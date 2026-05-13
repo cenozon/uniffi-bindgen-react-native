@@ -1,0 +1,445 @@
+name: 'Cenozon: Publish @cenozon/* napi runtime + bindgen to GHCR'
+
+# Snapshot-publish workflow for the cenozon fork.
+#
+# Trigger model:
+#   - workflow_dispatch only. The user manually clicks "Run workflow"
+#     (or runs `gh workflow run ...`) against whichever branch they want
+#     to publish. The workflow derives a unique prerelease snapshot
+#     version from the sanitised branch name + short HEAD SHA so each
+#     dispatch produces an identifiable build.
+#
+# Explicitly NOT triggered on push, pull_request, or tags — this branch
+# is a permanent feature branch that won't be merged, and every publish
+# is a deliberate user action.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version-base:
+        description: 'Base version to embed in the snapshot (defaults to runtimes/napi/package.json version stem).'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: cenozon-ghcr-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Scope and registry for the cenozon GitHub Packages npm registry.
+  CENOZON_SCOPE: '@cenozon'
+  CENOZON_REGISTRY: 'https://npm.pkg.github.com'
+  # Upstream package names that we rename at workflow time.
+  UPSTREAM_RUNTIME_SCOPE: '@uniffi-runtime/napi'
+  UPSTREAM_BINDGEN_NAME: 'uniffi-bindgen-react-native'
+  CENOZON_RUNTIME_NAME: '@cenozon/uniffi-runtime-napi'
+  CENOZON_BINDGEN_NAME: '@cenozon/uniffi-bindgen-react-native'
+
+jobs:
+  prepare:
+    name: Compute snapshot version
+    runs-on: ubuntu-latest
+    outputs:
+      snapshot-version: ${{ steps.compute.outputs.snapshot-version }}
+      short-sha: ${{ steps.compute.outputs.short-sha }}
+      sanitised-branch: ${{ steps.compute.outputs.sanitised-branch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute snapshot version
+        id: compute
+        run: |
+          set -euo pipefail
+
+          # The dispatched ref (branch the user clicked "Run workflow" on)
+          # and its HEAD SHA at the time of dispatch.
+          BRANCH="${{ github.ref_name }}"
+          SHA="${{ github.sha }}"
+
+          # Sanitise the branch: strip `dev/<user>/` prefix the same way
+          # indoraptor's packages-rs-sqlite3-publish.yaml does, then replace
+          # any remaining non [A-Za-z0-9-] with `-` so the result is a
+          # legal semver prerelease identifier.
+          SANITISED="$(echo "$BRANCH" | sed -E 's#dev/[A-Za-z0-9_.-]+/##g' | sed -E 's#[^A-Za-z0-9-]+#-#g' | sed -E 's#^-+|-+$##g')"
+          if [ -z "$SANITISED" ]; then
+            SANITISED="snapshot"
+          fi
+
+          SHORT_SHA="$(echo "$SHA" | cut -c1-7)"
+
+          # Base version: either the dispatch input, or the stem of the
+          # current runtimes/napi/package.json version (everything before
+          # the first `-`).
+          DISPATCH_BASE="${{ inputs.version-base }}"
+          if [ -n "$DISPATCH_BASE" ]; then
+            BASE="$DISPATCH_BASE"
+          else
+            BASE="$(node -e "console.log(require('./runtimes/napi/package.json').version.split('-')[0])")"
+          fi
+
+          SNAPSHOT="${BASE}-${SANITISED}.${SHORT_SHA}"
+
+          echo "snapshot-version=${SNAPSHOT}" >> "$GITHUB_OUTPUT"
+          echo "short-sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "sanitised-branch=${SANITISED}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Cenozon snapshot publish"
+            echo ""
+            echo "- Branch: \`${BRANCH}\`"
+            echo "- Sanitised branch: \`${SANITISED}\`"
+            echo "- Short SHA: \`${SHORT_SHA}\`"
+            echo "- Base version: \`${BASE}\`"
+            echo "- Snapshot version: \`${SNAPSHOT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux GNU x64 — native on the standard ubuntu runner.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build-flags: ''
+          # Linux GNU arm64 — native on GitHub-hosted ARM runner.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            build-flags: ''
+          # Windows MSVC x64 — native on windows-latest.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            build-flags: ''
+          # Windows MSVC arm64 — native on Windows-on-ARM. GitHub-hosted
+          # `windows-11-arm` runner; no cross-compile dance.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            build-flags: ''
+          # macOS arm64 — native on Apple Silicon.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            build-flags: ''
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: runtimes/napi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build native module
+        # NB: --js-package-name is honoured by napi when it generates
+        # index.js, but the publish job runs on a fresh checkout where
+        # index.js is sourced from the committed tree, not from this
+        # build. We sed-rewrite the scope in the publish step instead;
+        # passing --js-package-name here is harmless but not required
+        # for the published loader to be correct.
+        run: npm run build -- --target ${{ matrix.target }} ${{ matrix.build-flags }} --js-package-name ${{ env.CENOZON_RUNTIME_NAME }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cenozon-napi-${{ matrix.target }}
+          path: runtimes/napi/uniffi-runtime-napi.*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to GHCR
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Auth + scope for npm publish. NODE_AUTH_TOKEN comes from the
+      # workflow's own GITHUB_TOKEN which has packages:write per the
+      # workflow-level permissions block above.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: ${{ env.CENOZON_REGISTRY }}
+          scope: ${{ env.CENOZON_SCOPE }}
+          always-auth: true
+
+      - name: Install runtime dependencies
+        working-directory: runtimes/napi
+        run: npm ci --ignore-scripts
+
+      # Restrict the napi platform set to our 5 targets BEFORE running
+      # `napi create-npm-dir` and before re-renaming. This is a
+      # workflow-only transform — never committed back to the tree.
+      - name: Restrict napi triples to cenozon target set
+        working-directory: runtimes/napi
+        run: |
+          node <<'EOF'
+          const fs = require('node:fs');
+          const path = './package.json';
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+          pkg.napi = pkg.napi || {};
+          pkg.napi.triples = {
+            defaults: false,
+            additional: [
+              'x86_64-unknown-linux-gnu',
+              'aarch64-unknown-linux-gnu',
+              'x86_64-pc-windows-msvc',
+              'aarch64-pc-windows-msvc',
+              'aarch64-apple-darwin',
+            ],
+          };
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          EOF
+
+      - name: Create per-platform npm package directories
+        working-directory: runtimes/napi
+        run: npm run create-npm-dirs
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: runtimes/napi/artifacts
+          pattern: cenozon-napi-*
+          merge-multiple: true
+
+      - name: Move artifacts into platform dirs
+        working-directory: runtimes/napi
+        run: npm run artifacts
+
+      - name: Build TypeScript helpers (resolve-lib)
+        working-directory: runtimes/napi
+        run: npm run build:ts
+
+      - name: Assemble root package
+        working-directory: runtimes/napi
+        run: npm run assemble-root
+
+      # Workflow-time rename of every package:
+      #   - npm/<triple>/package.json: name → @cenozon/uniffi-runtime-napi-<triple>
+      #   - npm/root/package.json: name → @cenozon/uniffi-runtime-napi,
+      #     optionalDependencies remapped to @cenozon/* scope.
+      # All sub-packages get pinned to the snapshot version.
+      - name: Rewrite napi runtime packages to @cenozon scope
+        working-directory: runtimes/napi
+        env:
+          SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
+        run: |
+          node <<'EOF'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const version = process.env.SNAPSHOT_VERSION;
+          if (!version) throw new Error('SNAPSHOT_VERSION not set');
+
+          const npmDir = path.resolve('npm');
+          const entries = fs.readdirSync(npmDir);
+
+          for (const name of entries) {
+            const pkgPath = path.join(npmDir, name, 'package.json');
+            if (!fs.existsSync(pkgPath)) continue;
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+
+            if (name === 'root') {
+              pkg.name = '@cenozon/uniffi-runtime-napi';
+              if (pkg.optionalDependencies) {
+                const next = {};
+                for (const [k, v] of Object.entries(pkg.optionalDependencies)) {
+                  // Rewrite @uniffi-runtime/napi-<triple> → @cenozon/uniffi-runtime-napi-<triple>.
+                  const triple = k.replace(/^@uniffi-runtime\/napi-/, '');
+                  next[`@cenozon/uniffi-runtime-napi-${triple}`] = version;
+                }
+                pkg.optionalDependencies = next;
+              }
+            } else {
+              // Platform sub-package: name is `@uniffi-runtime/napi-<triple>`.
+              pkg.name = `@cenozon/uniffi-runtime-napi-${name}`;
+            }
+            pkg.version = version;
+            // GHCR-friendly publishConfig: explicit registry + restricted access
+            // (private repo packages cannot be public on GHCR).
+            pkg.publishConfig = {
+              registry: 'https://npm.pkg.github.com',
+              access: 'restricted',
+            };
+            // Drop any provenance-related publishConfig keys leftover from upstream.
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+            console.log(`Rewrote ${pkgPath}: name=${pkg.name} version=${pkg.version}`);
+          }
+
+          // assemble-root.mjs already copied index.js into npm/root/.
+          // Rewrite its require('@uniffi-runtime/napi-<triple>') calls
+          // to point at our scope. Done as a string replace because the
+          // file is generated by napi-rs and only references the scope
+          // through these literal require() strings.
+          const rootIndexPath = path.join(npmDir, 'root', 'index.js');
+          if (fs.existsSync(rootIndexPath)) {
+            let txt = fs.readFileSync(rootIndexPath, 'utf8');
+            const before = txt;
+            txt = txt.replace(/@uniffi-runtime\/napi-/g, '@cenozon/uniffi-runtime-napi-');
+            if (txt === before) {
+              console.warn('WARN: no @uniffi-runtime/napi- references found in root/index.js');
+            }
+            fs.writeFileSync(rootIndexPath, txt);
+          } else {
+            throw new Error(`Missing ${rootIndexPath} — assemble-root did not copy index.js`);
+          }
+          EOF
+
+      # Sanity-check: the published root package must only reference our
+      # scope at require() time.
+      - name: Verify root index.js references @cenozon scope only
+        working-directory: runtimes/napi
+        run: |
+          set -euo pipefail
+          if grep -q "@uniffi-runtime/napi-" npm/root/index.js; then
+            echo "ERROR: root/index.js still references @uniffi-runtime/* after rewrite."
+            grep -n "@uniffi-runtime/napi-" npm/root/index.js | head
+            exit 1
+          fi
+          if ! grep -q "@cenozon/uniffi-runtime-napi-" npm/root/index.js; then
+            echo "ERROR: root/index.js does not reference @cenozon/uniffi-runtime-napi-*."
+            exit 1
+          fi
+          echo "OK: index.js loader references @cenozon/uniffi-runtime-napi-*"
+
+      # Build the bindgen TS helper package under its renamed name.
+      - name: Build uniffi-bindgen-react-native TS
+        run: |
+          npm install --ignore-scripts --no-fund --no-audit
+          ./node_modules/.bin/tsc
+
+      - name: Stage @cenozon/uniffi-bindgen-react-native publish dir
+        env:
+          SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
+        run: |
+          set -euo pipefail
+          STAGE="$(pwd)/dist-cenozon-bindgen"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -r typescript/dist "$STAGE/typescript-dist"
+          # Re-home to the expected layout: package.json + typescript/dist + bin/cli.cjs.
+          mkdir -p "$STAGE/typescript"
+          mv "$STAGE/typescript-dist" "$STAGE/typescript/dist"
+          mkdir -p "$STAGE/bin"
+          cp bin/cli.cjs "$STAGE/bin/cli.cjs"
+          # Copy README + license if present.
+          for f in README.md LICENSE LICENSE.md; do
+            if [ -f "$f" ]; then cp "$f" "$STAGE/$f"; fi
+          done
+
+          # Construct a fresh package.json carrying only publish-relevant fields.
+          node - "$STAGE" <<'EOF'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const stage = process.argv[2];
+          const src = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+          const version = process.env.SNAPSHOT_VERSION;
+          if (!version) throw new Error('SNAPSHOT_VERSION not set');
+
+          const out = {
+            name: '@cenozon/uniffi-bindgen-react-native',
+            version,
+            description: src.description,
+            homepage: src.homepage,
+            repository: src.repository,
+            license: src.license,
+            author: src.author,
+            type: src.type,
+            main: src.main,
+            types: src.types,
+            bin: src.bin,
+            files: [
+              'bin/',
+              'typescript/dist/',
+              'README.md',
+              'LICENSE',
+            ],
+            publishConfig: {
+              registry: 'https://npm.pkg.github.com',
+              access: 'restricted',
+            },
+          };
+          fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify(out, null, 2) + '\n');
+          console.log('Wrote', path.join(stage, 'package.json'));
+          EOF
+
+      - name: List staged packages
+        run: |
+          echo "--- runtimes/napi/npm/* ---"
+          ls -la runtimes/napi/npm/
+          for d in runtimes/napi/npm/*/; do
+            echo "--- $d ---"
+            cat "$d/package.json"
+            echo ""
+          done
+          echo "--- dist-cenozon-bindgen ---"
+          ls -la dist-cenozon-bindgen/
+          echo "--- dist-cenozon-bindgen/package.json ---"
+          cat dist-cenozon-bindgen/package.json
+
+      # The `npm publish` invocations use NODE_AUTH_TOKEN sourced from the
+      # workflow's own GITHUB_TOKEN. setup-node@v4 above wrote an .npmrc
+      # that points the @cenozon scope at https://npm.pkg.github.com and
+      # injects NODE_AUTH_TOKEN at publish time.
+      - name: Publish platform sub-packages
+        working-directory: runtimes/napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for dir in npm/*/; do
+            name="$(basename "$dir")"
+            if [ "$name" = "root" ]; then continue; fi
+            echo "--- npm publish $dir (tag=snapshot) ---"
+            (cd "$dir" && npm publish --tag snapshot --access restricted)
+          done
+
+      - name: Publish @cenozon/uniffi-runtime-napi root package
+        working-directory: runtimes/napi/npm/root
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --tag snapshot --access restricted
+
+      - name: Publish @cenozon/uniffi-bindgen-react-native
+        working-directory: dist-cenozon-bindgen
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --tag snapshot --access restricted
+
+      - name: Append published coords to workflow summary
+        env:
+          SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
+        run: |
+          {
+            echo "## Published packages"
+            echo ""
+            echo "All published to \`https://npm.pkg.github.com/@cenozon\` with dist-tag \`snapshot\`."
+            echo ""
+            echo '```json'
+            echo "\"@cenozon/uniffi-runtime-napi\": \"${SNAPSHOT_VERSION}\","
+            echo "\"@cenozon/uniffi-bindgen-react-native\": \"${SNAPSHOT_VERSION}\""
+            echo '```'
+            echo ""
+            echo "Platform sub-packages (loaded via optionalDependencies on the runtime root):"
+            echo ""
+            echo '```'
+            for t in linux-x64-gnu linux-arm64-gnu win32-x64-msvc win32-arm64-msvc darwin-arm64; do
+              echo "@cenozon/uniffi-runtime-napi-${t}@${SNAPSHOT_VERSION}"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
