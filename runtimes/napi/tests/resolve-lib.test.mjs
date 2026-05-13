@@ -131,6 +131,24 @@ test("override: absolute existing path returns it verbatim", () => {
   }
 });
 
+test("override: works without callerUrl (CJS-safe shape)", () => {
+  // Bindings generated with `--lib-absolute` omit `callerUrl` so they don't
+  // have to emit `import.meta.url` (which would break CJS consumers). The
+  // resolver must accept that shape and return the override verbatim.
+  const { dir, cleanup } = makeTempDir();
+  try {
+    const lib = join(dir, "libfoo.dylib");
+    writeFileSync(lib, "");
+    const got = resolveLibPath({
+      crateName: "foo",
+      override: lib,
+    });
+    assert.equal(got, lib);
+  } finally {
+    cleanup();
+  }
+});
+
 test("override: relative path throws", () => {
   try {
     resolveLibPath({
