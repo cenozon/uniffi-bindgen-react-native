@@ -162,6 +162,24 @@ jobs:
           path: runtimes/napi/uniffi-runtime-napi.*.node
           if-no-files-found: error
 
+      # Build the uniffi-bindgen-react-native CLI binary for this same
+      # target so consumers don't need a Rust toolchain to install the
+      # bindgen. The crate lives at crates/ubrn_cli/ and its [[bin]]
+      # name is uniffi-bindgen-react-native; the binary lands at
+      # target/<triple>/release/uniffi-bindgen-react-native[.exe].
+      - name: Build uniffi-bindgen-react-native CLI binary
+        working-directory: ${{ github.workspace }}
+        run: cargo build --release --locked --bin uniffi-bindgen-react-native --target ${{ matrix.target }}
+
+      - name: Upload CLI binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cenozon-cli-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/uniffi-bindgen-react-native
+            target/${{ matrix.target }}/release/uniffi-bindgen-react-native.exe
+          if-no-files-found: error
+
   publish:
     name: Publish to GHCR
     needs: [prepare, build]
@@ -323,6 +341,102 @@ jobs:
           npm install --ignore-scripts --no-fund --no-audit
           ./node_modules/.bin/tsc
 
+      # Download all 5 per-triple CLI binaries built by the matrix into
+      # one tree, then stage each into its own publishable npm package
+      # at dist-cenozon-cli/<napi-triple>/.
+      - name: Download CLI binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: cli-artifacts
+          pattern: cenozon-cli-*
+
+      - name: Stage CLI platform sub-packages
+        env:
+          SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
+        run: |
+          set -euo pipefail
+          node - <<'EOF'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { execSync } = require('node:child_process');
+
+          const version = process.env.SNAPSHOT_VERSION;
+          if (!version) throw new Error('SNAPSHOT_VERSION not set');
+
+          // Cargo target triple -> napi-rs triple convention used everywhere
+          // else in the workflow (and matched by the umbrella's runtime
+          // resolution map).
+          const TARGETS = [
+            { cargo: 'x86_64-unknown-linux-gnu',  napi: 'linux-x64-gnu',    os: 'linux',  cpu: 'x64',   exe: 'uniffi-bindgen-react-native' },
+            { cargo: 'aarch64-unknown-linux-gnu', napi: 'linux-arm64-gnu',  os: 'linux',  cpu: 'arm64', exe: 'uniffi-bindgen-react-native' },
+            { cargo: 'x86_64-pc-windows-msvc',    napi: 'win32-x64-msvc',   os: 'win32',  cpu: 'x64',   exe: 'uniffi-bindgen-react-native.exe' },
+            { cargo: 'aarch64-pc-windows-msvc',   napi: 'win32-arm64-msvc', os: 'win32',  cpu: 'arm64', exe: 'uniffi-bindgen-react-native.exe' },
+            { cargo: 'aarch64-apple-darwin',      napi: 'darwin-arm64',     os: 'darwin', cpu: 'arm64', exe: 'uniffi-bindgen-react-native' },
+          ];
+
+          const stageRoot = path.resolve('dist-cenozon-cli');
+          fs.rmSync(stageRoot, { recursive: true, force: true });
+          fs.mkdirSync(stageRoot, { recursive: true });
+
+          for (const t of TARGETS) {
+            const srcArtifactDir = path.resolve('cli-artifacts', `cenozon-cli-${t.cargo}`);
+            const srcExe = path.join(srcArtifactDir, t.exe);
+            if (!fs.existsSync(srcExe)) {
+              throw new Error(`Expected CLI binary not found: ${srcExe}`);
+            }
+
+            const stageDir = path.join(stageRoot, t.napi);
+            const stageBin = path.join(stageDir, 'bin');
+            fs.mkdirSync(stageBin, { recursive: true });
+            const dstExe = path.join(stageBin, t.exe);
+            fs.copyFileSync(srcExe, dstExe);
+            if (t.os !== 'win32') {
+              fs.chmodSync(dstExe, 0o755);
+            }
+
+            const pkg = {
+              name: `@cenozon/uniffi-bindgen-react-native-cli-${t.napi}`,
+              version,
+              description: `Prebuilt uniffi-bindgen-react-native CLI for ${t.napi}`,
+              license: 'MPL-2.0',
+              bin: {
+                [`uniffi-bindgen-react-native-cli-${t.napi}`]: `./bin/${t.exe}`,
+              },
+              os: [t.os],
+              cpu: [t.cpu],
+              files: ['bin/'],
+              publishConfig: {
+                registry: 'https://npm.pkg.github.com',
+                access: 'restricted',
+              },
+            };
+            fs.writeFileSync(path.join(stageDir, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
+            console.log(`Staged ${pkg.name}@${version} -> ${stageDir}`);
+          }
+          EOF
+
+      - name: List staged CLI sub-packages
+        run: |
+          echo "--- dist-cenozon-cli/* ---"
+          ls -la dist-cenozon-cli/
+          for d in dist-cenozon-cli/*/; do
+            echo "--- $d ---"
+            ls -la "$d"
+            cat "$d/package.json"
+            echo ""
+          done
+
+      - name: Publish CLI platform sub-packages
+        working-directory: dist-cenozon-cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for dir in */; do
+            echo "--- npm publish $dir (tag=snapshot) ---"
+            (cd "$dir" && npm publish --tag snapshot --access restricted)
+          done
+
       - name: Stage @cenozon/uniffi-bindgen-react-native publish dir
         env:
           SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
@@ -336,7 +450,44 @@ jobs:
           mkdir -p "$STAGE/typescript"
           mv "$STAGE/typescript-dist" "$STAGE/typescript/dist"
           mkdir -p "$STAGE/bin"
-          cp bin/cli.cjs "$STAGE/bin/cli.cjs"
+          # Write a fresh bin/cli.cjs that resolves and execs the prebuilt
+          # platform binary from the matching @cenozon/uniffi-bindgen-react-native-cli-*
+          # sub-package (delivered via optionalDependencies below). This
+          # replaces the upstream cli.cjs which `cargo run`s the source crate.
+          # Done via Node so we don't have to fight bash heredoc indentation
+          # inside a YAML literal block.
+          node - "$STAGE/bin/cli.cjs" <<'EOF'
+          const fs = require('node:fs');
+          const out = process.argv[2];
+          const content = [
+            "#!/usr/bin/env node",
+            "const { spawnSync } = require('node:child_process');",
+            "const PLATFORM_TO_TRIPLE = {",
+            "  'linux-x64': 'linux-x64-gnu',",
+            "  'linux-arm64': 'linux-arm64-gnu',",
+            "  'win32-x64': 'win32-x64-msvc',",
+            "  'win32-arm64': 'win32-arm64-msvc',",
+            "  'darwin-arm64': 'darwin-arm64',",
+            "};",
+            "const key = `${process.platform}-${process.arch}`;",
+            "const triple = PLATFORM_TO_TRIPLE[key];",
+            "if (!triple) {",
+            "  console.error(`Unsupported platform: ${key}. Supported: ${Object.keys(PLATFORM_TO_TRIPLE).join(', ')}`);",
+            "  process.exit(1);",
+            "}",
+            "const subpkg = `@cenozon/uniffi-bindgen-react-native-cli-${triple}`;",
+            "const exeName = process.platform === 'win32' ? 'uniffi-bindgen-react-native.exe' : 'uniffi-bindgen-react-native';",
+            "let binPath;",
+            "try { binPath = require.resolve(`${subpkg}/bin/${exeName}`); }",
+            "catch (e) { console.error(`Could not resolve ${subpkg}. Is it installed? (${e.message})`); process.exit(1); }",
+            "const res = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });",
+            "process.exit(res.status ?? 1);",
+            "",
+          ].join('\n');
+          fs.writeFileSync(out, content);
+          fs.chmodSync(out, 0o755);
+          console.log('Wrote', out);
+          EOF
           # Copy README + license if present.
           for f in README.md LICENSE LICENSE.md; do
             if [ -f "$f" ]; then cp "$f" "$STAGE/$f"; fi
@@ -351,6 +502,22 @@ jobs:
           const version = process.env.SNAPSHOT_VERSION;
           if (!version) throw new Error('SNAPSHOT_VERSION not set');
 
+          // Pin each per-triple CLI sub-package as an optionalDependency.
+          // npm/bun honour os/cpu constraints declared by the sub-package's
+          // own package.json, so only the matching one installs on a given
+          // host.
+          const CLI_TRIPLES = [
+            'linux-x64-gnu',
+            'linux-arm64-gnu',
+            'win32-x64-msvc',
+            'win32-arm64-msvc',
+            'darwin-arm64',
+          ];
+          const optionalDependencies = {};
+          for (const t of CLI_TRIPLES) {
+            optionalDependencies[`@cenozon/uniffi-bindgen-react-native-cli-${t}`] = version;
+          }
+
           const out = {
             name: '@cenozon/uniffi-bindgen-react-native',
             version,
@@ -363,6 +530,7 @@ jobs:
             main: src.main,
             types: src.types,
             bin: src.bin,
+            optionalDependencies,
             files: [
               'bin/',
               'typescript/dist/',
@@ -435,11 +603,19 @@ jobs:
             echo "\"@cenozon/uniffi-bindgen-react-native\": \"${SNAPSHOT_VERSION}\""
             echo '```'
             echo ""
-            echo "Platform sub-packages (loaded via optionalDependencies on the runtime root):"
+            echo "Napi runtime platform sub-packages (loaded via optionalDependencies on the runtime root):"
             echo ""
             echo '```'
             for t in linux-x64-gnu linux-arm64-gnu win32-x64-msvc win32-arm64-msvc darwin-arm64; do
               echo "@cenozon/uniffi-runtime-napi-${t}@${SNAPSHOT_VERSION}"
+            done
+            echo '```'
+            echo ""
+            echo "CLI platform sub-packages (loaded via optionalDependencies on @cenozon/uniffi-bindgen-react-native):"
+            echo ""
+            echo '```'
+            for t in linux-x64-gnu linux-arm64-gnu win32-x64-msvc win32-arm64-msvc darwin-arm64; do
+              echo "@cenozon/uniffi-bindgen-react-native-cli-${t}@${SNAPSHOT_VERSION}"
             done
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
