@@ -42,13 +42,15 @@ fn template_absolute() {
         LibResolution::Absolute(camino::Utf8PathBuf::from("/abs/lib.so")),
         "my_crate",
     );
+    // Absolute mode bakes the path in at codegen time, so the runtime
+    // resolver never reads `callerUrl`. We omit `callerUrl: import.meta.url`
+    // here so the output stays valid under CJS as well as ESM.
     expect![[r#"
         let _nativeModule: NativeModuleInterface | undefined;
         const getter: () => NativeModuleInterface = () => {
           if (!_nativeModule) {
             const libPath = resolveLibPath({
               crateName: "my_crate",
-              callerUrl: import.meta.url,
               override: "/abs/lib.so",
             });
             const mod_ = UniffiNativeModule.open(libPath);
@@ -58,6 +60,22 @@ fn template_absolute() {
         };
         export default getter;"#]]
     .assert_eq(&extract_getter_block(&rendered));
+}
+
+#[test]
+fn template_absolute_does_not_reference_import_meta_url() {
+    // Regression guard: under `--lib-absolute` the generated bindings must
+    // not reference `import.meta.url` anywhere — that's ESM-only syntax and
+    // would break CJS consumers. The resolver doesn't read `callerUrl` for
+    // override mode, so it's safe (and necessary) to leave it out.
+    let rendered = render_minimal_for_test(
+        LibResolution::Absolute(camino::Utf8PathBuf::from("/abs/lib.so")),
+        "my_crate",
+    );
+    assert!(
+        !rendered.contains("import.meta.url"),
+        "Absolute mode must not emit import.meta.url, but it did:\n{rendered}"
+    );
 }
 
 #[test]

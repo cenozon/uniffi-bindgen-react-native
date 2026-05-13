@@ -64,11 +64,16 @@ export class ResolveLibPathError extends Error {
 
 export type ResolveLibPathOptions = {
   crateName: string;
-  callerUrl: string;
 } & (
-  | { override: string; npmPackageBase?: never }
-  | { npmPackageBase: string; override?: never }
-  | { override?: never; npmPackageBase?: never }
+  // override mode: callerUrl is unused by the resolver, so it's optional —
+  // generated bindings that bake an absolute path in (e.g. via
+  // `--lib-absolute`) omit it entirely so the output stays valid under CJS,
+  // where `import.meta.url` would otherwise be a syntax error.
+  | { override: string; npmPackageBase?: never; callerUrl?: string }
+  // npmPackageBase mode: callerUrl anchors `createRequire(callerUrl)`.
+  | { npmPackageBase: string; override?: never; callerUrl: string }
+  // colocated mode: callerUrl is the path the lib must sit next to.
+  | { override?: never; npmPackageBase?: never; callerUrl: string }
 );
 
 function callerDir(callerUrl: string): string {

@@ -78,12 +78,20 @@ const getter: () => NativeModuleInterface = () => {
   if (!_nativeModule) {
     const libPath = resolveLibPath({
       crateName: "{{ module.crate_name }}",
-      callerUrl: import.meta.url,
       {%- match module.lib_resolution %}
+      {#- `callerUrl` is consumed by the runtime resolver only when the path
+          needs to be derived from the caller (colocated lookup) or anchored
+          against the caller (npm package lookup via createRequire). When an
+          absolute override is baked in at bindgen time, `callerUrl` is dead
+          weight — and `import.meta.url` is also a syntax error under CJS, so
+          omitting it here lets `--lib-absolute` outputs run unchanged under
+          both module systems. #}
       {%- when LibResolution::Colocated %}
+      callerUrl: import.meta.url,
       {%- when LibResolution::Absolute with (path) %}
       override: "{{ path }}",
       {%- when LibResolution::Require with (base) %}
+      callerUrl: import.meta.url,
       npmPackageBase: "{{ base }}",
       {%- endmatch %}
     });
