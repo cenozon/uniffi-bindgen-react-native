@@ -49,6 +49,12 @@ pub(crate) struct TsApiModule {
     pub type_definitions: Vec<TsTypeDefinition>,
     pub functions: Vec<TsFunction>,
     pub initialization: InitializationIR,
+    /// Relative import specifier for the colocated `{module_name}-ffi`
+    /// module. Pre-computed so the template stays single-method (no
+    /// conditional ext logic in `wrapper.ts`). Equals `./{module_name}-ffi`
+    /// by default; `./{module_name}-ffi.{ext}` when the operator passes
+    /// `--import-extension`.
+    pub nativemodule_import_path: String,
 }
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -503,6 +509,8 @@ impl TsApiModule {
             }
         }
 
+        let nativemodule_import_path = config.import_specifier(&format!("{}-ffi", module_name));
+
         let mut module = Self {
             module_name,
             namespace_docstring,
@@ -518,17 +526,23 @@ impl TsApiModule {
             type_definitions,
             functions,
             initialization,
+            nativemodule_import_path,
         };
 
         let mut acc = module.collect_all_imports();
         acc.merge(primitive_imports);
 
-        // Build file imports: FFI types first, then cross-module imports
+        // Build file imports: FFI types first, then cross-module imports.
+        //
+        // `ImportAccumulator` keys intra-crate paths as `./{namespace}` so it
+        // can dedupe by sibling module. Resolve the final relative specifier
+        // here (once) via `Config::import_specifier`; that's the single place
+        // the `--import-extension` suffix is applied to cross-module imports.
         let mut file_imports = Vec::new();
 
         if !ffi_exported_definitions.is_empty() {
             file_imports.push(TsFileImport {
-                path: format!("./{}-ffi", module.module_name),
+                path: config.import_specifier(&format!("{}-ffi", module.module_name)),
                 types: ffi_exported_definitions
                     .iter()
                     .map(|def| def.name().to_string())
@@ -546,8 +560,16 @@ impl TsApiModule {
                     ImportedItem::Value(v) => values.push(v),
                 }
             }
+            // Only intra-crate `./{namespace}` keys get the configured
+            // extension applied; absolute specifiers (e.g. node module names
+            // like `uniffi-bindgen-react-native`, or user-configured custom
+            // type import paths) pass through untouched.
+            let path = match file.strip_prefix("./") {
+                Some(name) => config.import_specifier(name),
+                None => file,
+            };
             file_imports.push(TsFileImport {
-                path: file,
+                path,
                 types,
                 values,
             });
@@ -555,14 +577,20 @@ impl TsApiModule {
 
         module.file_imports = file_imports;
 
-        // Build converter imports
+        // Build converter imports (same intra-crate-only suffixing rule).
         module.converter_imports = acc
             .imported_converters
             .into_iter()
-            .map(|((path, default_name), converters)| TsConverterImport {
-                path,
-                default_name,
-                converters: converters.into_iter().collect(),
+            .map(|((path, default_name), converters)| {
+                let path = match path.strip_prefix("./") {
+                    Some(name) => config.import_specifier(name),
+                    None => path,
+                };
+                TsConverterImport {
+                    path,
+                    default_name,
+                    converters: converters.into_iter().collect(),
+                }
             })
             .collect();
 

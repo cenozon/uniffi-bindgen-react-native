@@ -88,6 +88,22 @@ pub struct OutputArgs {
     /// The directory in which to put the generated C++.
     #[clap(long, alias = "abi-dir")]
     pub(crate) cpp_dir: Utf8PathBuf,
+
+    /// Append this extension to every relative import specifier in the
+    /// generated TypeScript (e.g. `--import-extension js` produces
+    /// `from './foo.js'`). Unset = today's behavior (`from './foo'`).
+    ///
+    /// Node ESM via `tsc --module nodenext` requires explicit extensions
+    /// (`tsc` preserves specifiers verbatim into emitted `.js`, and Node
+    /// rejects extensionless ones with `ERR_MODULE_NOT_FOUND`). Bundlers
+    /// (metro, webpack, rollup, esbuild) accept either form, so leaving
+    /// this off keeps bundler-fed consumers byte-identical.
+    ///
+    /// A leading `.` is tolerated (`.js` and `js` are equivalent). Most
+    /// users want `js`; `mjs`/`cjs` are reserved for future generators
+    /// that emit those filenames directly.
+    #[clap(long, value_name = "EXT")]
+    pub(crate) import_extension: Option<String>,
 }
 
 impl OutputArgs {
@@ -96,7 +112,16 @@ impl OutputArgs {
             ts_dir: ts_dir.to_owned(),
             cpp_dir: cpp_dir.to_owned(),
             no_format,
+            import_extension: None,
         }
+    }
+
+    /// Builder-style setter for the import-extension option. Mirrors the
+    /// CLI flag for callers that construct `OutputArgs` programmatically
+    /// (e.g. the wrapping `ubrn_cli` crate).
+    pub fn with_import_extension(mut self, ext: Option<String>) -> Self {
+        self.import_extension = ext;
+        self
     }
 }
 
@@ -199,10 +224,21 @@ impl BindingsArgs {
             &switches,
             &ts_dir,
             self.lib_resolution.clone(),
+            out.import_extension.as_deref(),
         )?;
-        let modules = generate_api_from_pipeline(&general_root, &switches, &ts_dir)?;
+        let modules = generate_api_from_pipeline(
+            &general_root,
+            &switches,
+            &ts_dir,
+            out.import_extension.as_deref(),
+        )?;
         if switches.flavor == AbiFlavor::Napi {
-            generate_index_from_modules(&modules, &switches, &ts_dir)?;
+            generate_index_from_modules(
+                &modules,
+                &switches,
+                &ts_dir,
+                out.import_extension.as_deref(),
+            )?;
         }
         if !out.no_format {
             gen_typescript::format_directory(&ts_dir)?;
@@ -244,10 +280,11 @@ fn generate_api_from_pipeline(
     general_root: &general::Root,
     switches: &SwitchArgs,
     ts_dir: &Utf8Path,
+    import_extension: Option<&str>,
 ) -> Result<Vec<ModuleMetadata>> {
     let mut modules = Vec::new();
     for (name, namespace) in &general_root.namespaces {
-        let config = extract_ts_config(namespace)?;
+        let config = extract_ts_config(namespace)?.with_import_extension(import_extension);
         let module = ModuleMetadata::new(name);
         let ffi_module = gen_typescript::ffi_module::TsFfiModule::from_general(
             namespace,
@@ -273,8 +310,13 @@ fn generate_index_from_modules(
     modules: &[ModuleMetadata],
     switches: &SwitchArgs,
     ts_dir: &Utf8Path,
+    import_extension: Option<&str>,
 ) -> Result<()> {
-    let code = gen_typescript::generate_index_code(modules.to_vec(), switches.flavor.clone())?;
+    let code = gen_typescript::generate_index_code(
+        modules.to_vec(),
+        switches.flavor.clone(),
+        import_extension,
+    )?;
     let path = ts_dir.join("index.ts");
     ubrn_common::write_file(path, code)?;
     Ok(())
@@ -303,12 +345,13 @@ fn generate_ffi_from_pipeline(
     switches: &SwitchArgs,
     ts_dir: &Utf8Path,
     lib_resolution: Option<gen_typescript::ffi_module_player::LibResolution>,
+    import_extension: Option<&str>,
 ) -> Result<()> {
     for (name, namespace) in &root.namespaces {
         let module = ModuleMetadata::new(name);
         let path = ts_dir.join(module.ts_ffi_filename());
 
-        let config = extract_ts_config(namespace)?;
+        let config = extract_ts_config(namespace)?.with_import_extension(import_extension);
         let code = match &switches.flavor {
             AbiFlavor::Napi => {
                 let lib_resolution = lib_resolution.clone().ok_or_else(|| {

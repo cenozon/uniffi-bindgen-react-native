@@ -71,6 +71,13 @@ pub(crate) struct BindingsArgs {
     /// Requires --library; the path must be absolute.
     #[clap(long = "lib-absolute", requires = "library_mode")]
     pub(crate) lib_absolute: bool,
+
+    /// Append this extension to every relative import specifier in the
+    /// generated TypeScript (e.g. `--import-extension js` produces
+    /// `from './foo.js'`). Required for `tsc --module nodenext` consumers;
+    /// leave unset for bundler-fed projects to preserve current output.
+    #[clap(long, value_name = "EXT")]
+    pub(crate) import_extension: Option<String>,
 }
 
 impl BindingsArgs {
@@ -108,7 +115,8 @@ impl From<&BindingsArgs> for ubrn_bindgen::BindingsArgs {
                 flavor: AbiFlavor::Napi,
             },
             value.source.clone(),
-            OutputArgs::new(&value.ts_dir, &value.ts_dir, value.no_format),
+            OutputArgs::new(&value.ts_dir, &value.ts_dir, value.no_format)
+                .with_import_extension(value.import_extension.clone()),
         )
     }
 }
