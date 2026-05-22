@@ -611,7 +611,7 @@ jobs:
             `s.name             = 'uniffi-bindgen-react-native'`,
           );
           if (txt === before) {
-            throw new Error('Failed to find `s.name = package[\\'name\\']` in podspec — template may have changed');
+            throw new Error("Failed to find `s.name = package['name']` in podspec — template may have changed");
           }
           fs.writeFileSync(p, txt);
           console.log(`Rewrote ${p}: hardcoded s.name = 'uniffi-bindgen-react-native'`);
