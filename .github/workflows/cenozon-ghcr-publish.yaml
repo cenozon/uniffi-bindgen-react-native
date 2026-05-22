@@ -74,7 +74,12 @@ jobs:
             SANITISED="snapshot"
           fi
 
-          SHORT_SHA="$(echo "$SHA" | cut -c1-7)"
+          # Prefix the short SHA with `g` (matching `git describe --abbrev=N`
+          # convention) so the resulting identifier is alphanumeric. Semver
+          # rejects leading zeros in all-digit pre-release identifiers,
+          # which intermittently breaks the snapshot version when the SHA
+          # happens to be all digits (e.g. `0875417`).
+          SHORT_SHA="g$(echo "$SHA" | cut -c1-7)"
 
           # Base version: either the dispatch input, or the stem of the
           # current runtimes/napi/package.json version (everything before
