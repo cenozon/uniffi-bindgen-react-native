@@ -69,3 +69,15 @@ generated/
 .clang-format-ignore
 .licence-config.yaml
 .prettierignore
+
+# Cenozon publish workflow: staging artifacts created during
+# `cenozon-ghcr-publish.yaml`. These are published as separate packages
+# (`@cenozon/uniffi-runtime-napi*`, `@cenozon/uniffi-bindgen-react-native-cli-*`)
+# and must NOT be packed into the umbrella `@cenozon/uniffi-bindgen-react-native`
+# tarball. Without these excludes the umbrella tarball ships every prebuilt
+# `.node` napi binary and every per-triple CLI binary downloaded by the
+# matrix build — multiple hundreds of MB of duplication.
+runtimes/
+dist-cenozon-cli/
+dist-cenozon-bindgen/
+cli-artifacts/

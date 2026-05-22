@@ -437,26 +437,20 @@ jobs:
             (cd "$dir" && npm publish --tag snapshot --access restricted)
           done
 
-      - name: Stage @cenozon/uniffi-bindgen-react-native publish dir
-        env:
-          SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
+      # Rewrite bin/cli.cjs IN PLACE in the source tree. Upstream's
+      # cli.cjs does `cargo run` against the source crate, which doesn't
+      # work for installed consumers. We replace it with a resolver shim
+      # that finds the matching @cenozon/uniffi-bindgen-react-native-cli-*
+      # sub-package (delivered via optionalDependencies below) and execs
+      # its prebuilt binary.
+      #
+      # Done via Node so we don't have to fight bash heredoc indentation
+      # inside a YAML literal block. Edits to the runner's working tree
+      # are ephemeral — never committed back.
+      - name: Rewrite bin/cli.cjs as platform-resolver shim
         run: |
           set -euo pipefail
-          STAGE="$(pwd)/dist-cenozon-bindgen"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cp -r typescript/dist "$STAGE/typescript-dist"
-          # Re-home to the expected layout: package.json + typescript/dist + bin/cli.cjs.
-          mkdir -p "$STAGE/typescript"
-          mv "$STAGE/typescript-dist" "$STAGE/typescript/dist"
-          mkdir -p "$STAGE/bin"
-          # Write a fresh bin/cli.cjs that resolves and execs the prebuilt
-          # platform binary from the matching @cenozon/uniffi-bindgen-react-native-cli-*
-          # sub-package (delivered via optionalDependencies below). This
-          # replaces the upstream cli.cjs which `cargo run`s the source crate.
-          # Done via Node so we don't have to fight bash heredoc indentation
-          # inside a YAML literal block.
-          node - "$STAGE/bin/cli.cjs" <<'EOF'
+          node - "bin/cli.cjs" <<'EOF'
           const fs = require('node:fs');
           const out = process.argv[2];
           const content = [
@@ -488,24 +482,38 @@ jobs:
           fs.chmodSync(out, 0o755);
           console.log('Wrote', out);
           EOF
-          # Copy README + license if present.
-          for f in README.md LICENSE LICENSE.md; do
-            if [ -f "$f" ]; then cp "$f" "$STAGE/$f"; fi
-          done
 
-          # Construct a fresh package.json carrying only publish-relevant fields.
-          node - "$STAGE" <<'EOF'
+      # Edit the source package.json IN PLACE with only the cenozon-fork
+      # changes layered on top:
+      #   - name      → @cenozon/uniffi-bindgen-react-native
+      #   - version   → SNAPSHOT_VERSION
+      #   - optionalDependencies → 5-triple CLI sub-package pins
+      #   - publishConfig → GHCR
+      #
+      # Crucially we do NOT add a `files:` array. The source package.json
+      # has none, so `npm publish` falls back to "everything not in
+      # .npmignore / .gitignore" — which matches what upstream's own
+      # publish workflow does and ensures cpp/, *.podspec,
+      # react-native.config.js (when present), typescript/dist/, bin/,
+      # etc. all land in the tarball. The hand-curated `files:` array we
+      # used to ship here is what kept silently dropping files; the
+      # whole-tree-minus-ignores default is exactly what we want.
+      - name: Rewrite source package.json for cenozon publish
+        env:
+          SNAPSHOT_VERSION: ${{ needs.prepare.outputs.snapshot-version }}
+        run: |
+          set -euo pipefail
+          node <<'EOF'
           const fs = require('node:fs');
-          const path = require('node:path');
-          const stage = process.argv[2];
-          const src = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+          const pkgPath = './package.json';
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
           const version = process.env.SNAPSHOT_VERSION;
           if (!version) throw new Error('SNAPSHOT_VERSION not set');
 
           // Pin each per-triple CLI sub-package as an optionalDependency.
-          // npm/bun honour os/cpu constraints declared by the sub-package's
-          // own package.json, so only the matching one installs on a given
-          // host.
+          // npm/bun honour the os/cpu constraints declared in the
+          // sub-package's own package.json, so only the matching one
+          // installs on a given host.
           const CLI_TRIPLES = [
             'linux-x64-gnu',
             'linux-arm64-gnu',
@@ -518,32 +526,16 @@ jobs:
             optionalDependencies[`@cenozon/uniffi-bindgen-react-native-cli-${t}`] = version;
           }
 
-          const out = {
-            name: '@cenozon/uniffi-bindgen-react-native',
-            version,
-            description: src.description,
-            homepage: src.homepage,
-            repository: src.repository,
-            license: src.license,
-            author: src.author,
-            type: src.type,
-            main: src.main,
-            types: src.types,
-            bin: src.bin,
-            optionalDependencies,
-            files: [
-              'bin/',
-              'typescript/dist/',
-              'README.md',
-              'LICENSE',
-            ],
-            publishConfig: {
-              registry: 'https://npm.pkg.github.com',
-              access: 'restricted',
-            },
+          pkg.name = '@cenozon/uniffi-bindgen-react-native';
+          pkg.version = version;
+          pkg.optionalDependencies = optionalDependencies;
+          pkg.publishConfig = {
+            registry: 'https://npm.pkg.github.com',
+            access: 'restricted',
           };
-          fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify(out, null, 2) + '\n');
-          console.log('Wrote', path.join(stage, 'package.json'));
+
+          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          console.log(`Rewrote ${pkgPath}: name=${pkg.name} version=${pkg.version}`);
           EOF
 
       - name: List staged packages
@@ -555,10 +547,12 @@ jobs:
             cat "$d/package.json"
             echo ""
           done
-          echo "--- dist-cenozon-bindgen ---"
-          ls -la dist-cenozon-bindgen/
-          echo "--- dist-cenozon-bindgen/package.json ---"
-          cat dist-cenozon-bindgen/package.json
+          echo "--- repo root (publish source for @cenozon/uniffi-bindgen-react-native) ---"
+          ls -la .
+          echo "--- ./package.json ---"
+          cat ./package.json
+          echo "--- npm pack --dry-run (what will land in the tarball) ---"
+          npm pack --dry-run
 
       # The `npm publish` invocations use NODE_AUTH_TOKEN sourced from the
       # workflow's own GITHUB_TOKEN. setup-node@v4 above wrote an .npmrc
@@ -583,8 +577,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish --tag snapshot --access restricted
 
+      # Publish from the repo root, mirroring upstream's `.github/workflows/npm.yml`
+      # which just `npm publish`'s from the checkout. The in-place package.json
+      # rewrite above is the only diff vs. upstream's flow.
       - name: Publish @cenozon/uniffi-bindgen-react-native
-        working-directory: dist-cenozon-bindgen
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm publish --tag snapshot --access restricted
