@@ -95,7 +95,16 @@ impl WasmConfig {
         false
     }
     fn default_runtime_version() -> String {
-        format!("={}", env!("CARGO_PKG_VERSION"))
+        // Pin to the `uniffi-runtime-javascript` crate version — NOT
+        // this CLI crate's `CARGO_PKG_VERSION`. The cenozon publish
+        // workflow stamps `ubrn_cli/Cargo.toml`'s version to a snapshot
+        // tag (e.g. `0.31.0-cenozon.g7276585`) so the podspec line
+        // matches the published npm package, but `uniffi-runtime-javascript`
+        // is never republished — only the upstream value lives on
+        // crates.io. Reading the runtime crate's actual Cargo.toml
+        // version at build time (via `build.rs`) keeps the two
+        // decoupled and the generated wasm-crate dep resolvable.
+        format!("={}", env!("UBRN_RUNTIME_JAVASCRIPT_VERSION"))
     }
     fn default_entrypoint() -> String {
         let package_json = workspace::package_json();
