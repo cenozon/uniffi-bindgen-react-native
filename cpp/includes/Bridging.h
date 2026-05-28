@@ -5,6 +5,19 @@
  */
 #pragma once
 
+// Self-contained — `CMutableBuffer` derives from `jsi::MutableBuffer` and the
+// `arraybufferToUint8Array` helper deals in `jsi::*` types. Pulling jsi here
+// avoids a load-order trap where any consumer that includes this header
+// before `<jsi/jsi.h>` (e.g. via `<RustBuffer.h>`) fails to parse.
+#include <cstddef>
+#include <cstdint>
+#include <jsi/jsi.h>
+
+// Same alias the other in-tree headers (`UniffiCallInvoker.h`,
+// `<RustBuffer.h>` consumers) use for `facebook::jsi`. Declaring it here
+// keeps Bridging.h usable in any include order.
+namespace jsi = facebook::jsi;
+
 namespace uniffi_jsi {
 
 // Declare the Bridging template

@@ -1,5 +1,9 @@
 [general]
-dirs = ["src/bindings/gen_typescript/templates", "src/bindings/gen_cpp/templates"]
+dirs = [
+  "src/bindings/gen_typescript/templates",
+  "src/bindings/gen_cpp/templates",
+  "src/bindings/gen_nitro/templates",
+]
 
 [[syntax]]
 name = "ts"

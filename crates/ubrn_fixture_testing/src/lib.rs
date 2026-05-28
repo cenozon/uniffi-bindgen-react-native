@@ -9,15 +9,18 @@ pub mod typescript;
 
 pub mod jsi;
 pub mod napi;
+pub mod nitro;
 pub mod ts;
 pub mod wasm;
 
-/// Test flavor: JSI (Hermes native), WASM (Node.js), or Napi (Node.js N-API).
+/// Test flavor: JSI (Hermes native), WASM (Node.js), Napi (Node.js N-API),
+/// or Nitro (Hermes + Nitro HybridObjects via the desktop test-runner-nitro).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
     Jsi,
     Wasm,
     Napi,
+    Nitro,
 }
 
 impl Flavor {
@@ -26,6 +29,7 @@ impl Flavor {
             Flavor::Jsi => "jsi",
             Flavor::Wasm => "wasm",
             Flavor::Napi => "napi",
+            Flavor::Nitro => "nitro",
         }
     }
 }

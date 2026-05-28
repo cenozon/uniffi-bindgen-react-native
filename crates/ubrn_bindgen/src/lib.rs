@@ -11,8 +11,12 @@ mod switches;
 mod wasm;
 
 pub use self::{
-    bindings::{generate_entrypoint, metadata::ModuleMetadata},
-    cli::{BindingsArgs, OutputArgs, SourceArgs},
+    bindings::{
+        generate_entrypoint,
+        gen_nitro::{HybridObjectEntry, HybridObjectKind},
+        metadata::ModuleMetadata,
+    },
+    cli::{BindingsArgs, BindingsOutcome, OutputArgs, SourceArgs},
     switches::{AbiFlavor, SwitchArgs},
 };
 

@@ -20,6 +20,9 @@ pub fn generate_entrypoint(
     match &switches.flavor {
         AbiFlavor::Jsi => gen_cpp::generate_entrypoint(crate_, modules),
         AbiFlavor::Napi => Ok(String::new()),
+        // Nitro doesn't emit a project-wide entrypoint — Nitrogen's
+        // auto-generated `<Name>OnLoad.cpp` is the runtime hook.
+        AbiFlavor::Nitro => Ok(String::new()),
         #[cfg(feature = "wasm")]
         AbiFlavor::Wasm => gen_rust::generate_entrypoint(crate_, modules),
     }

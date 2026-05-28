@@ -4,6 +4,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/
  */
 mod hermes;
+mod nitro;
+mod nitro_test_runner;
 mod test_runner;
 mod yarn;
 
@@ -14,6 +16,8 @@ use clap::{Args, Subcommand};
 use crate::clean::CleanCmd;
 
 pub(crate) use self::hermes::HermesCmd;
+pub(crate) use self::nitro::NitroCmd;
+pub(crate) use self::nitro_test_runner::NitroTestRunnerCmd;
 pub(crate) use self::test_runner::TestRunnerCmd;
 pub(crate) use self::yarn::YarnCmd;
 
@@ -34,6 +38,8 @@ impl BootstrapCmd {
         if let Some(cmd) = &self.cmd {
             match cmd {
                 SubsystemCmd::Hermes(c) => c.bootstrap(clean)?,
+                SubsystemCmd::Nitro(c) => c.bootstrap(clean)?,
+                SubsystemCmd::NitroTestRunner(c) => c.bootstrap(clean)?,
                 SubsystemCmd::TestRunner(c) => c.bootstrap(clean)?,
                 SubsystemCmd::Yarn(c) => c.bootstrap(clean)?,
             }
@@ -50,10 +56,14 @@ impl BootstrapCmd {
         HermesCmd::default().bootstrap(false)?;
         TestRunnerCmd.bootstrap(false)?;
         YarnCmd.bootstrap(false)?;
+        NitroCmd::default().bootstrap(false)?;
+        NitroTestRunnerCmd.bootstrap(false)?;
         Ok(())
     }
 
     pub(crate) fn clean_all() -> Result<()> {
+        NitroTestRunnerCmd::clean()?;
+        NitroCmd::clean()?;
         YarnCmd::clean()?;
         TestRunnerCmd::clean()?;
         HermesCmd::clean()?;
@@ -74,6 +84,17 @@ enum SubsystemCmd {
     /// Install nodejs tooling
     #[clap(aliases = ["npm", "js", "ts"])]
     Yarn(YarnCmd),
+    /// react-native-nitro-modules' C++ runtime.
+    ///
+    /// This command clones (or, by preference, symlinks an existing local
+    /// checkout of) nitro and builds a desktop-linkable `libNitroModules`
+    /// against Hermes' JSI for use by the test-runner.
+    Nitro(NitroCmd),
+    /// The Nitro-aware counterpart to the JSI `TestRunner`. Builds a Hermes
+    /// host that installs `global.NitroModulesProxy` and a CallInvoker-backed
+    /// Dispatcher before evaluating user JS, so loaded shared libs that
+    /// register HybridObjects (via `HybridObjectRegistry`) are reachable from JS.
+    NitroTestRunner(NitroTestRunnerCmd),
 }
 
 pub(crate) trait Bootstrap {

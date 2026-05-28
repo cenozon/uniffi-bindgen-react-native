@@ -40,7 +40,37 @@ pub fn run_test(test_script: &str, flavor: Flavor, target_tmpdir: &str) {
             paths::assert_napi_bootstrap();
             crate::run_tsx(test_script);
         }
+        Flavor::Nitro => {
+            // Framework TS tests don't have a fixture cdylib, so the
+            // Nitro flavor reuses the JSI bundling pipeline + the
+            // Nitro-aware test runner. Bootstrap checks here skip
+            // (rather than panic) to mirror the per-fixture Nitro flow
+            // — see `crate::nitro::run_test`.
+            if let Err(msg) = paths::assert_nitro_bootstrap() {
+                eprintln!("skipping nitro framework test {test_stem}: {msg}");
+                return;
+            }
+            let _lock = crate::lock_fixture();
+            let nitro_modules_pkg = paths::nitro_modules_pkg_dir();
+            let ubrn_nitro_runtime_pkg = paths::ubrn_nitro_runtime_pkg_dir();
+            let extras: &[(&str, &camino::Utf8Path)] = &[
+                ("react-native-nitro-modules", nitro_modules_pkg.as_path()),
+                ("@ubrn/nitro-runtime", ubrn_nitro_runtime_pkg.as_path()),
+            ];
+            let bundle = typescript::prepare_for_jsi_with_extras(
+                test_script, &out_dir, None, extras,
+            );
+            run_test_runner_nitro_no_lib(&bundle);
+        }
     }
+}
+
+fn run_test_runner_nitro_no_lib(bundle: &Utf8Path) {
+    let runner = paths::nitro_test_runner_binary();
+    let mut cmd = Command::new(runner.as_str());
+    cmd.arg(bundle.as_str());
+    paths::add_nitro_dll_paths(&mut cmd);
+    run_cmd_quietly(&mut cmd);
 }
 
 fn run_test_runner_no_lib(bundle: &Utf8Path) {

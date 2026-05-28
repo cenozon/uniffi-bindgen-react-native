@@ -1,0 +1,307 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/
+ */
+
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <sstream>
+#include <thread>
+#ifndef _WIN32
+#include <dlfcn.h>
+#else
+#include <windows.h>
+#endif
+
+/// The JS library that implements the setTimeout and setImmediate.
+/// Reused verbatim from the JSI test-runner.
+static const char *s_jslib =
+#include "timers.js.inc"
+    ;
+
+#include "MyCallInvoker.h"
+#include <ReactCommon/CallInvoker.h>
+#include <hermes/hermes.h>
+#include <jsi/instrumentation.h>
+
+// Nitro entrypoint + Dispatcher implementation backed by a react::CallInvoker.
+#include <InstallNitro.hpp>
+#include <CallInvokerDispatcher.hpp>
+
+/// Read the contents of a file into a string.
+static std::optional<std::string> readFile(const char *path) {
+  std::ifstream fileStream(path);
+  std::stringstream stringStream;
+
+  if (fileStream) {
+    stringStream << fileStream.rdbuf();
+    fileStream.close();
+  } else {
+    // Handle error - file opening failed
+    std::cerr << path << ": error opening file" << std::endl;
+    return std::nullopt;
+  }
+
+  return stringStream.str();
+}
+
+/// The signature of the function that initializes the library.
+///
+/// For "classic" JSI libs this installs host objects on globalThis directly.
+/// For Nitro libs this typically calls
+/// `HybridObjectRegistry::registerHybridObjectConstructor(...)` instead.
+/// The runner is agnostic — it just calls the symbol.
+typedef void (*RegisterNativesFN)(facebook::jsi::Runtime &rt);
+
+#ifndef _WIN32
+/// Load the library and return the "registerNatives()" function.
+static RegisterNativesFN loadRegisterNatives(const char *libraryPath) {
+  // Open the library.
+  void *handle = dlopen(libraryPath, RTLD_LAZY);
+  if (!handle) {
+    std::cerr << "*** Cannot open library: " << dlerror() << '\n';
+    return nullptr;
+  }
+
+  // Clear any existing error.
+  dlerror();
+  // Load the symbol (function).
+  auto func = (RegisterNativesFN)dlsym(handle, "registerNatives");
+  if (const char *dlsym_error = dlerror()) {
+    std::cerr << "Cannot load symbol 'registerNatives': " << dlsym_error
+              << '\n';
+    dlclose(handle);
+    return nullptr;
+  }
+
+  return func;
+}
+#else
+/// Load the library and return the "registerNatives()" function.
+static RegisterNativesFN loadRegisterNatives(const char *libraryPath) {
+  // Load the library
+  HMODULE hModule = LoadLibraryA(libraryPath);
+  if (!hModule) {
+    std::cerr << "Cannot open library: " << GetLastError() << '\n';
+    return nullptr;
+  }
+
+  // Get the function address
+  auto func = (RegisterNativesFN)GetProcAddress(hModule, "registerNatives");
+  if (!func) {
+    std::cerr << "Cannot load symbol 'registerNatives': " << GetLastError()
+              << '\n';
+    FreeLibrary(hModule);
+    return nullptr;
+  }
+
+  return func;
+}
+#endif
+
+static std::shared_ptr<facebook::jsi::Runtime> createRuntime() {
+  // `react-native-nitro-modules`' JS surface uses ES6 classes and
+  // block-scoped declarations (e.g. `class ModuleNotFoundError extends
+  // Error { ... }` evaluated at module load). The vendored Hermes
+  // defaults both off (`ES6Class = false`, `EnableBlockScoping = false`)
+  // — flip both on so the bundled package parses.
+  //
+  // Eager compilation is also required: under the default `SmartCompilation`
+  // mode, top-level source is compiled eagerly but Metro factory function
+  // bodies are deferred and lazy-compiled on first call. In that lazy path
+  // the `enableES6Classes` flag is not honored, so a `class X extends Y {}`
+  // declared inside a `__d(function () { ... })` factory silently fails to
+  // bind `X` and any later `var.X = X` reference throws
+  // `ReferenceError: Property 'X' doesn't exist`. Forcing eager compilation
+  // makes the class transform run uniformly.
+  auto runtimeConfig = ::hermes::vm::RuntimeConfig::Builder()
+                           .withIntl(false)
+                           .withMicrotaskQueue(true)
+                           .withES6Class(true)
+                           .withEnableBlockScoping(true)
+                           .withCompilationMode(::hermes::vm::ForceEagerCompilation)
+                           .build();
+  return facebook::hermes::makeHermesRuntime(runtimeConfig);
+}
+
+static std::vector<RegisterNativesFN> loadNativeLibraryFunctions(int argc,
+                                                                 char **argv) {
+  std::vector<RegisterNativesFN> functions;
+  for (int i = 2; i < argc; i++) {
+    auto func = loadRegisterNatives(argv[i]);
+    if (!func) {
+      throw std::runtime_error("Failed to load native library");
+    }
+    functions.push_back(func);
+  }
+  return functions;
+}
+
+static void
+registerNativeLibraries(facebook::jsi::Runtime &rt,
+                        const std::vector<RegisterNativesFN> &functions) {
+  for (const auto &func : functions) {
+    func(rt);
+  }
+}
+
+/// Install Nitro's runtime entrypoint:
+///   - Creates `global.NitroModulesProxy`
+///   - Registers a Dispatcher (backed by our CallInvoker) so Nitro can run
+///     callbacks / Promises back on the JS thread.
+///
+/// Must be called *before* any registered HybridObject constructor is invoked
+/// from JS, but Nitro doesn't care if it's called before or after a lib's
+/// `registerNatives()` populates the `HybridObjectRegistry`.
+static void installNitro(facebook::jsi::Runtime &runtime,
+                         std::shared_ptr<facebook::react::CallInvoker> invoker) {
+  auto dispatcher =
+      std::make_shared<margelo::nitro::CallInvokerDispatcher>(invoker);
+  margelo::nitro::install(runtime, dispatcher);
+}
+
+static double currentTimeMillis() {
+  auto now = std::chrono::steady_clock::now();
+  return (double)std::chrono::duration_cast<std::chrono::milliseconds>(
+             now.time_since_epoch())
+      .count();
+}
+
+static void installPerformanceNow(facebook::jsi::Runtime &runtime) {
+  auto fn = facebook::jsi::Function::createFromHostFunction(
+      runtime, facebook::jsi::PropNameID::forAscii(runtime, "__performanceNow"),
+      0,
+      [](facebook::jsi::Runtime &rt, const facebook::jsi::Value &,
+         const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        double ms = std::chrono::duration<double, std::milli>(now).count();
+        return facebook::jsi::Value(ms);
+      });
+  runtime.global().setProperty(runtime, "__performanceNow", fn);
+}
+
+static void installHeapInfo(facebook::jsi::Runtime &runtime) {
+  auto fn = facebook::jsi::Function::createFromHostFunction(
+      runtime, facebook::jsi::PropNameID::forAscii(runtime, "__hermesHeapInfo"),
+      0,
+      [](facebook::jsi::Runtime &rt, const facebook::jsi::Value &,
+         const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
+        auto info =
+            rt.instrumentation().getHeapInfo(/*includeExpensive=*/false);
+        facebook::jsi::Object out(rt);
+        for (const auto &kv : info) {
+          out.setProperty(rt, kv.first.c_str(),
+                          facebook::jsi::Value(static_cast<double>(kv.second)));
+        }
+        return facebook::jsi::Value(rt, out);
+      });
+  runtime.global().setProperty(runtime, "__hermesHeapInfo", fn);
+}
+
+static void installGc(facebook::jsi::Runtime &runtime) {
+  auto fn = facebook::jsi::Function::createFromHostFunction(
+      runtime, facebook::jsi::PropNameID::forAscii(runtime, "__hermesGc"), 0,
+      [](facebook::jsi::Runtime &rt, const facebook::jsi::Value &,
+         const facebook::jsi::Value *, size_t) -> facebook::jsi::Value {
+        rt.instrumentation().collectGarbage("test-runner-nitro");
+        return facebook::jsi::Value::undefined();
+      });
+  runtime.global().setProperty(runtime, "__hermesGc", fn);
+}
+
+static int runEventLoop(facebook::jsi::Runtime &runtime,
+                        std::shared_ptr<uniffi::testing::MyCallInvoker> invoker,
+                        const std::string &jsCode, const char *jsPath) {
+  try {
+    installPerformanceNow(runtime);
+    installHeapInfo(runtime);
+    installGc(runtime);
+    facebook::jsi::Object helpers =
+        runtime
+            .evaluateJavaScript(
+                std::make_unique<facebook::jsi::StringBuffer>(s_jslib),
+                "timers.js.inc")
+            .asObject(runtime);
+    auto peekMacroTask = helpers.getPropertyAsFunction(runtime, "peek");
+    auto runMacroTask = helpers.getPropertyAsFunction(runtime, "run");
+
+    runMacroTask.call(runtime, currentTimeMillis());
+
+    runtime.evaluateJavaScript(
+        std::make_unique<facebook::jsi::StringBuffer>(jsCode), jsPath);
+    invoker->drainTasks(runtime);
+    runtime.drainMicrotasks();
+
+    double nextTimeMs;
+    while ((nextTimeMs = peekMacroTask.call(runtime).getNumber()) >= 0) {
+      double duration = nextTimeMs - currentTimeMillis();
+      if (duration > 0) {
+        invoker->waitForTaskOrTimeout(duration);
+      }
+      invoker->drainTasks(runtime);
+      runtime.drainMicrotasks();
+      runMacroTask.call(runtime, currentTimeMillis());
+      runtime.drainMicrotasks();
+    }
+    return 0;
+  } catch (facebook::jsi::JSError &e) {
+    std::cerr << "JS Exception: " << e.getStack() << std::endl;
+    return 1;
+  }
+}
+
+int main(int argc, char **argv) {
+  // If no argument is provided, print usage and exit.
+  if (argc < 2) {
+    std::cout << "Usage: " << argv[0] << " <path-to-js-file> [<shared-lib>...]"
+              << std::endl;
+    return 1;
+  }
+  const char *jsPath = argv[1];
+
+  // Read the file.
+  auto optCode = readFile(jsPath);
+  if (!optCode)
+    return 1;
+
+  try {
+    auto nativeFunctions = loadNativeLibraryFunctions(argc, argv);
+
+    // Run the test twice (matches the JSI runner — exercises runtime teardown).
+    for (int i = 0; i < 2; i++) {
+      std::cout << "Running iteration " << (i + 1) << std::endl;
+
+      auto runtime = createRuntime();
+      auto invoker = std::make_shared<uniffi::testing::MyCallInvoker>(*runtime);
+
+      invoker->invokeAsync([i](facebook::jsi::Runtime &rt) {
+        std::cout << "-- Starting the hermes event loop (iteration " << (i + 1)
+                  << ")" << std::endl;
+      });
+
+      // Install Nitro's runtime entrypoint (global.NitroModulesProxy +
+      // Dispatcher) *before* loading user libs, so a lib's registerNatives()
+      // can immediately use Nitro helpers if it wants to. The
+      // HybridObjectRegistry itself is process-global so the order of
+      // installNitro() vs registerNativeLibraries() doesn't actually matter
+      // for registration — but it does matter if any lib touches
+      // global.NitroModulesProxy during registration.
+      installNitro(*runtime, invoker);
+
+      registerNativeLibraries(*runtime, nativeFunctions);
+
+      int status = runEventLoop(*runtime, invoker, *optCode, jsPath);
+      if (status != 0)
+        return status;
+
+      // Runtime will be destroyed here when shared_ptr goes out of scope
+    }
+
+    return 0;
+  } catch (facebook::jsi::JSIException &e) {
+    std::cerr << "JSI Exception: " << e.what() << std::endl;
+    return 1;
+  }
+}

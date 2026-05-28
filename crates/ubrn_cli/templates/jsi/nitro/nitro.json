@@ -1,0 +1,24 @@
+{
+  "$schema": "https://nitro.margelo.com/nitro.schema.json",
+  "cxxNamespace": ["{{ self.config.project.cpp_namespace() }}"],
+  "ios": {
+    "iosModuleName": "{{ self.config.project.spec_name() }}"
+  },
+  "android": {
+    "androidNamespace": ["{{ self.config.project.cpp_namespace() }}"],
+    "androidCxxLibName": "{{ self.config.project.spec_name() }}"
+  },
+  "autolinking": {
+    {%- for func in self.config.nitro_hybrid_objects %}
+    "{{ func.name }}": {
+      "all": {
+        "language": "c++",
+        "implementationClassName": "{{ func.cxx_class }}"
+      }
+    }{%- if !loop.last -%},{%- endif %}
+    {%- endfor %}
+  },
+  "ignorePaths": [
+    "**/node_modules"
+  ]
+}

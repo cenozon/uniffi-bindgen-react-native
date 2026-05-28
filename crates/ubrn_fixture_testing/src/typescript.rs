@@ -21,11 +21,56 @@ pub fn prepare_for_jsi(
     out_dir: &Utf8Path,
     generated_dir: Option<&Utf8Path>,
 ) -> Utf8PathBuf {
+    prepare_for_jsi_with_extras(test_script, out_dir, generated_dir, &[])
+}
+
+/// Variant of [`prepare_for_jsi`] that registers additional Metro
+/// `extraNodeModules` entries so the bundled JS can resolve non-installed
+/// packages (e.g. `react-native-nitro-modules` and `@ubrn/nitro-runtime`
+/// for the Nitro flavor).
+///
+/// Each `(name, dir)` pair maps an import specifier to a package root.
+/// Entries pull double duty: they're written into both the tsconfig
+/// `paths` map (so `tsc` can typecheck imports against the package's
+/// source) and Metro's `extraNodeModules` map (so the runtime resolver
+/// finds the same package). Use `<dir>/src/index` as the TSC target when
+/// the package ships TS sources; for built-only packages, point at the
+/// `main` from package.json.
+pub fn prepare_for_jsi_with_extras(
+    test_script: &Utf8Path,
+    out_dir: &Utf8Path,
+    generated_dir: Option<&Utf8Path>,
+    extra_modules: &[(&str, &Utf8Path)],
+) -> Utf8PathBuf {
+    prepare_for_jsi_with_extras_and_platform(
+        test_script,
+        out_dir,
+        generated_dir,
+        extra_modules,
+        None,
+    )
+}
+
+/// Same as [`prepare_for_jsi_with_extras`] but lets the caller pin a
+/// Metro `--platform`. Required for the Nitro flow because
+/// `react-native-nitro-modules` ships a `.web.js` platform extension
+/// whose proxy throws on every access — when Metro has no platform
+/// hint it can resolve to that file and the test would fail before
+/// it ever reaches native code. Passing `Some("ios")` makes Metro fall
+/// back to the bare `.js` (the variant that consults
+/// `global.NitroModulesProxy`, which the desktop runner installs).
+pub fn prepare_for_jsi_with_extras_and_platform(
+    test_script: &Utf8Path,
+    out_dir: &Utf8Path,
+    generated_dir: Option<&Utf8Path>,
+    extra_modules: &[(&str, &Utf8Path)],
+    platform: Option<&str>,
+) -> Utf8PathBuf {
     let stem = test_script.file_stem().unwrap_or("test");
     let tsc_dir = out_dir.join("tsc");
 
     // Generate tsconfig.json
-    let tsconfig = prepare_tsconfig(&tsc_dir, "es5", test_script, generated_dir);
+    let tsconfig = prepare_tsconfig(&tsc_dir, "es5", test_script, generated_dir, extra_modules);
 
     // Compile with tsc
     compile_ts(&tsconfig);
@@ -34,6 +79,11 @@ pub fn prepare_for_jsi(
     // tsc-alias has trouble when outDir == configDir, so we do it ourselves.
     rewrite_at_paths(&tsc_dir, generated_dir);
 
+    // Rewrite bare specifiers for the extra modules into relative paths so
+    // Metro doesn't have to walk node_modules for things that don't live
+    // there. This keeps the bundle hermetic w.r.t. the vendored packages.
+    rewrite_extra_module_imports(&tsc_dir, extra_modules);
+
     // Find the compiled JS file
     let js_file = find_compiled_js(&tsc_dir, stem);
 
@@ -41,7 +91,7 @@ pub fn prepare_for_jsi(
     let bundle_dir = out_dir.join("bundles");
     std::fs::create_dir_all(&bundle_dir).expect("failed to create bundle dir");
     let bundle_path = bundle_dir.join(format!("{stem}.bundle.js"));
-    bundle_with_metro(&js_file, &bundle_path, &tsc_dir);
+    bundle_with_metro(&js_file, &bundle_path, &tsc_dir, extra_modules, platform);
 
     bundle_path
 }
@@ -56,6 +106,7 @@ fn prepare_tsconfig(
     target: &str,
     test_script: &Utf8Path,
     generated_dir: Option<&Utf8Path>,
+    extra_modules: &[(&str, &Utf8Path)],
 ) -> Utf8PathBuf {
     std::fs::create_dir_all(tsc_dir).expect("failed to create tsc output dir");
 
@@ -82,6 +133,19 @@ fn prepare_tsconfig(
             "\"@/*\":",
             &format!("\"@/generated/*\": [\"{rel_gen}/*\"],\n      \"@/*\":"),
         );
+    }
+
+    // Add per-package `paths` entries for the extra modules so TSC can
+    // resolve them. We point at <dir> as a bare entry — TSC will fall
+    // through to the package's `types`/`main` field. Place them before
+    // `@/*` so the more-specific names match first.
+    if !extra_modules.is_empty() {
+        let mut entries = String::new();
+        for (name, dir) in extra_modules {
+            let rel = relative_path(dir, tsc_dir);
+            entries.push_str(&format!("\"{name}\": [\"{rel}\"],\n      "));
+        }
+        contents = contents.replace("\"@/*\":", &format!("{entries}\"@/*\":"));
     }
 
     // Uncomment outDir so tsc-alias can find the output directory.
@@ -244,7 +308,13 @@ fn find_file_recursive(dir: &Utf8Path, filename: &str) -> Option<Utf8PathBuf> {
 /// A temporary `metro.config.js` is generated in `tsc_dir` so that Metro can
 /// discover files that live under `target/` (which watchman normally ignores
 /// because it is listed in `.gitignore`).
-fn bundle_with_metro(js_file: &Utf8Path, bundle_path: &Utf8Path, tsc_dir: &Utf8Path) {
+fn bundle_with_metro(
+    js_file: &Utf8Path,
+    bundle_path: &Utf8Path,
+    tsc_dir: &Utf8Path,
+    extra_modules: &[(&str, &Utf8Path)],
+    platform: Option<&str>,
+) {
     let metro = paths::node_modules_bin().join("metro");
     let repo_root = paths::repo_root();
 
@@ -254,36 +324,108 @@ fn bundle_with_metro(js_file: &Utf8Path, bundle_path: &Utf8Path, tsc_dir: &Utf8P
     //  - disables watchman for the same reason
     //  - resolves `@/*` imports to the compiled `typescript/testing/*` tree
     //    (tsc-alias cannot reliably rewrite these when outDir == configDir)
+    //  - registers any extra packages (`react-native-nitro-modules`, …)
+    //    that don't live in the workspace `node_modules`.
     let testing_dir = tsc_dir.join("typescript/testing");
     let metro_config_path = tsc_dir.join("metro.config.cjs");
     let repo_root = repo_root.to_forward_slash();
     let tsc_dir_fwd = tsc_dir.to_forward_slash();
     let testing_dir = testing_dir.to_forward_slash();
+
+    // Collect watchFolders for every extra package + the tsc dir. Metro
+    // refuses to resolve a path outside its `watchFolders ∪ projectRoot`,
+    // and the Nitro packages live under `cpp_modules/` which is outside
+    // the default root.
+    let mut watch_folders = vec![format!("path.resolve(\"{tsc_dir_fwd}\")")];
+    let mut extra_node_modules =
+        String::from(&format!("      \"@\": path.resolve(\"{testing_dir}\"),\n"));
+    for (name, dir) in extra_modules {
+        let dir_fwd = dir.to_forward_slash();
+        watch_folders.push(format!("path.resolve(\"{dir_fwd}\")"));
+        extra_node_modules.push_str(&format!(
+            "      \"{name}\": path.resolve(\"{dir_fwd}\"),\n"
+        ));
+    }
+    let watch_folders = watch_folders.join(", ");
+
     let metro_config = format!(
         r#"const path = require("path");
 module.exports = {{
   projectRoot: path.resolve("{repo_root}"),
-  watchFolders: [path.resolve("{tsc_dir_fwd}")],
+  watchFolders: [{watch_folders}],
   resolver: {{
     useWatchman: false,
     extraNodeModules: {{
-      "@": path.resolve("{testing_dir}"),
-    }},
+{extra_node_modules}    }},
   }},
 }};
 "#,
     );
     std::fs::write(&metro_config_path, metro_config).expect("failed to write metro.config.js");
 
-    run_cmd_quietly(
-        command(&metro)
-            .arg("build")
-            .arg("--minify")
-            .arg("false")
-            .arg("--config")
-            .arg(&metro_config_path)
-            .arg("--out")
-            .arg(bundle_path)
-            .arg(js_file),
-    );
+    let mut cmd = command(&metro);
+    cmd.arg("build")
+        .arg("--minify")
+        .arg("false")
+        .arg("--config")
+        .arg(&metro_config_path)
+        .arg("--out")
+        .arg(bundle_path);
+    if let Some(p) = platform {
+        cmd.arg("--platform").arg(p);
+    }
+    cmd.arg(js_file);
+    run_cmd_quietly(&mut cmd);
+}
+
+/// Rewrite bare-specifier imports of the named extra packages to absolute
+/// paths in every compiled `.js` file under `tsc_dir`. Mirrors the
+/// rewriting logic for `uniffi-bindgen-react-native` / `@/*` (see
+/// `rewrite_paths_recursive`) but for arbitrary extra modules.
+fn rewrite_extra_module_imports(tsc_dir: &Utf8Path, extra_modules: &[(&str, &Utf8Path)]) {
+    if extra_modules.is_empty() {
+        return;
+    }
+    rewrite_extras_recursive(tsc_dir, extra_modules);
+}
+
+fn rewrite_extras_recursive(dir: &Utf8Path, extra_modules: &[(&str, &Utf8Path)]) {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let utf8: Utf8PathBuf = match path.try_into() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if utf8.is_dir() {
+            rewrite_extras_recursive(&utf8, extra_modules);
+        } else if utf8.extension() == Some("js") {
+            let contents = match std::fs::read_to_string(&utf8) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let file_dir = utf8.parent().unwrap();
+            let mut rewritten = contents;
+            let mut changed = false;
+            for (name, target) in extra_modules {
+                let needle_dq = format!("\"{name}\"");
+                let needle_sq = format!("'{name}'");
+                if !rewritten.contains(&needle_dq) && !rewritten.contains(&needle_sq) {
+                    continue;
+                }
+                let rel = relative_path(target, file_dir);
+                let rel_str = make_relative(&rel);
+                rewritten = rewritten.replace(&needle_dq, &format!("\"{rel_str}\""));
+                rewritten = rewritten.replace(&needle_sq, &format!("\"{rel_str}\""));
+                changed = true;
+            }
+            if changed {
+                std::fs::write(&utf8, rewritten)
+                    .unwrap_or_else(|e| panic!("failed to write {utf8}: {e}"));
+            }
+        }
+    }
 }

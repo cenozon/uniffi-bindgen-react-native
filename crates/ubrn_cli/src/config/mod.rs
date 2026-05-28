@@ -19,6 +19,22 @@ use crate::{
     workspace,
 };
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Framework {
+    /// React Native TurboModule (the original ubrn target).
+    #[default]
+    #[serde(alias = "turboModule", alias = "turbomodule", alias = "turbo")]
+    TurboModule,
+    /// Nitro Modules. ubrn emits one Nitro HybridObject per uniffi
+    /// interface, one HybridObject per uniffi namespace for top-level
+    /// functions, Nitro structs for records, Nitro enums for enums.
+    /// Methods call the uniffi C ABI directly via the `@ubrn/nitro-runtime`
+    /// C++ headers — there is no JSI host-object middle layer.
+    #[serde(alias = "nitroModules", alias = "nitromodules", alias = "nitro-native")]
+    Nitro,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectConfig {
@@ -30,6 +46,13 @@ pub(crate) struct ProjectConfig {
 
     #[serde(default = "ProjectConfig::default_repository")]
     pub(crate) repository: String,
+
+    /// Native module framework to generate plumbing for. Defaults to
+    /// `turbo-module` for backward compatibility; set to `nitro` to emit a
+    /// Nitro Modules HybridObject + nitro.json instead of the TurboModule
+    /// registration shell.
+    #[serde(default)]
+    pub(crate) framework: Framework,
 
     #[serde(rename = "rust", alias = "crate")]
     pub(crate) crate_: CrateConfig,
