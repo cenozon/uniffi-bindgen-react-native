@@ -148,19 +148,21 @@ inline double read_duration(RustBufferReader &r) { return r.read_duration(); }
 // A uniffi `interface` crosses the C ABI as a bare `uint64_t` Arc handle.
 // When one appears *inside* a composite (`Vec<Counter>`, `Option<Counter>`,
 // a record field, an enum payload) it's wire-encoded as that u64. The
-// write thunk reads `raw_handle()` off the `std::shared_ptr<HybridT>`; the
+// write thunk clones the handle off the `std::shared_ptr<HybridT>`; the
 // read thunk wraps the decoded handle back into a fresh `HybridT`.
 //
-// Lowering does not transfer ownership of the C++-side handle: uniffi
-// clones the Arc on its end when it consumes a handle out of a buffer, so
-// the `shared_ptr` the JS side holds stays valid.
+// Lowering MUST clone: when uniffi reads an interface handle out of a
+// buffer it lifts it with `Arc::from_raw` and drops it on return — i.e. it
+// consumes one Arc reference. Handing over a clone (via `clone_handle()`,
+// which bumps the Rust-side strong count) keeps the `shared_ptr` the JS
+// side holds valid.
 // -----------------------------------------------------------------------
 
 template <typename HybridT, RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline void write_interface_handle(Writer<A, R> &w,
                                    const std::shared_ptr<HybridT> &v) {
-  w.write_u64(v->raw_handle());
+  w.write_u64(v->clone_handle());
 }
 
 template <typename HybridT>
@@ -375,6 +377,33 @@ inline RustBuffer lower_bytes(const BytesT &v) {
 inline BytesT lift_bytes(RustBuffer buf) {
   RustBufferReader r{buf};
   return read_bytes(r);
+}
+
+/// Zero-copy top-level lift for a `Vec<u8>` return. The uniffi wire payload
+/// is `[i32 len][len raw bytes]`; instead of copying the bytes out (as
+/// `lift_bytes` does for the in-composite case, where the reader is shared),
+/// we hand the payload region *directly* to JS as the ArrayBuffer's backing
+/// store. The whole Rust-owned `RustBuffer` is reclaimed via `FreeFn` when
+/// JS garbage-collects the ArrayBuffer — Hermes invokes the `wrap` deleter
+/// from the external-buffer finalizer. One Rust allocation, zero copies on
+/// the lift. Only valid when we own the entire buffer (a direct return /
+/// out value), which is why it is distinct from the copying `read_bytes`.
+template <void (*FreeFn)(RustBuffer, UniffiRustCallStatus *)>
+inline BytesT lift_bytes_owning(RustBuffer buf) {
+  RustBufferReader r{buf};
+  int32_t len = r.read_i32();
+  if (len <= 0) {
+    UniffiRustCallStatus s{};
+    FreeFn(buf, &s);
+    return ::margelo::nitro::ArrayBuffer::allocate(0);
+  }
+  // Payload starts after the 4-byte big-endian length prefix.
+  uint8_t *payload = buf.data + 4;
+  return ::margelo::nitro::ArrayBuffer::wrap(
+      payload, static_cast<size_t>(len), [buf]() {
+        UniffiRustCallStatus s{};
+        FreeFn(buf, &s);
+      });
 }
 
 } // namespace ubrn::nitro

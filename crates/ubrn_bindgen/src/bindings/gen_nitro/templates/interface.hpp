@@ -51,10 +51,17 @@ public:
   explicit {{ iface.cxx_class }}(uint64_t raw_handle)
       : HybridObject(TAG), handle_(raw_handle) {}
 
-  /// Public accessor for the raw uniffi handle. Used by other generated
-  /// HybridObject impls' lowering expressions when this interface is
-  /// passed as an argument.
+  /// Public accessor for the raw uniffi handle. Used internally where a
+  /// borrowed (non-consuming) view of the handle is needed.
   uint64_t raw_handle() const { return handle_.raw(); }
+
+  /// Clone the underlying uniffi Arc handle (bumps the Rust-side strong
+  /// count) and return the fresh handle. uniffi method / function calls and
+  /// argument lowering *consume* the handle they are handed — the scaffolding
+  /// does `Arc::from_raw` and drops it on return — so every place that passes
+  /// this object's handle to Rust must hand over a clone, or the first such
+  /// call drops our retained reference and frees the object out from under us.
+  uint64_t clone_handle() const;
 
 {%- for method in iface.methods %}
   {{ method.cxx_return_signature() }} {{ method.cxx_name }}(

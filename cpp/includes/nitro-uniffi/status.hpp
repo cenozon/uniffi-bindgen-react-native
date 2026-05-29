@@ -25,6 +25,7 @@
 #include <RustBuffer.h>
 #include <UniffiRustCallStatus.h>
 
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -40,31 +41,32 @@ enum class RustCallStatusCode : int8_t {
   Cancelled = 3,
 };
 
-/// Exception thrown when uniffi returns a typed error (`code == 1`). Holds
-/// onto the `RustBuffer` so the generated per-method wrapper can decode it
-/// into the project-specific error variant before propagating. After
-/// decoding the wrapper *must* call `release()` to hand the buffer back to
-/// Rust; the destructor otherwise leaks the buffer because we can't safely
-/// invoke a Rust allocator deallocation hook from a destructor.
+/// Exception thrown when uniffi returns a typed error (`code == 1`). Owns
+/// the error `RustBuffer` and frees it via the per-namespace free hook in
+/// its destructor — so the buffer is reclaimed on *every* path: whether the
+/// generated handler decodes it and rethrows, the decoder itself throws, or
+/// no handler exists at all (a method ubrn modeled as infallible). Decoders
+/// borrow the payload via `buffer()` and must NOT free it themselves.
 class UniffiTypedError : public std::runtime_error {
 public:
-  UniffiTypedError(RustBuffer error_buf)
+  UniffiTypedError(RustBuffer error_buf,
+                   std::function<void(RustBuffer)> free_buffer)
       : std::runtime_error("uniffi typed error (decode the error buffer)"),
-        error_buf_(error_buf), released_(false) {}
+        error_buf_(error_buf), free_buffer_(std::move(free_buffer)) {}
 
-  /// Hand ownership of the buffer to the caller. The caller is responsible
-  /// for freeing it via the project's per-namespace
-  /// `ffi_<crate>_rustbuffer_free` symbol after decoding.
-  RustBuffer release() {
-    released_ = true;
-    return error_buf_;
+  /// Borrow the encoded error payload for decoding. Ownership stays with the
+  /// exception; the destructor frees it once the handler returns or throws.
+  RustBuffer buffer() const noexcept { return error_buf_; }
+
+  ~UniffiTypedError() override {
+    if (free_buffer_) {
+      free_buffer_(error_buf_);
+    }
   }
-
-  ~UniffiTypedError() override = default;
 
 private:
   RustBuffer error_buf_;
-  bool released_;
+  std::function<void(RustBuffer)> free_buffer_;
 };
 
 /// Exception thrown for `code == 2`/`code == 3` paths — the Rust side
@@ -74,6 +76,25 @@ private:
 class UniffiUnexpectedError : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
+};
+
+/// RAII guard that frees a Rust-owned `RustBuffer` on scope exit. The
+/// generated method bodies wrap a successfully-returned buffer in this
+/// before lifting, so the buffer is reclaimed even if the lift codec throws
+/// (malformed/under-length payload, unknown enum tag, or `std::bad_alloc`
+/// while materializing a large value). `FreeFn` is the per-namespace
+/// `free_status_buffer` thunk; passed as a plain function pointer.
+class RustBufferGuard {
+public:
+  RustBufferGuard(RustBuffer buf, void (*free_fn)(RustBuffer) noexcept) noexcept
+      : buf_(buf), free_fn_(free_fn) {}
+  ~RustBufferGuard() { free_fn_(buf_); }
+  RustBufferGuard(const RustBufferGuard &) = delete;
+  RustBufferGuard &operator=(const RustBufferGuard &) = delete;
+
+private:
+  RustBuffer buf_;
+  void (*free_fn_)(RustBuffer) noexcept;
 };
 
 /// Default-construct a status struct in the "no error yet" state. The C-ABI
@@ -111,8 +132,10 @@ inline void check_status(const UniffiRustCallStatus &status,
   case RustCallStatusCode::Error:
     // Hand the buffer off to the generated per-error decoder. We
     // can't decode it ourselves — the variant shape is
-    // project-specific.
-    throw UniffiTypedError(status.error_buf);
+    // project-specific. The exception owns the buffer and frees it via
+    // `free_buffer` on destruction, so it is reclaimed even if there is no
+    // typed handler (infallible-modeled method) or the decoder throws.
+    throw UniffiTypedError(status.error_buf, free_buffer);
   case RustCallStatusCode::UnexpectedError: {
     std::string message = decode_string_and_free(status.error_buf, free_buffer);
     throw UniffiUnexpectedError(std::move(message));

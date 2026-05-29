@@ -422,9 +422,10 @@ pub struct NitroInterface {
     pub cxx_class: String,
     /// `uniffi_<crate>_fn_free_<obj>` — comes straight from the pipeline.
     pub free_symbol: String,
-    /// `uniffi_<crate>_fn_clone_<obj>` — for now unused; will be needed
-    /// when methods take other interface references as args.
-    #[allow(dead_code)]
+    /// `uniffi_<crate>_fn_clone_<obj>` — bumps the Rust-side Arc strong
+    /// count. Every call site that hands this object's handle to Rust (the
+    /// method receiver, and the object passed as an argument) must clone
+    /// first, because uniffi *consumes* the handle it's given.
     pub clone_symbol: String,
     /// Parsed from uniffi metadata. The argless primary constructor (if
     /// any) is wired into the C++ default constructor so
@@ -614,7 +615,10 @@ pub enum NitroType {
     /// `std::time::Duration`. Wire format: `RustBuffer` containing
     /// `u64 seconds + u32 nanos` (12 bytes, big-endian). TS surface:
     /// `number` (milliseconds, matching the TS/JSI backend). C++
-    /// surface: `std::chrono::nanoseconds`.
+    /// surface: `double` (milliseconds) — see `cxx_type`. This is a
+    /// deliberate, JS-friendly surface that matches the JSI backend; it
+    /// loses exactness for sub-millisecond nanos and durations beyond
+    /// 2^53 ms (~285k millennia) vs uniffi's exact u64+u32 representation.
     Duration,
     Optional(Box<NitroType>),
     Sequence(Box<NitroType>),
@@ -851,6 +855,14 @@ impl NitroType {
         }
     }
 
+    /// True when this type crosses the FFI as a `RustBuffer`. Used by the
+    /// callback trampolines: an arg lowered by Rust into a RustBuffer is
+    /// handed to us by-value (Rust gives up ownership), so after lifting it
+    /// the trampoline must free the buffer exactly once.
+    pub fn is_rust_buffer(&self) -> bool {
+        self.c_type() == "RustBuffer"
+    }
+
     /// Expression that lowers a `cxx_type`-typed value named `<name>` to
     /// the `c_type` for an FFI call. `alloc_symbol` / `reserve_symbol`
     /// are the namespace's `ffi_<crate>_rustbuffer_alloc` /
@@ -907,11 +919,12 @@ impl NitroType {
                 )
             }
             Self::CallbackInterface(cb_name) => {
-                // Register the JS-side instance with the handle map.
-                // The trampoline file ensures vtable init has happened
-                // by the time this expression runs.
+                // Install the vtable (idempotent) before the first hand-off,
+                // then register the JS-side instance with the handle map and
+                // pass the resulting u64 handle to Rust. The comma operator
+                // keeps this a single expression usable in `auto x = …;`.
                 format!(
-                    "ubrn::nitro::CallbackHandleMap<Hybrid{cb}>::instance().insert({name})",
+                    "(ensure_{cb}_vtable_init(), ubrn::nitro::CallbackHandleMap<Hybrid{cb}>::instance().insert({name}))",
                     cb = cb_name,
                 )
             }
@@ -924,7 +937,10 @@ impl NitroType {
             | Self::Enum {
                 name: type_name, ..
             } => format!("lower_{}({name})", type_name.to_upper_camel_case()),
-            Self::Interface { .. } => format!("{name}->raw_handle()"),
+            // Passing an interface as an argument hands its handle to Rust,
+            // which *consumes* one Arc reference. Clone first so the JS-side
+            // wrapper keeps its own live reference.
+            Self::Interface { .. } => format!("{name}->clone_handle()"),
             Self::Stub => {
                 format!("::ubrn::nitro::lower_stub(/* unsupported in nitro v1 */ {name})")
             }
@@ -1000,6 +1016,29 @@ impl NitroType {
             ),
             Self::Stub => format!("::ubrn::nitro::lift_stub(/* unsupported in nitro v1 */ {name})"),
             _ => format!("ubrn::nitro::lift_{}({name})", self.lower_suffix()),
+        }
+    }
+
+    /// True for types whose top-level lift can take ownership of the
+    /// returned `RustBuffer` and hand its memory straight to JS (zero-copy),
+    /// meaning the generated method must NOT separately free the buffer —
+    /// the value's own finalizer does. Currently `Bytes`, whose payload we
+    /// expose directly as the ArrayBuffer's backing store.
+    pub fn lift_consumes_buffer(&self) -> bool {
+        matches!(self, Self::Bytes)
+    }
+
+    /// Zero-copy top-level lift that consumes the `RustBuffer` (see
+    /// [`Self::lift_consumes_buffer`]). `free_symbol` is the namespace
+    /// `ffi_<crate>_rustbuffer_free`, wired as the ArrayBuffer's finalizer.
+    pub fn lift_owning_expr(&self, name: &str, free_symbol: &str) -> String {
+        match self {
+            Self::Bytes => {
+                format!("ubrn::nitro::lift_bytes_owning<&{free_symbol}>({name})")
+            }
+            // Only `Bytes` sets `lift_consumes_buffer`, so this is unreachable
+            // for other types; fall back to the copying lift to stay total.
+            _ => self.lift_expr(name),
         }
     }
 

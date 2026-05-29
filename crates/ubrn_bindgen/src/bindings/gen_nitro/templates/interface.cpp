@@ -10,6 +10,7 @@ extern "C" {
 RustBuffer {{ module.rustbuffer_alloc }}(uint64_t size, UniffiRustCallStatus* status);
 void {{ module.rustbuffer_free }}(RustBuffer buf, UniffiRustCallStatus* status);
 RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiRustCallStatus* status);
+uint64_t {{ iface.clone_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
 {%- if let Some(ctor) = iface.primary_constructor() %}
 uint64_t {{ ctor.uniffi_symbol }}(UniffiRustCallStatus* status);
 {%- endif %}
@@ -48,6 +49,22 @@ inline void free_status_buffer(RustBuffer buf) noexcept {
 }
 } // namespace
 
+uint64_t {{ iface.cxx_class }}::clone_handle() const {
+  // A zero handle means this is a default-constructed shell (an interface
+  // whose construction needs arguments, reached via the argless JS shim).
+  // Cloning it would call `Arc::increment_strong_count(nullptr)` on the Rust
+  // side — a null deref, not a clean error — so fail loudly instead.
+  if (handle_.raw() == 0) {
+    throw std::runtime_error(
+        "{{ iface.ts_name }}: method/argument use of an uninitialized handle "
+        "(this interface cannot be constructed with `new {{ iface.ts_name }}()`)");
+  }
+  auto __status = ubrn::nitro::make_status();
+  uint64_t __cloned = {{ iface.clone_symbol }}(handle_.raw(), &__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  return __cloned;
+}
+
 {%- if let Some(ctor) = iface.primary_constructor() %}
 uint64_t {{ iface.cxx_class }}::make_handle() {
   auto __status = ubrn::nitro::make_status();
@@ -77,7 +94,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- for arg in method.args %}
   auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endfor %}
-  uint64_t __handle = {{ method.uniffi_symbol }}(handle_.raw(){% if !method.args.is_empty() %},{% endif %}
+  uint64_t __handle = {{ method.uniffi_symbol }}(clone_handle(){% if !method.args.is_empty() %},{% endif %}
 {%- for arg in method.args -%}
     {{ arg.ts_name }}_lowered{% if !loop.last %}, {% endif %}
 {%- endfor -%}
@@ -96,9 +113,9 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          RustBuffer __err_buf = __typed.release();
-          auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-          free_status_buffer(__err_buf);
+          // Decode borrows the buffer; __typed frees it on scope exit (even
+          // if the decoder itself throws).
+          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
           throw __decoded;
         }
 {%- else %}
@@ -112,18 +129,21 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          RustBuffer __err_buf = __typed.release();
-          auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-          free_status_buffer(__err_buf);
+          // Decode borrows the buffer; __typed frees it on scope exit (even
+          // if the decoder itself throws).
+          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
           throw __decoded;
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
 {%- if method.return_kind.returns_owned_rustbuffer() %}
-        auto __lifted = {{ ret_ty.lift_expr("__raw") }};
-        free_status_buffer(__raw);
-        return __lifted;
+{%- if ret_ty.lift_consumes_buffer() %}
+        return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+{%- else %}
+        ::ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+        return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- else %}
         return {{ ret_ty.lift_expr("__raw") }};
 {%- endif %}
@@ -137,7 +157,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- endfor %}
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
-  {{ method.uniffi_symbol }}(handle_.raw(),
+  {{ method.uniffi_symbol }}(clone_handle(),
 {%- for arg in method.args -%}
     {{ arg.ts_name }}_lowered,
 {%- endfor -%}
@@ -146,16 +166,16 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
   try {
     ubrn::nitro::check_status(__status, free_status_buffer);
   } catch (ubrn::nitro::UniffiTypedError& __typed) {
-    RustBuffer __err_buf = __typed.release();
-    auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-    free_status_buffer(__err_buf);
+    // Decode borrows the buffer; __typed frees it on scope exit (even if
+    // the decoder itself throws).
+    auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
     throw __decoded;
   }
 {%- else %}
   ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
-  auto __raw = {{ method.uniffi_symbol }}(handle_.raw(),
+  auto __raw = {{ method.uniffi_symbol }}(clone_handle(),
 {%- for arg in method.args -%}
     {{ arg.ts_name }}_lowered,
 {%- endfor -%}
@@ -164,18 +184,25 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
   try {
     ubrn::nitro::check_status(__status, free_status_buffer);
   } catch (ubrn::nitro::UniffiTypedError& __typed) {
-    RustBuffer __err_buf = __typed.release();
-    auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-    free_status_buffer(__err_buf);
+    // Decode borrows the buffer; __typed frees it on scope exit (even if
+    // the decoder itself throws).
+    auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
     throw __decoded;
   }
 {%- else %}
   ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
 {%- if method.return_kind.returns_owned_rustbuffer() %}
-  auto __lifted = {{ ret_ty.lift_expr("__raw") }};
-  free_status_buffer(__raw);
-  return __lifted;
+{%- if ret_ty.lift_consumes_buffer() %}
+  // Zero-copy: hand the Rust-owned buffer's payload straight to JS as the
+  // ArrayBuffer backing store; freed via the namespace hook on JS GC.
+  return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+{%- else %}
+  // RAII: free the Rust-owned return buffer on scope exit, so a throwing
+  // lift (malformed payload / OOM) can't leak it.
+  ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+  return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- else %}
   return {{ ret_ty.lift_expr("__raw") }};
 {%- endif %}

@@ -95,9 +95,9 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          RustBuffer __err_buf = __typed.release();
-          auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-          free_status_buffer(__err_buf);
+          // Decode borrows the buffer; __typed frees it on scope exit (even
+          // if the decoder itself throws).
+          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
           throw __decoded;
         }
 {%- else %}
@@ -111,18 +111,21 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          RustBuffer __err_buf = __typed.release();
-          auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-          free_status_buffer(__err_buf);
+          // Decode borrows the buffer; __typed frees it on scope exit (even
+          // if the decoder itself throws).
+          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
           throw __decoded;
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
 {%- if func.return_kind.returns_owned_rustbuffer() %}
-        auto __lifted = {{ ret_ty.lift_expr("__raw") }};
-        free_status_buffer(__raw);
-        return __lifted;
+{%- if ret_ty.lift_consumes_buffer() %}
+        return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+{%- else %}
+        ::ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+        return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- else %}
         return {{ ret_ty.lift_expr("__raw") }};
 {%- endif %}
@@ -145,9 +148,9 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
   try {
     ubrn::nitro::check_status(__status, free_status_buffer);
   } catch (ubrn::nitro::UniffiTypedError& __typed) {
-    RustBuffer __err_buf = __typed.release();
-    auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-    free_status_buffer(__err_buf);
+    // Decode borrows the buffer; __typed frees it on scope exit (even if
+    // the decoder itself throws).
+    auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
     throw __decoded;
   }
 {%- else %}
@@ -163,21 +166,26 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
   try {
     ubrn::nitro::check_status(__status, free_status_buffer);
   } catch (ubrn::nitro::UniffiTypedError& __typed) {
-    RustBuffer __err_buf = __typed.release();
-    auto __decoded = {{ throws.lift_fn() }}(__err_buf);
-    free_status_buffer(__err_buf);
+    // Decode borrows the buffer; __typed frees it on scope exit (even if
+    // the decoder itself throws).
+    auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
     throw __decoded;
   }
 {%- else %}
   ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
 {%- if func.return_kind.returns_owned_rustbuffer() %}
-  // Lift copies the payload out of the Rust-owned buffer; free it before
-  // returning so the buffer doesn't leak (and Rust's allocator stays
-  // consistent — the buffer was uniquely handed to us).
-  auto __lifted = {{ ret_ty.lift_expr("__raw") }};
-  free_status_buffer(__raw);
-  return __lifted;
+{%- if ret_ty.lift_consumes_buffer() %}
+  // Zero-copy: hand the Rust-owned buffer's payload straight to JS as the
+  // ArrayBuffer backing store; it's freed via the namespace free hook when
+  // JS garbage-collects the ArrayBuffer.
+  return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+{%- else %}
+  // RAII: free the Rust-owned return buffer on scope exit, so a throwing
+  // lift (malformed payload / OOM) can't leak it.
+  ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+  return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- else %}
   return {{ ret_ty.lift_expr("__raw") }};
 {%- endif %}
