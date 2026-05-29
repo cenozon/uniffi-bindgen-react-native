@@ -9,6 +9,16 @@
 // field to its own `JSIConverter<T>` (Nitro core ships those for
 // primitives / string / optional / vector / map; nested records/enums
 // recurse through their own emitted converters).
+//
+{%- if record.in_cycle() %}
+// This record is part of a record/enum header `#include` cycle (it and its
+// partner(s) reference each other so each `<Name>.hpp` would need the other
+// complete). To stay compilable from either entry order we forward-declare the
+// cycle partners, declare `JSIConverter<{{ record.ts_name }}>` here, pull the
+// partner headers in *after* the struct, and define the converter out-of-line
+// in the guarded `{{ record.ts_name }}.conv.hpp` footer — emitted only once
+// every struct in the cycle is complete. See `NitroModule::resolve_cycles`.
+{%- endif %}
 #pragma once
 
 #include <NitroModules/JSIConverter.hpp>
@@ -19,6 +29,7 @@
 #include <nitro-uniffi/jsi_converter_ints.hpp>
 #include <nitro-uniffi/jsi_converter_map.hpp>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -30,13 +41,26 @@
 
 namespace margelo::nitro::{{ module.namespace }} {
 
+{%- if record.in_cycle() %}
+// Cycle partners reached only through `vector`/`optional`/`map` — forward-
+// declared so this record's struct can name them without pulling their
+// (mutually dependent) headers in first. By-value partners are *not* here:
+// the struct needs them complete, so they're ordinary top `#include`s above.
+struct {{ record.ts_name }};
+{%- for partner in record.cycle_partners %}
+{%- if !partner.by_value %}
+struct {{ partner.name }};
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+
 /**
  * Uniffi record `{{ record.ts_name }}`, as a JS-object-shaped struct.
  */
 struct {{ record.ts_name }} final {
 public:
 {%- for field in record.fields %}
-  {{ field.ty.cxx_type() }} {{ field.ts_name }};
+  {{ field.ty.cxx_type() }} {{ field.cxx_name }};
 {%- endfor %}
 
 public:
@@ -44,11 +68,11 @@ public:
 {%- if !record.fields.is_empty() %}
   explicit {{ record.ts_name }}(
 {%- for field in record.fields -%}
-    {{ field.ty.cxx_type() }} {{ field.ts_name }}{% if !loop.last %}, {% endif %}
+    {{ field.ty.cxx_type() }} {{ field.cxx_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   ):
 {%- for field in record.fields -%}
-    {{ field.ts_name }}(std::move({{ field.ts_name }})){% if !loop.last %}, {% endif %}
+    {{ field.cxx_name }}(std::move({{ field.cxx_name }})){% if !loop.last %}, {% endif %}
 {%- endfor -%}
    {}
 {%- endif %}
@@ -58,6 +82,45 @@ public:
 };
 
 } // namespace margelo::nitro::{{ module.namespace }}
+
+{%- if record.in_cycle() %}
+
+// Mark this record's struct complete for the cycle's converter guards.
+#define UBRN_CYC_{{ module.namespace }}_{{ record.ts_name }}_STRUCT 1
+
+namespace margelo::nitro {
+
+// C++ {{ record.ts_name }} <> JS {{ record.ts_name }} (object) — DECLARATION
+// only; the definition lives in `{{ record.ts_name }}.conv.hpp` and is emitted
+// once every struct in the cycle is complete (deferred so its body, which
+// names the cycle partners, isn't instantiated before they're defined).
+template <>
+struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ record.ts_name }}> final {
+  static margelo::nitro::{{ module.namespace }}::{{ record.ts_name }}
+  fromJSI(jsi::Runtime& runtime, const jsi::Value& arg);
+  static jsi::Value
+  toJSI(jsi::Runtime& runtime, const margelo::nitro::{{ module.namespace }}::{{ record.ts_name }}& arg);
+  static bool canConvert(jsi::Runtime& runtime, const jsi::Value& value);
+};
+
+} // namespace margelo::nitro
+
+// Now bring in the cycle partners' full definitions, then the converter
+// footers for every member of the cycle (each guarded so it fires exactly once
+// — when all structs are complete). Including all members' footers from every
+// member's header guarantees that whichever header the TU enters last
+// completes every converter.
+{%- for partner in record.cycle_partners %}
+{%- if !partner.by_value %}
+#include "{{ partner.header }}"
+{%- endif %}
+{%- endfor %}
+#include "{{ record.ts_name }}.conv.hpp"
+{%- for partner in record.cycle_partners %}
+#include "{{ partner.conv_header }}"
+{%- endfor %}
+
+{%- else %}
 
 namespace margelo::nitro {
 
@@ -77,7 +140,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ record.ts_name }}
   toJSI(jsi::Runtime& runtime, const margelo::nitro::{{ module.namespace }}::{{ record.ts_name }}& arg) {
     jsi::Object obj(runtime);
 {%- for field in record.fields %}
-    obj.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, arg.{{ field.ts_name }}));
+    obj.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, arg.{{ field.cxx_name }}));
 {%- endfor %}
     return obj;
   }
@@ -97,3 +160,5 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ record.ts_name }}
 };
 
 } // namespace margelo::nitro
+
+{%- endif %}

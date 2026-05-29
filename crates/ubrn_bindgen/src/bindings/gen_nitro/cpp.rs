@@ -32,6 +32,14 @@ pub(super) fn write_record(
     let text = RecordHpp { module, record }.render()?;
     let path = cpp_dir.join(format!("{}.hpp", record.ts_name));
     ubrn_common::write_file(path, text)?;
+    // A record in a header `#include` cycle defines its `JSIConverter`
+    // out-of-line in a guarded `<Name>.conv.hpp` footer (see `record.hpp` /
+    // `NitroModule::resolve_cycles`). Acyclic records keep everything inline.
+    if record.in_cycle() {
+        let conv = RecordConvHpp { module, record }.render()?;
+        let conv_path = cpp_dir.join(format!("{}.conv.hpp", record.ts_name));
+        ubrn_common::write_file(conv_path, conv)?;
+    }
     Ok(())
 }
 
@@ -41,6 +49,14 @@ pub(super) fn write_enum(cpp_dir: &Utf8Path, module: &NitroModule, en: &NitroEnu
     let text = EnumHpp { module, en }.render()?;
     let path = cpp_dir.join(format!("{}.hpp", en.ts_name));
     ubrn_common::write_file(path, text)?;
+    // A tagged enum in a header `#include` cycle defines its `JSIConverter`
+    // out-of-line in a guarded `<Name>.conv.hpp` footer (see `enum.hpp`).
+    // Acyclic / flat enums keep everything inline.
+    if en.in_cycle() {
+        let conv = EnumConvHpp { module, en }.render()?;
+        let conv_path = cpp_dir.join(format!("{}.conv.hpp", en.ts_name));
+        ubrn_common::write_file(conv_path, conv)?;
+    }
     Ok(())
 }
 
@@ -158,8 +174,22 @@ struct RecordHpp<'a> {
 }
 
 #[derive(Template)]
+#[template(syntax = "cpp", escape = "none", path = "record_conv.hpp")]
+struct RecordConvHpp<'a> {
+    module: &'a NitroModule,
+    record: &'a NitroRecord,
+}
+
+#[derive(Template)]
 #[template(syntax = "cpp", escape = "none", path = "enum.hpp")]
 struct EnumHpp<'a> {
+    module: &'a NitroModule,
+    en: &'a NitroEnum,
+}
+
+#[derive(Template)]
+#[template(syntax = "cpp", escape = "none", path = "enum_conv.hpp")]
+struct EnumConvHpp<'a> {
     module: &'a NitroModule,
     en: &'a NitroEnum,
 }

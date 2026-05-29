@@ -7,6 +7,15 @@
 // one payload struct per variant wrapped in a `std::variant`, surfaced to
 // JS as a discriminated union `{ type: '<variant>', ...fields }`. Both get
 // a hand-written `JSIConverter` so there is no dependency on Nitrogen.
+//
+{%- if en.in_cycle() %}
+// This enum is part of a record/enum header `#include` cycle. To stay
+// compilable from either entry order we forward-declare the cycle partners,
+// declare `JSIConverter<{{ en.ts_name }}>` here, pull the partner headers in
+// *after* the struct, and define the converter out-of-line in the guarded
+// `{{ en.ts_name }}.conv.hpp` footer — emitted only once every struct in the
+// cycle is complete. See `NitroModule::resolve_cycles`.
+{%- endif %}
 #pragma once
 
 #include <NitroModules/JSIConverter.hpp>
@@ -18,6 +27,7 @@
 #include <nitro-uniffi/jsi_converter_ints.hpp>
 #include <nitro-uniffi/jsi_converter_map.hpp>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -46,6 +56,17 @@ enum class {{ en.ts_name }} {
 // `std::optional` members, so forward-declare the wrapper before the
 // per-variant payload structs that embed it.
 struct {{ en.ts_name }};
+{%- if en.in_cycle() %}
+// Cycle partners reached only through `std::vector` / `std::optional` —
+// forward-declared so the payload structs below can name them without pulling
+// their mutually dependent headers in first. By-value partners (if any) are
+// ordinary top `#include`s above.
+{%- for partner in en.cycle_partners %}
+{%- if !partner.by_value %}
+struct {{ partner.name }};
+{%- endif %}
+{%- endfor %}
+{%- endif %}
 
 {%- for variant in en.variants %}
 /**
@@ -53,7 +74,7 @@ struct {{ en.ts_name }};
  */
 struct {{ variant.cxx_struct_name(en.ts_name) }} final {
 {%- for field in variant.fields %}
-  {{ field.ty.cxx_type() }} {{ field.ts_name }};
+  {{ field.ty.cxx_type() }} {{ field.cxx_name }};
 {%- endfor %}
   friend bool operator==(const {{ variant.cxx_struct_name(en.ts_name) }}&, const {{ variant.cxx_struct_name(en.ts_name) }}&) = default;
 };
@@ -75,6 +96,44 @@ struct {{ en.ts_name }} final {
 {%- endif %}
 
 } // namespace margelo::nitro::{{ module.namespace }}
+
+{%- if en.in_cycle() %}
+
+// Mark this enum's struct complete for the cycle's converter guards.
+#define UBRN_CYC_{{ module.namespace }}_{{ en.ts_name }}_STRUCT 1
+
+namespace margelo::nitro {
+
+// C++ {{ en.ts_name }} <> JS {{ en.ts_name }} (discriminated union on `type`) —
+// DECLARATION only; the definition lives in `{{ en.ts_name }}.conv.hpp` and is
+// emitted once every struct in the cycle is complete (deferred so its body,
+// which names the cycle partners, isn't instantiated before they're defined).
+template <>
+struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> final {
+  using EnumT = margelo::nitro::{{ module.namespace }}::{{ en.ts_name }};
+  static EnumT fromJSI(jsi::Runtime& runtime, const jsi::Value& arg);
+  static jsi::Value toJSI(jsi::Runtime& runtime, const EnumT& arg);
+  static bool canConvert(jsi::Runtime& runtime, const jsi::Value& value);
+};
+
+} // namespace margelo::nitro
+
+// Bring in the cycle partners' full definitions, then the converter footers for
+// every member of the cycle (each guarded so it fires exactly once — when all
+// structs are complete). Including all members' footers from every member's
+// header guarantees that whichever header the TU enters last completes every
+// converter.
+{%- for partner in en.cycle_partners %}
+{%- if !partner.by_value %}
+#include "{{ partner.header }}"
+{%- endif %}
+{%- endfor %}
+#include "{{ en.ts_name }}.conv.hpp"
+{%- for partner in en.cycle_partners %}
+#include "{{ partner.conv_header }}"
+{%- endfor %}
+
+{%- else %}
 
 namespace margelo::nitro {
 
@@ -136,7 +195,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
       case hashString("{{ variant.tag }}"): {
         margelo::nitro::{{ module.namespace }}::{{ variant.cxx_struct_name(en.ts_name) }} __v{};
 {%- for field in variant.fields %}
-        __v.{{ field.ts_name }} = JSIConverter<{{ field.ty.cxx_type() }}>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}")));
+        __v.{{ field.cxx_name }} = JSIConverter<{{ field.ty.cxx_type() }}>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}")));
 {%- endfor %}
         return EnumT{EnumT::Variant{std::move(__v)}};
       }
@@ -155,7 +214,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
 {%- if !variant.fields.is_empty() %}
         const auto& __v = std::get<{{ loop.index0 }}>(arg.variant);
 {%- for field in variant.fields %}
-        obj.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, __v.{{ field.ts_name }}));
+        obj.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, __v.{{ field.cxx_name }}));
 {%- endfor %}
 {%- endif %}
         break;
@@ -194,3 +253,5 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
 {%- endif %}
 
 } // namespace margelo::nitro
+
+{%- endif %}

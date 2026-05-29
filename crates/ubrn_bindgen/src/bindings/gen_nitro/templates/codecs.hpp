@@ -86,7 +86,7 @@ inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r);
 template <class W>
 inline void write_{{ record.ts_name }}(W& w, const {{ record.ts_name }}& value) {
 {%- for field in record.fields %}
-  {{ field.ty.stream_write_stmt("value", field.ts_name, module.namespace) }}
+  {{ field.ty.stream_write_stmt("value", field.cxx_name, module.namespace) }}
 {%- endfor %}
   (void)w;
   (void)value;
@@ -95,7 +95,7 @@ inline void write_{{ record.ts_name }}(W& w, const {{ record.ts_name }}& value) 
 inline {{ record.ts_name }} read_{{ record.ts_name }}(RustBufferReader& r) {
   {{ record.ts_name }} __out{};
 {%- for field in record.fields %}
-  __out.{{ field.ts_name }} = {{ field.ty.stream_read_expr(module.namespace) }};
+  __out.{{ field.cxx_name }} = {{ field.ty.stream_read_expr(module.namespace) }};
 {%- endfor %}
   (void)r;
   return __out;
@@ -151,7 +151,7 @@ inline void write_{{ en.ts_name }}(W& w, const {{ en.ts_name }}& value) {
 {%- if !variant.fields.is_empty() %}
       const auto& __v = std::get<{{ loop.index0 }}>(value.variant);
 {%- for field in variant.fields %}
-      {{ field.ty.stream_write_stmt("__v", field.ts_name, module.namespace) }}
+      {{ field.ty.stream_write_stmt("__v", field.cxx_name, module.namespace) }}
 {%- endfor %}
 {%- endif %}
       break;
@@ -169,7 +169,7 @@ inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r) {
     case {{ loop.index }}: {
       {{ variant.cxx_struct_name(en.ts_name) }} __v{};
 {%- for field in variant.fields %}
-      __v.{{ field.ts_name }} = {{ field.ty.stream_read_expr(module.namespace) }};
+      __v.{{ field.cxx_name }} = {{ field.ty.stream_read_expr(module.namespace) }};
 {%- endfor %}
       return {{ en.ts_name }}{ {{ en.ts_name }}::Variant{std::move(__v)} };
     }

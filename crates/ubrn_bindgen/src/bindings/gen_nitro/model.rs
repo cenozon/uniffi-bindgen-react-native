@@ -204,7 +204,7 @@ impl NitroModule {
             }
         }
 
-        Ok(Self {
+        let mut module = Self {
             namespace: ns_name,
             crate_name,
             namespace_camel,
@@ -217,7 +217,130 @@ impl NitroModule {
             rustbuffer_alloc: namespace.ffi_rustbuffer_alloc.0.clone(),
             rustbuffer_free: namespace.ffi_rustbuffer_free.0.clone(),
             rustbuffer_reserve: namespace.ffi_rustbuffer_reserve.0.clone(),
-        })
+        };
+        module.resolve_cycles();
+        Ok(module)
+    }
+
+    /// Detect record/enum header `#include` cycles and record each cyclic
+    /// type's SCC partners on the type, so the templates can switch to the
+    /// cycle-safe layout.
+    ///
+    /// ## Why this is needed
+    ///
+    /// A record/enum `<Name>.hpp` both *defines* the struct and *defines* its
+    /// `JSIConverter`. A record holding another record/enum by value (or an
+    /// enum constructing a payload that embeds one) needs that type
+    /// **complete**, so `<Name>.hpp` `#include`s the dependency. When two such
+    /// headers reference each other (e.g. `DbValue` holds `vector<DbMapEntry>`
+    /// and `DbMapEntry` holds `DbValue` by value), the mutual `#include` +
+    /// `#pragma once` means whichever header the translation unit enters first
+    /// hits the other before the first type is declared — the by-value field
+    /// then names an incomplete type and the TU fails to compile. (Pure
+    /// self-recursion — `Tree` holding `vector<Tree>` — is fine: a `vector` of
+    /// an incomplete element type is legal, and the single header completes the
+    /// type before its own converter.)
+    ///
+    /// ## What "cycle" means here
+    ///
+    /// We build a directed graph over this namespace's records + enums where an
+    /// edge `X → Y` means *X's header would `#include "Y.hpp"`* (X references
+    /// the record/enum Y in a field — by value or through
+    /// `vector`/`optional`/`map`; interfaces/callbacks are excluded as they
+    /// only ever need a forward declaration). Self-edges are dropped. A
+    /// strongly-connected component of size ≥ 2 is a genuine header cycle; each
+    /// of its members gets the cycle-safe layout. (Cross-namespace cycles can't
+    /// arise — uniffi records/enums only reference types in their own
+    /// namespace's metadata graph — so a single-namespace SCC pass suffices.)
+    fn resolve_cycles(&mut self) {
+        // node key = UpperCamel type name (unique within a namespace).
+        let ns = self.namespace.clone();
+        let mut nodes: BTreeSet<String> = BTreeSet::new();
+        for r in &self.records {
+            nodes.insert(r.ts_name.clone());
+        }
+        for e in &self.enums {
+            nodes.insert(e.ts_name.clone());
+        }
+
+        // adjacency: X -> set of referenced same-namespace record/enum names
+        // (excluding self).
+        let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut add_edges = |from: &str, refs: &BTreeSet<(String, String)>| {
+            let e = adj.entry(from.to_string()).or_default();
+            for (rns, rname) in refs {
+                if rns == &ns && nodes.contains(rname) && rname != from {
+                    e.insert(rname.clone());
+                }
+            }
+        };
+        // `by_value_refs[X]` = the same-namespace record/enum names X holds by
+        // value (a direct field, not wrapped) — these must be complete at X's
+        // struct definition. Drives the per-partner `by_value` flag below.
+        let mut by_value_refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut record_by_value = |from: &str, ty: &NitroType, bv: &mut BTreeSet<String>| {
+            if let Some((rns, rname)) = ty.by_value_type() {
+                if rns == ns && nodes.contains(&rname) && rname != from {
+                    bv.insert(rname);
+                }
+            }
+        };
+        for r in &self.records {
+            let mut refs = BTreeSet::new();
+            let mut bv = BTreeSet::new();
+            for f in &r.fields {
+                f.ty.referenced_value_types(&mut refs);
+                record_by_value(&r.ts_name, &f.ty, &mut bv);
+            }
+            add_edges(&r.ts_name, &refs);
+            by_value_refs.insert(r.ts_name.clone(), bv);
+        }
+        for e in &self.enums {
+            let mut refs = BTreeSet::new();
+            let mut bv = BTreeSet::new();
+            for f in e.variants.iter().flat_map(|v| v.fields.iter()) {
+                f.ty.referenced_value_types(&mut refs);
+                record_by_value(&e.ts_name, &f.ty, &mut bv);
+            }
+            add_edges(&e.ts_name, &refs);
+            by_value_refs.insert(e.ts_name.clone(), bv);
+        }
+
+        let sccs = strongly_connected_components(&nodes, &adj);
+        // Map each cyclic node -> the sorted partner spellings (excl. self).
+        let mut partners_of: BTreeMap<String, Vec<CycleMember>> = BTreeMap::new();
+        for scc in &sccs {
+            if scc.len() < 2 {
+                continue;
+            }
+            for member in scc {
+                let owner_bv = by_value_refs.get(member).cloned().unwrap_or_default();
+                let partners: Vec<CycleMember> = scc
+                    .iter()
+                    .filter(|other| *other != member)
+                    .map(|name| CycleMember {
+                        name: name.clone(),
+                        header: format!("{name}.hpp"),
+                        conv_header: format!("{name}.conv.hpp"),
+                        cxx_type: format!("::margelo::nitro::{ns}::{name}"),
+                        struct_sentinel: format!("UBRN_CYC_{ns}_{name}_STRUCT"),
+                        by_value: owner_bv.contains(name),
+                    })
+                    .collect();
+                partners_of.insert(member.clone(), partners);
+            }
+        }
+
+        for r in &mut self.records {
+            if let Some(p) = partners_of.remove(&r.ts_name) {
+                r.cycle_partners = p;
+            }
+        }
+        for e in &mut self.enums {
+            if let Some(p) = partners_of.remove(&e.ts_name) {
+                e.cycle_partners = p;
+            }
+        }
     }
 
     pub fn namespace_api_ts_name(&self) -> String {
@@ -2168,6 +2291,45 @@ impl NitroType {
         }
     }
 
+    /// Collect the `(namespace, UpperCamelName)` of every record / enum this
+    /// type references — by value, by `vector`/`optional`/`map`, anything that
+    /// drives a `#include "<Name>.hpp"` in [`Self::referenced_headers`]. Used to
+    /// build the record/enum *header* dependency graph for cycle detection
+    /// (see [`NitroModule`]'s SCC pass). Interfaces / callbacks are excluded:
+    /// they cross behind a `shared_ptr` and only need a forward declaration, so
+    /// they never participate in a `<Name>.hpp` include cycle. Recurses through
+    /// composites.
+    pub fn referenced_value_types(&self, out: &mut BTreeSet<(String, String)>) {
+        match self {
+            Self::Optional(inner) | Self::Sequence(inner) => inner.referenced_value_types(out),
+            Self::Map(k, v) => {
+                k.referenced_value_types(out);
+                v.referenced_value_types(out);
+            }
+            Self::Record { namespace, name } | Self::Enum { namespace, name } => {
+                out.insert((namespace.clone(), name.to_upper_camel_case()));
+            }
+            _ => {}
+        }
+    }
+
+    /// `(namespace, UpperCamelName)` of the record/enum this type names **by
+    /// value** — i.e. directly, not behind a `vector`/`optional`/`map`. A
+    /// by-value field needs its type *complete* at the struct definition, so it
+    /// cannot be satisfied by a forward declaration; in a header cycle the
+    /// by-value side must therefore `#include` the partner up front (only the
+    /// wrapper-indirected side can forward-declare + late-include). `None` for
+    /// composites, primitives, and interfaces (interfaces cross behind a
+    /// `shared_ptr`, so a forward declaration always suffices).
+    pub fn by_value_type(&self) -> Option<(String, String)> {
+        match self {
+            Self::Record { namespace, name } | Self::Enum { namespace, name } => {
+                Some((namespace.clone(), name.to_upper_camel_case()))
+            }
+            _ => None,
+        }
+    }
+
     /// Headers for types this type references that must be a *complete* type
     /// at the point of use — records / enums (passed/held by value). Interface
     /// types are excluded: they always cross as `std::shared_ptr<Hybrid…>`,
@@ -2403,6 +2565,15 @@ impl ReturnKind {
 pub struct NitroRecord {
     pub ts_name: String,
     pub fields: Vec<NitroRecordField>,
+    /// The other record/enum types this record forms a header `#include`
+    /// cycle with — i.e. the rest of its strongly-connected component in the
+    /// record/enum dependency graph (see [`NitroModule::resolve_cycles`]).
+    /// Empty for the common acyclic case. When non-empty, the emitted
+    /// `<Name>.hpp` switches to the cycle-safe layout (forward-declared
+    /// partners, `JSIConverter` *declared* in the header and *defined*
+    /// out-of-line in a guarded `<Name>.conv.hpp` footer pulled in after all
+    /// the cycle's structs are complete). Sorted, excludes self.
+    pub cycle_partners: Vec<CycleMember>,
 }
 
 impl NitroRecord {
@@ -2414,24 +2585,85 @@ impl NitroRecord {
             .enumerate()
             .map(|(i, f)| NitroRecordField::from_general(f, i))
             .collect();
-        Ok(Self { ts_name, fields })
+        Ok(Self {
+            ts_name,
+            fields,
+            cycle_partners: Vec::new(),
+        })
+    }
+
+    /// `true` when this record participates in a header `#include` cycle and
+    /// must use the cycle-safe emission layout.
+    pub fn in_cycle(&self) -> bool {
+        !self.cycle_partners.is_empty()
     }
 
     /// Headers this record's struct definition depends on (nested
-    /// records / enums / interfaces), deduped and excluding its own.
+    /// records / enums / interfaces), deduped and excluding its own — and,
+    /// in the cyclic case, excluding the cycle partners (those are
+    /// forward-declared and pulled in *after* the struct, by the template).
     pub fn dependency_headers(&self) -> Vec<String> {
         let own = format!("{}.hpp", self.ts_name);
-        dedup_headers(
+        let mut headers = dedup_headers(
             self.fields.iter().flat_map(|f| f.ty.referenced_headers()),
             &own,
-        )
+        );
+        // Drop only the *wrapper-indirected* cycle partners: those are
+        // forward-declared and pulled in after the struct. By-value partners
+        // stay as ordinary top includes (the struct needs them complete).
+        headers.retain(|h| {
+            !self
+                .cycle_partners
+                .iter()
+                .any(|m| &m.header == h && !m.by_value)
+        });
+        headers
     }
 }
 
+/// One member of a record/enum header `#include` cycle (a strongly-connected
+/// component of size ≥ 2). Carries the spellings the cycle-safe templates need:
+/// the partner header to `#include`, its `<Name>.conv.hpp` converter footer,
+/// the fully-qualified C++ type for the `JSIConverter<…>` specialization, and
+/// the `UBRN_CYC_…` preprocessor sentinels that gate out-of-line converter
+/// emission until every struct in the cycle is complete.
+pub struct CycleMember {
+    /// Bare `UpperCamel` type name, e.g. `DbValue` — used to forward-declare
+    /// the partner inside the shared namespace.
+    pub name: String,
+    /// `<Name>.hpp` — the partner's main header.
+    pub header: String,
+    /// `<Name>.conv.hpp` — the partner's guarded out-of-line converter footer.
+    pub conv_header: String,
+    /// Fully-qualified C++ type, e.g. `::margelo::nitro::ace_db_js::DbValue`.
+    pub cxx_type: String,
+    /// `UBRN_CYC_<ns>_<Name>_STRUCT` — defined once the struct is complete.
+    pub struct_sentinel: String,
+    /// `true` when the *owning* type holds this partner **by value** (a direct
+    /// field, not through `vector`/`optional`/`map`). A by-value partner needs
+    /// its complete type at the owner's struct definition, so the owner
+    /// `#include`s it up front (via `dependency_headers`) and does *not*
+    /// forward-declare or late-include it. `false` when the partner is only
+    /// ever wrapped — then the owner forward-declares it and pulls the header
+    /// in after its own struct, breaking the include cycle. (If both directions
+    /// were by-value the cycle would be genuinely unbreakable without heap
+    /// indirection; uniffi's recursive shapes always route at least one
+    /// direction through a `vector`/`optional`, so that does not occur here.)
+    pub by_value: bool,
+}
+
 pub struct NitroRecordField {
-    /// TS-facing field name (lowerCamelCase), matching what Nitrogen
-    /// names the field on the auto-generated C++ struct.
+    /// TS-facing / JS-object key name (lowerCamelCase), matching what
+    /// Nitrogen names the field and what the wire-positional codec maps to a
+    /// JS property. This is the spelling used for `PropNameIDCache::get(…,
+    /// "<ts_name>")` and the `.nitro.ts` surface — it must NOT be mangled.
     pub ts_name: String,
+    /// C++ struct-member / accessor identifier. Equal to `ts_name` except when
+    /// `ts_name` collides with a C++ keyword (e.g. a Rust field literally
+    /// named `else`, `class`, `new`), in which case it is suffixed with `_`
+    /// (`else_`). Keeping it separate from `ts_name` means the JS surface is
+    /// unchanged while the emitted C++ stays valid. See [`sanitize_cxx_ident`].
+    pub cxx_name: String,
     /// Source Rust field name (snake_case) — kept for debug emission.
     #[allow(dead_code)]
     pub rust_name: String,
@@ -2452,8 +2684,10 @@ impl NitroRecordField {
         } else {
             camel
         };
+        let cxx_name = sanitize_cxx_ident(&ts_name);
         Self {
             ts_name,
+            cxx_name,
             rust_name: field.name.clone(),
             ty: NitroType::from_type_lossy(&field.ty.ty),
         }
@@ -2468,6 +2702,10 @@ pub struct NitroEnum {
     pub ts_name: String,
     pub variants: Vec<NitroEnumVariant>,
     pub flat: bool,
+    /// The other record/enum types this enum forms a header `#include` cycle
+    /// with — its SCC partners. See [`NitroRecord::cycle_partners`]. Always
+    /// empty for flat enums (no payloads, so they reference nothing).
+    pub cycle_partners: Vec<CycleMember>,
 }
 
 impl NitroEnum {
@@ -2482,21 +2720,39 @@ impl NitroEnum {
             ts_name,
             variants,
             flat: en.is_flat,
+            cycle_partners: Vec::new(),
         })
+    }
+
+    /// `true` when this enum participates in a header `#include` cycle and
+    /// must use the cycle-safe emission layout.
+    pub fn in_cycle(&self) -> bool {
+        !self.cycle_partners.is_empty()
     }
 
     /// Headers this enum's payload structs depend on, deduped and
     /// excluding its own (a recursive enum references itself, which is
-    /// handled by in-file forward declaration, not an include).
+    /// handled by in-file forward declaration, not an include) — and, in the
+    /// cyclic case, excluding the cycle partners (forward-declared and pulled
+    /// in after the struct by the template).
     pub fn dependency_headers(&self) -> Vec<String> {
         let own = format!("{}.hpp", self.ts_name);
-        dedup_headers(
+        let mut headers = dedup_headers(
             self.variants
                 .iter()
                 .flat_map(|v| v.fields.iter())
                 .flat_map(|f| f.ty.referenced_headers()),
             &own,
-        )
+        );
+        // Drop only the wrapper-indirected cycle partners (forward-declared +
+        // late-included); by-value partners stay as ordinary top includes.
+        headers.retain(|h| {
+            !self
+                .cycle_partners
+                .iter()
+                .any(|m| &m.header == h && !m.by_value)
+        });
+        headers
     }
 }
 
@@ -2664,6 +2920,105 @@ fn dedup_headers(headers: impl Iterator<Item = String>, own: &str) -> Vec<String
     let mut set: BTreeSet<String> = headers.collect();
     set.remove(own);
     set.into_iter().collect()
+}
+
+/// Tarjan's strongly-connected-components over the directed graph `(nodes,
+/// adj)`. Returns one `Vec<String>` per SCC, each sorted, with the SCC list
+/// itself sorted by first member — fully deterministic so codegen output is
+/// stable across runs. A single node with no self-loop comes back as its own
+/// singleton SCC; only SCCs of size ≥ 2 are genuine cycles (the caller
+/// filters). Iterative (explicit stack) so a deep dependency chain can't blow
+/// the native stack.
+fn strongly_connected_components(
+    nodes: &BTreeSet<String>,
+    adj: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Vec<String>> {
+    let mut index_of: BTreeMap<String, usize> = BTreeMap::new();
+    let mut lowlink: BTreeMap<String, usize> = BTreeMap::new();
+    let mut on_stack: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut next_index = 0usize;
+    let mut sccs: Vec<Vec<String>> = Vec::new();
+
+    // Explicit DFS frame: the node plus an iterator position over its
+    // successors.
+    struct Frame {
+        node: String,
+        succ: Vec<String>,
+        pos: usize,
+    }
+
+    for root in nodes {
+        if index_of.contains_key(root) {
+            continue;
+        }
+        let mut call_stack: Vec<Frame> = vec![Frame {
+            node: root.clone(),
+            succ: adj
+                .get(root)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default(),
+            pos: 0,
+        }];
+        index_of.insert(root.clone(), next_index);
+        lowlink.insert(root.clone(), next_index);
+        next_index += 1;
+        stack.push(root.clone());
+        on_stack.insert(root.clone());
+
+        while let Some(frame) = call_stack.last_mut() {
+            if frame.pos < frame.succ.len() {
+                let w = frame.succ[frame.pos].clone();
+                frame.pos += 1;
+                if !index_of.contains_key(&w) {
+                    // Descend into the unvisited successor.
+                    index_of.insert(w.clone(), next_index);
+                    lowlink.insert(w.clone(), next_index);
+                    next_index += 1;
+                    stack.push(w.clone());
+                    on_stack.insert(w.clone());
+                    let succ = adj
+                        .get(&w)
+                        .map(|s| s.iter().cloned().collect())
+                        .unwrap_or_default();
+                    call_stack.push(Frame {
+                        node: w,
+                        succ,
+                        pos: 0,
+                    });
+                } else if on_stack.contains(&w) {
+                    let v = frame.node.clone();
+                    let low = lowlink[&v].min(index_of[&w]);
+                    lowlink.insert(v, low);
+                }
+            } else {
+                // Done with this node — pop and, if it's an SCC root, peel.
+                let v = frame.node.clone();
+                call_stack.pop();
+                if lowlink[&v] == index_of[&v] {
+                    let mut comp: Vec<String> = Vec::new();
+                    while let Some(w) = stack.pop() {
+                        on_stack.remove(&w);
+                        comp.push(w.clone());
+                        if w == v {
+                            break;
+                        }
+                    }
+                    comp.sort();
+                    sccs.push(comp);
+                }
+                // Propagate lowlink to the parent frame.
+                if let Some(parent) = call_stack.last() {
+                    let p = parent.node.clone();
+                    let low = lowlink[&p].min(lowlink[&v]);
+                    lowlink.insert(p, low);
+                }
+            }
+        }
+    }
+
+    sccs.sort_by(|a, b| a.first().cmp(&b.first()));
+    sccs
 }
 
 pub struct NitroEnumVariant {
