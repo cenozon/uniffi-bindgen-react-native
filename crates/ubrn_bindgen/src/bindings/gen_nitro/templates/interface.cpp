@@ -116,7 +116,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          throw {{ throws.lift_fn() }}(__typed.buffer());
+          throw {{ throws.lift_fn(module.namespace) }}(__typed.buffer());
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
@@ -132,7 +132,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          throw {{ throws.lift_fn() }}(__typed.buffer());
+          throw {{ throws.lift_fn(module.namespace) }}(__typed.buffer());
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
@@ -168,7 +168,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
   } catch (ubrn::nitro::UniffiTypedError& __typed) {
     // Decode borrows the buffer; __typed frees it on scope exit (even if
     // the decoder itself throws).
-    auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
+    auto __decoded = {{ throws.lift_fn(module.namespace) }}(__typed.buffer());
     throw __decoded;
   }
 {%- else %}
@@ -186,7 +186,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
   } catch (ubrn::nitro::UniffiTypedError& __typed) {
     // Decode borrows the buffer; __typed frees it on scope exit (even if
     // the decoder itself throws).
-    auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
+    auto __decoded = {{ throws.lift_fn(module.namespace) }}(__typed.buffer());
     throw __decoded;
   }
 {%- else %}

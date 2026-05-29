@@ -344,6 +344,10 @@ pub struct NitroFunction {
 pub struct NitroErrorRef {
     /// UpperCamelCase TS name (also the unqualified C++ class name).
     pub ts_name: String,
+    /// Owning uniffi namespace. When it differs from the throwing
+    /// callable's namespace, the decoder lives in the *foreign*
+    /// `<namespace>_codecs.hpp` and must be name-qualified.
+    pub namespace: String,
 }
 
 impl NitroErrorRef {
@@ -356,9 +360,17 @@ impl NitroErrorRef {
         format!("{}Error", self.ts_name)
     }
 
-    /// Free-function decoder name in `<namespace>_codecs.hpp`.
-    pub fn lift_fn(&self) -> String {
-        format!("lift_{}Error", self.ts_name)
+    /// Free-function decoder name in the owning namespace's
+    /// `<namespace>_codecs.hpp`, qualified with the foreign namespace when
+    /// the error is defined outside `current_ns` (so a cross-crate throws
+    /// resolves against the included foreign codecs header).
+    pub fn lift_fn(&self, current_ns: &str) -> String {
+        let prefix = if self.namespace == current_ns {
+            String::new()
+        } else {
+            format!("::margelo::nitro::{}::", self.namespace)
+        };
+        format!("{prefix}lift_{}Error", self.ts_name)
     }
 }
 
@@ -525,8 +537,9 @@ impl NitroFunction {
 /// codec strategy and the upstream pipeline normally rejects them).
 fn throws_from(ty: Option<&general::Type>) -> Option<NitroErrorRef> {
     match ty? {
-        general::Type::Enum { name, .. } => Some(NitroErrorRef {
+        general::Type::Enum { name, namespace, .. } => Some(NitroErrorRef {
             ts_name: name.to_upper_camel_case(),
+            namespace: namespace.clone(),
         }),
         _ => None,
     }
@@ -827,9 +840,6 @@ pub struct NitroCallbackProxy {
     /// `uniffi_<crate>_fn_clone_<trait>` — bumps the Rust-side strong
     /// count. The proxy clones before each dispatch (uniffi consumes the
     /// receiver handle), and once when re-vending the handle to Rust.
-    /// Consumed once the proxy's per-method Rust dispatch is emitted (the
-    /// handle + ctor scaffold are in place; see `callback.{hpp,cpp}`).
-    #[allow(dead_code)]
     pub clone_symbol: String,
     /// `uniffi_<crate>_fn_free_<trait>` — drops the Rust-side reference.
     /// Wired as the proxy handle's RAII free symbol.
@@ -847,12 +857,9 @@ pub struct NitroCallbackMethod {
     /// (no Rust impl exists to call) and for async methods (whose FFI
     /// symbol returns a future handle, not the value — the proxy can't
     /// drive that poll loop yet, so it falls back to the JS-impl path).
-    /// Consumed once the proxy's per-method Rust dispatch is emitted.
-    #[allow(dead_code)]
     pub uniffi_symbol: Option<String>,
     /// Typed error this method may throw, if any. Drives the proxy's
     /// `lift_<Name>Error` decode + rethrow on a `RustCallStatus` error.
-    #[allow(dead_code)]
     pub throws: Option<NitroErrorRef>,
 }
 

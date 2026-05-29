@@ -40,6 +40,22 @@ RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiR
 /// Rust-side hook: installs the vtable. Takes `NonNull<UniFfiTraitVtable…>`;
 /// ABI is a plain non-null pointer, so we hand it `&our_vtable`.
 void {{ cb.vtable_init_symbol }}(const void* vtable);
+{%- if let Some(proxy) = cb.proxy %}
+// Rust-callable surface for the proxy half (a `with_foreign` trait object
+// Rust returned): clone the receiver (uniffi consumes it per call) + the
+// per-method dispatch symbols.
+uint64_t {{ proxy.clone_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
+{%- for method in cb.methods %}
+{%- if let Some(sym) = method.uniffi_symbol %}
+{{ method.return_kind.c_type() }} {{ sym }}(
+    uint64_t self_handle
+{%- for arg in method.args -%}
+    , {{ arg.ty.c_type() }} {{ arg.ts_name }}_lowered
+{%- endfor -%}
+    , UniffiRustCallStatus* status);
+{%- endif %}
+{%- endfor %}
+{%- endif %}
 }
 
 namespace margelo::nitro::{{ module.namespace }} {
@@ -63,9 +79,60 @@ void {{ cb.cxx_class }}::loadHybridMethods() {
 {% for method in cb.methods %}
 {{ method.return_kind.cxx_type() }} {{ cb.cxx_class }}::{{ method.cxx_name }}(
 {%- for arg in method.args -%}
-    {{ arg.ty.cxx_type() }} /* {{ arg.ts_name }} */{% if !loop.last %}, {% endif %}
+    {{ arg.ty.cxx_type() }} {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
 ) {
+{%- if let Some(proxy) = cb.proxy %}
+{%- if let Some(sym) = method.uniffi_symbol %}
+  // Rust-backed proxy (Rust handed us this trait object): dispatch the call
+  // into Rust. Clone our handle first — uniffi consumes the receiver — then
+  // lower args, invoke, and lift the result, exactly like an interface method.
+  if (proxy_handle_.raw() != 0) {
+    auto __status = ubrn::nitro::make_status();
+    uint64_t __self = {{ proxy.clone_symbol }}(proxy_handle_.raw(), &__status);
+    ubrn::nitro::check_status(__status, free_status_buffer);
+    __status = ubrn::nitro::make_status();
+{%- for arg in method.args %}
+    auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+{%- endfor %}
+{%- match method.return_kind %}
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
+    {{ sym }}(__self{% for arg in method.args %}, {{ arg.ts_name }}_lowered{% endfor %}, &__status);
+{%- if let Some(throws) = method.throws %}
+    try {
+      ubrn::nitro::check_status(__status, free_status_buffer);
+    } catch (ubrn::nitro::UniffiTypedError& __typed) {
+      throw {{ throws.lift_fn(module.namespace) }}(__typed.buffer());
+    }
+{%- else %}
+    ubrn::nitro::check_status(__status, free_status_buffer);
+{%- endif %}
+    return;
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
+    auto __raw = {{ sym }}(__self{% for arg in method.args %}, {{ arg.ts_name }}_lowered{% endfor %}, &__status);
+{%- if let Some(throws) = method.throws %}
+    try {
+      ubrn::nitro::check_status(__status, free_status_buffer);
+    } catch (ubrn::nitro::UniffiTypedError& __typed) {
+      throw {{ throws.lift_fn(module.namespace) }}(__typed.buffer());
+    }
+{%- else %}
+    ubrn::nitro::check_status(__status, free_status_buffer);
+{%- endif %}
+{%- if method.return_kind.returns_owned_rustbuffer() %}
+{%- if ret_ty.lift_consumes_buffer() %}
+    return {{ ret_ty.lift_owning_expr("__raw", module.namespace, module.rustbuffer_free) }};
+{%- else %}
+    ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+    return {{ ret_ty.lift_expr("__raw", module.namespace) }};
+{%- endif %}
+{%- else %}
+    return {{ ret_ty.lift_expr("__raw", module.namespace) }};
+{%- endif %}
+{%- endmatch %}
+  }
+{%- endif %}
+{%- endif %}
   throw std::runtime_error(
       "{{ cb.ts_name }}::{{ method.cxx_name }} not implemented — "
       "this method must be overridden by a JS-side HybridObject subclass");
