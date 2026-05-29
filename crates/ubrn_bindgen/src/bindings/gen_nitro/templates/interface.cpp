@@ -105,40 +105,34 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
     {{ arg.ts_name }}_lowered{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   );
-  return ::margelo::nitro::Promise<{{ method.return_kind.cxx_type() }}>::async(
-      [__handle]() -> {{ method.return_kind.cxx_type() }} {
-        ::ubrn::nitro::drive_rust_future(
-            __handle,
-            &{{ ad.poll_symbol }});
-        auto __status = ::ubrn::nitro::make_status();
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
+  return ::ubrn::nitro::drive_rust_future_async_void(
+      __handle, &{{ ad.poll_symbol }}, &{{ ad.free_symbol }},
+      [__handle]() {
+        auto __status = ::ubrn::nitro::make_status();
         {{ ad.complete_symbol }}(__handle, &__status);
-        {{ ad.free_symbol }}(__handle);
 {%- if let Some(throws) = method.throws %}
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          // Decode borrows the buffer; __typed frees it on scope exit (even
-          // if the decoder itself throws).
-          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
-          throw __decoded;
+          throw {{ throws.lift_fn() }}(__typed.buffer());
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
-        return;
+      });
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
+  return ::ubrn::nitro::drive_rust_future_async<{{ ret_ty.cxx_type() }}>(
+      __handle, &{{ ad.poll_symbol }}, &{{ ad.free_symbol }},
+      [__handle]() -> {{ ret_ty.cxx_type() }} {
+        auto __status = ::ubrn::nitro::make_status();
         auto __raw = {{ ad.complete_symbol }}(__handle, &__status);
-        {{ ad.free_symbol }}(__handle);
 {%- if let Some(throws) = method.throws %}
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          // Decode borrows the buffer; __typed frees it on scope exit (even
-          // if the decoder itself throws).
-          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
-          throw __decoded;
+          throw {{ throws.lift_fn() }}(__typed.buffer());
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
@@ -153,8 +147,8 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- else %}
         return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
-{%- endmatch %}
       });
+{%- endmatch %}
 {%- endif %}
 {%- else %}
   auto __status = ubrn::nitro::make_status();

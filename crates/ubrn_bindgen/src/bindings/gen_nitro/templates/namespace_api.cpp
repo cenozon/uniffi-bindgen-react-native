@@ -73,48 +73,43 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- for arg in func.args %}
   auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endfor %}
-  // Kick off the future eagerly: lowered-arg ownership transfers to
-  // Rust at this call, which means the args don't need to be captured
-  // by the Promise::async closure.
+  // Kick off the future eagerly: lowered-arg ownership transfers to Rust at
+  // this call. We then arm the uniffi continuation and resolve the Promise
+  // event-driven (no worker thread / blocking wait) — see
+  // `drive_rust_future_async`.
   uint64_t __handle = {{ func.uniffi_symbol }}(
 {%- for arg in func.args -%}
     {{ arg.ts_name }}_lowered{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   );
-  return ::margelo::nitro::Promise<{{ func.return_kind.cxx_type() }}>::async(
-      [__handle]() -> {{ func.return_kind.cxx_type() }} {
-        ::ubrn::nitro::drive_rust_future(
-            __handle,
-            &{{ ad.poll_symbol }});
-        auto __status = ::ubrn::nitro::make_status();
 {%- match func.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
+  return ::ubrn::nitro::drive_rust_future_async_void(
+      __handle, &{{ ad.poll_symbol }}, &{{ ad.free_symbol }},
+      [__handle]() {
+        auto __status = ::ubrn::nitro::make_status();
         {{ ad.complete_symbol }}(__handle, &__status);
-        {{ ad.free_symbol }}(__handle);
 {%- if let Some(throws) = func.throws %}
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          // Decode borrows the buffer; __typed frees it on scope exit (even
-          // if the decoder itself throws).
-          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
-          throw __decoded;
+          throw {{ throws.lift_fn() }}(__typed.buffer());
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
-        return;
+      });
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
+  return ::ubrn::nitro::drive_rust_future_async<{{ ret_ty.cxx_type() }}>(
+      __handle, &{{ ad.poll_symbol }}, &{{ ad.free_symbol }},
+      [__handle]() -> {{ ret_ty.cxx_type() }} {
+        auto __status = ::ubrn::nitro::make_status();
         auto __raw = {{ ad.complete_symbol }}(__handle, &__status);
-        {{ ad.free_symbol }}(__handle);
 {%- if let Some(throws) = func.throws %}
         try {
           ::ubrn::nitro::check_status(__status, free_status_buffer);
         } catch (::ubrn::nitro::UniffiTypedError& __typed) {
-          // Decode borrows the buffer; __typed frees it on scope exit (even
-          // if the decoder itself throws).
-          auto __decoded = {{ throws.lift_fn() }}(__typed.buffer());
-          throw __decoded;
+          throw {{ throws.lift_fn() }}(__typed.buffer());
         }
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
@@ -129,8 +124,8 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- else %}
         return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
-{%- endmatch %}
       });
+{%- endmatch %}
 {%- endif %}
 {%- else %}
   auto __status = ubrn::nitro::make_status();
