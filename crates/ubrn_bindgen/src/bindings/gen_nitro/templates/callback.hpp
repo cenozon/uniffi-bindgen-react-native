@@ -36,6 +36,14 @@
 namespace margelo::nitro::{{ fd.namespace }} { class {{ fd.cxx_class }}; }
 {%- endfor %}
 
+{%- if let Some(proxy) = cb.proxy %}
+extern "C" {
+// Rust-side reference management for a `with_foreign` trait object Rust
+// can hand back as `Arc<dyn Trait>` (the proxy path).
+void {{ proxy.free_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
+}
+{%- endif %}
+
 namespace margelo::nitro::{{ module.namespace }} {
 
 /// Trampoline HybridObject for `{{ cb.ts_name }}`. The methods are
@@ -45,7 +53,17 @@ class {{ cb.cxx_class }} : public ::margelo::nitro::HybridObject {
 public:
   static constexpr auto TAG = "{{ cb.ts_name }}";
 
+{%- if let Some(proxy) = cb.proxy %}
+  // Foreign-implemented (JS subclass) default constructor — no proxy handle.
+  {{ cb.cxx_class }}() : HybridObject(TAG), proxy_handle_() {}
+  // Rust-backed proxy constructor: wraps an `Arc<dyn Trait>` handle Rust
+  // returned. Its methods (unless overridden by a JS subclass) dispatch back
+  // into Rust; the handle is RAII-freed via the trait's uniffi free symbol.
+  explicit {{ cb.cxx_class }}(::ubrn::nitro::FromRustHandle __h)
+      : HybridObject(TAG), proxy_handle_(__h.raw) {}
+{%- else %}
   {{ cb.cxx_class }}() : HybridObject(TAG) {}
+{%- endif %}
 
 {%- for method in cb.methods %}
   virtual {{ method.return_kind.cxx_type() }} {{ method.cxx_name }}(
@@ -57,6 +75,14 @@ public:
 
 protected:
   void loadHybridMethods() override;
+
+{%- if let Some(proxy) = cb.proxy %}
+private:
+  // Non-zero when this instance is a Rust-backed proxy (Rust returned the
+  // trait object); zero for a JS-implemented instance. RAII-frees via the
+  // trait's uniffi free symbol on destruction.
+  ubrn::nitro::UniffiObjectHandle<&{{ proxy.free_symbol }}> proxy_handle_;
+{%- endif %}
 };
 
 /// Idempotent vtable installation. Called from

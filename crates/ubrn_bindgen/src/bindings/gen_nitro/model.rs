@@ -145,6 +145,15 @@ impl NitroModule {
                     match en.shape {
                         general::EnumShape::Error { .. } => {
                             errors.push(NitroError::from_general(en)?);
+                            // A uniffi error enum can also be used as a plain
+                            // value (field / argument / return) — e.g.
+                            // `fn get_tuple(t: Option<MyError>) -> MyError`.
+                            // Emit its value representation too (the `<Name>.hpp`
+                            // enum + `JSIConverter<Name>` + `lift_/lower_<Name>`
+                            // codec), so value uses resolve. The thrown form is
+                            // a distinct `<Name>Error` exception class
+                            // (TS `<Name>Variant`), so the two never collide.
+                            enums.push(NitroEnum::from_general(en)?);
                         }
                         general::EnumShape::Enum => {
                             enums.push(NitroEnum::from_general(en)?);
@@ -2083,7 +2092,8 @@ impl NitroRecord {
         let fields = record
             .fields
             .iter()
-            .map(NitroRecordField::from_general)
+            .enumerate()
+            .map(|(i, f)| NitroRecordField::from_general(f, i))
             .collect();
         Ok(Self { ts_name, fields })
     }
@@ -2107,9 +2117,21 @@ pub struct NitroRecordField {
 }
 
 impl NitroRecordField {
-    fn from_general(field: &general::Field) -> Self {
+    fn from_general(field: &general::Field, index: usize) -> Self {
+        // Tuple / positional fields (Rust `enum V { A(String) }` or a tuple
+        // struct) carry no usable name, so `to_lower_camel_case` yields "".
+        // Synthesize a stable `v<index>` so the C++ struct member and the JS
+        // object key are both valid and agree (the wire codec is positional,
+        // so the name is purely a surface detail — it just has to be
+        // consistent between the struct, the JSIConverter, and the .nitro.ts).
+        let camel = field.name.to_lower_camel_case();
+        let ts_name = if camel.is_empty() {
+            format!("v{index}")
+        } else {
+            camel
+        };
         Self {
-            ts_name: field.name.to_lower_camel_case(),
+            ts_name,
             rust_name: field.name.clone(),
             ty: NitroType::from_type_lossy(&field.ty.ty),
         }
@@ -2328,7 +2350,8 @@ impl NitroEnumVariant {
             fields: variant
                 .fields
                 .iter()
-                .map(NitroRecordField::from_general)
+                .enumerate()
+                .map(|(i, f)| NitroRecordField::from_general(f, i))
                 .collect(),
         }
     }

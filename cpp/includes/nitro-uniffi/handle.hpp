@@ -36,6 +36,15 @@
 
 namespace ubrn::nitro {
 
+/// Tag carrying a uint64 Arc handle Rust returned for an `Arc<dyn Trait>`
+/// (a callback-trait object). Handed to a callback `Hybrid<Name>`'s proxy
+/// constructor to distinguish it from the argless foreign-impl default
+/// constructor. The proxy takes ownership of the handle (uniffi already
+/// handed us our own reference).
+struct FromRustHandle {
+  uint64_t raw;
+};
+
 /// Owning handle to a uniffi-side Arc<Object>. `FreeFn` is the
 /// project+interface-specific `uniffi_<crate>_fn_free_<obj>` symbol.
 ///
