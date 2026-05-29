@@ -5,4 +5,5 @@
  */
 ubrn_macros::build_foreign_language_testcases! {
     "tests/bindings/test_benchmark.ts" => [Jsi, Wasm, Napi, Nitro],
+    "tests/bindings/test_async_callback_probe.ts" => [Jsi, Nitro],
 }

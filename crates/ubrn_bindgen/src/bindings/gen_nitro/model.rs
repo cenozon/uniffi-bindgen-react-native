@@ -1015,21 +1015,71 @@ impl NitroCallbackMethod {
     /// The C++ return type as it appears in the `Hybrid<Name>` method
     /// signature (both the `.hpp` virtual declaration and the `.cpp`
     /// definition). A sync method is the bare lowered/lifted value type; an
-    /// async method returns `std::shared_ptr<Promise<T>>` — Nitro's contract
-    /// for `Promise`-returning HybridObject methods, which the async
-    /// trampoline awaits before driving uniffi's foreign-future callback.
-    /// Mirror of [`NitroFunction::cxx_return_signature`].
+    /// async method returns `std::shared_ptr<ForeignAsyncResult<T>>`.
+    ///
+    /// The wrapper (not a bare `std::shared_ptr<Promise<T>>`) is load-bearing:
+    /// the `setJsImpl` hook binds the JS method as a `std::function` of this
+    /// same return type, and Nitro's `JSIConverter<std::function<R(Args...)>>`
+    /// branches on `is_promise_v<R>`. A `Promise`-typed `R` would build an
+    /// `AsyncJSCallback` whose `SyncJSCallback` reads the JS function's
+    /// returned *Promise object* as the raw value `T` without awaiting it
+    /// (`react-native-nitro-modules` `JSIConverter+Function.hpp` ->
+    /// `JSCallback.hpp`). `ForeignAsyncResult<T>` is not a `Promise`, so Nitro
+    /// keeps a plain `SyncJSCallback`; its `JSIConverter` (see
+    /// `nitro-uniffi/js_async_callback.hpp`) chains `.then` / `.catch` on the
+    /// JS Promise and yields a C++ `Promise<T>` the async trampoline awaits
+    /// before driving uniffi's foreign-future callback. Unlike
+    /// [`NitroFunction::cxx_return_signature`] (an interface/namespace async
+    /// method, which returns a real `Promise<T>` *to* JS), a callback method's
+    /// async return travels *from* JS and must be awaited.
     pub fn cxx_return_signature(&self) -> String {
         let inner = self.return_kind.cxx_type();
         if self.is_async {
-            format!("std::shared_ptr<::margelo::nitro::Promise<{inner}>>")
+            format!("std::shared_ptr<::ubrn::nitro::ForeignAsyncResult<{inner}>>")
         } else {
             inner
         }
     }
+
+    /// Whether the generated JS-impl bridge (the `setJsImpl` hook + the
+    /// per-method `_fn_` member the virtual prefers) can be emitted for this
+    /// method.
+    ///
+    /// Nitro's `JSIConverter<std::function<R(Args...)>>` collapses a
+    /// `Promise<void>`-returning JS function to a fire-and-forget
+    /// `AsyncJSCallback<void>` whose `operator()` returns `void` — which is
+    /// not convertible to the `std::shared_ptr<Promise<void>>` an async-void
+    /// virtual must return, so a `std::function`-typed member for that case
+    /// is ill-formed *and* would lose the JS completion signal the
+    /// foreign-future trampoline awaits. Such methods keep the proxy / throw
+    /// fallback instead (they aren't exercised through the JS-impl path).
+    ///
+    /// Sync methods (any return, including void) and async methods returning
+    /// a value are all supported.
+    pub fn supports_js_impl(&self) -> bool {
+        !(self.is_async && matches!(self.return_kind, ReturnKind::Void))
+    }
 }
 
 impl NitroCallbackInterface {
+    /// Whether any method supports the JS-impl bridge (see
+    /// [`NitroCallbackMethod::supports_js_impl`]). When false the `setJsImpl`
+    /// hook + the consumer-facing JS-impl factory are not emitted at all.
+    pub fn has_js_impl_methods(&self) -> bool {
+        self.methods.iter().any(NitroCallbackMethod::supports_js_impl)
+    }
+
+    /// The subset of methods the JS-impl bridge is emitted for, in
+    /// declaration order. Templates iterate this (rather than filtering
+    /// `methods` inline) so `loop.last` drives correct comma separation in
+    /// the generated `setJsImpl` parameter list / factory call.
+    pub fn js_impl_methods(&self) -> Vec<&NitroCallbackMethod> {
+        self.methods
+            .iter()
+            .filter(|m| m.supports_js_impl())
+            .collect()
+    }
+
     /// Build the foreign-only shape from a UDL `callback interface`.
     fn from_general(cb: &general::CallbackInterface) -> Result<Self> {
         let ts_name = cb.name.to_upper_camel_case();
@@ -2762,20 +2812,23 @@ mod tests {
     }
 
     #[test]
-    fn async_callback_method_cxx_return_wraps_in_promise() {
+    fn async_callback_method_cxx_return_wraps_in_foreign_async_result() {
         // The C++ HybridObject method for an async foreign-trait method must
-        // return `std::shared_ptr<Promise<T>>` so the trampoline can await it;
-        // a sync method stays the bare value/void type.
+        // return `std::shared_ptr<ForeignAsyncResult<T>>`: the wrapper keeps
+        // Nitro's `std::function` converter on the SyncJSCallback path (so the
+        // JS method's returned JS Promise is awaited, not mis-read as the raw
+        // value), and its `.promise` is the C++ `Promise<T>` the trampoline
+        // chains on. A sync method stays the bare value/void type.
         let m = callback_method(true, ReturnKind::Value(NitroType::I32));
         assert_eq!(
             m.cxx_return_signature(),
-            "std::shared_ptr<::margelo::nitro::Promise<int32_t>>"
+            "std::shared_ptr<::ubrn::nitro::ForeignAsyncResult<int32_t>>"
         );
 
         let m = callback_method(true, ReturnKind::Void);
         assert_eq!(
             m.cxx_return_signature(),
-            "std::shared_ptr<::margelo::nitro::Promise<void>>"
+            "std::shared_ptr<::ubrn::nitro::ForeignAsyncResult<void>>"
         );
 
         let m = callback_method(false, ReturnKind::Value(NitroType::I32));

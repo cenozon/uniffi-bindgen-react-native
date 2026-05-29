@@ -16,14 +16,16 @@ import type {
   {{ iface.ts_name }} as {{ iface.ts_name }}Spec,
 {%- endfor %}
 {%- for cb in module.callback_interfaces %}
-  {{ cb.ts_name }},
+  {{ cb.ts_name }} as {{ cb.ts_name }}Spec,
 {%- endfor %}
 } from './{{ module.namespace_camel }}.nitro'
 
 // Record / enum / callback types and the namespace-API + interface *types*
 // pass straight through. Interfaces also get a runtime value (the class
 // shim below), so they're exported as `type` here under the `Spec` alias
-// and re-surfaced under their bare name as a class.
+// and re-surfaced under their bare name as a class. Callback interfaces are
+// re-exported as `type` under a `Spec` alias too: their bare name becomes a
+// runtime *factory* (the JS-impl wrapper) emitted further down.
 export type {
   {{ module.namespace_api_ts_name() }},
 {%- for record in module.records %}
@@ -33,7 +35,7 @@ export type {
   {{ en.ts_name }},
 {%- endfor %}
 {%- for cb in module.callback_interfaces %}
-  {{ cb.ts_name }},
+  {{ cb.ts_name }} as {{ cb.ts_name }}Spec,
 {%- endfor %}
 }
 
@@ -82,6 +84,69 @@ export type {{ iface.ts_name }} = {{ iface.ts_name }}Spec
 {%- endif %}
  */
 export type {{ iface.ts_name }} = {{ iface.ts_name }}Spec
+{%- endif %}
+{%- endfor %}
+
+{%- for cb in module.callback_interfaces %}
+{%- if cb.has_js_impl_methods() %}
+
+/**
+ * JS-impl factory for the uniffi callback interface `{{ cb.ts_name }}`.
+ *
+ * The other backends (jsi/napi/wasm) let JS pass a plain object that
+ * `implements {{ cb.ts_name }}`. Under Nitro a callback parameter is a
+ * `HybridObject`, so a bare object is rejected by the argument's JSI
+ * converter (it has no C++ `NativeState`). This factory bridges the gap:
+ * it creates the generated `{{ cb.cxx_class }}` HybridObject and binds the
+ * supplied `impl`'s methods onto it via the C++ `setJsImpl` hook. The
+ * returned value IS a `{{ cb.ts_name }}` and can be handed straight to any
+ * method taking one — Rust dispatches into `impl`'s methods (async methods
+ * are awaited through uniffi's foreign-future ABI).
+ *
+ * Call it as a function (`{{ cb.ts_name }}(impl)`); the bare name doubles as
+ * the interface *type* (declaration merging), so `const cb: {{ cb.ts_name }}
+ * = {{ cb.ts_name }}(impl)` type-checks.
+ */
+export function {{ cb.ts_name }}(impl: {
+{%- for method in cb.methods %}
+  {{ method.ts_name }}(
+{%- for arg in method.args -%}
+    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+  ): {{ method.ts_return_signature() }}
+{%- endfor %}
+}): {{ cb.ts_name }}Spec {
+  const __obj = NitroModules.createHybridObject<{{ cb.ts_name }}Spec>('{{ cb.ts_name }}')
+  // The C++ `setJsImpl` hook isn't part of the public spec surface; it takes
+  // one bound function per JS-impl-supported method, in declaration order.
+  // (Async-void methods, if any, are omitted — see the C++ `supports_js_impl`
+  // rationale; they keep the proxy / throw fallback.)
+  ;(__obj as unknown as { setJsImpl(
+{%- for method in cb.js_impl_methods() -%}
+    {{ method.cxx_name }}_fn: (
+{%- for arg in method.args -%}
+      {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+    ) => {{ method.ts_return_signature() }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+  ): void }).setJsImpl(
+{%- for method in cb.js_impl_methods() -%}
+    impl.{{ method.ts_name }}.bind(impl){% if !loop.last %}, {% endif %}
+{%- endfor -%}
+  )
+  return __obj
+}
+export type {{ cb.ts_name }} = {{ cb.ts_name }}Spec
+{%- else %}
+
+/**
+ * The uniffi callback interface `{{ cb.ts_name }}` has no method the Nitro
+ * JS-impl bridge can support (every method is an async `void`-returning
+ * method, which Nitro's `std::function` callback converter can't round-trip
+ * as an awaitable). It is therefore type-only here — JS cannot supply an
+ * impl for it under Nitro yet.
+ */
+export type {{ cb.ts_name }} = {{ cb.ts_name }}Spec
 {%- endif %}
 {%- endfor %}
 

@@ -41,7 +41,13 @@
 #include "{{ header }}"
 {%- endfor %}
 
+// `JSIConverter<std::function<...>>` turns the JS impl functions handed to
+// `setJsImpl` into `Sync`/`AsyncJSCallback`s (pulled in transitively by
+// `HybridObject`, but named here for clarity).
+#include <NitroModules/JSIConverter.hpp>
+
 #include <atomic>
+#include <functional>
 #include <stdexcept>
 
 extern "C" {
@@ -84,8 +90,30 @@ void {{ cb.cxx_class }}::loadHybridMethods() {
 {%- for method in cb.methods %}
     prototype.registerHybridMethod("{{ method.ts_name }}", &{{ cb.cxx_class }}::{{ method.cxx_name }});
 {%- endfor %}
+{%- if cb.has_js_impl_methods() %}
+    // JS-impl binding hook — the `.ts` `{{ cb.ts_name }}(...)` factory calls
+    // this once with one function per (JS-impl-supported) method to install
+    // the JS impl.
+    prototype.registerHybridMethod("setJsImpl", &{{ cb.cxx_class }}::setJsImpl);
+{%- endif %}
   });
 }
+
+{%- if cb.has_js_impl_methods() %}
+void {{ cb.cxx_class }}::setJsImpl(
+{%- for method in cb.js_impl_methods() -%}
+    std::function<{{ method.cxx_return_signature() }}(
+{%- for arg in method.args -%}
+      {{ arg.ty.cxx_type() }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+    )> {{ method.cxx_name }}_fn{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+) {
+{%- for method in cb.js_impl_methods() %}
+  {{ method.cxx_name }}_fn_ = std::move({{ method.cxx_name }}_fn);
+{%- endfor %}
+}
+{%- endif %}
 
 {% for method in cb.methods %}
 {{ method.cxx_return_signature() }} {{ cb.cxx_class }}::{{ method.cxx_name }}(
@@ -93,6 +121,20 @@ void {{ cb.cxx_class }}::loadHybridMethods() {
     {{ arg.ty.cxx_type() }} {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
 ) {
+{%- if method.supports_js_impl() %}
+  // JS-implemented instance: invoke the bound JS function. For a sync method
+  // this runs the JS function inline and returns its value; for an async
+  // method the bound `SyncJSCallback` runs the JS function and converts its
+  // returned JS Promise into a `std::shared_ptr<ForeignAsyncResult<T>>` whose
+  // `.promise` the async trampoline awaits.
+  if ({{ method.cxx_name }}_fn_) {
+    return {{ method.cxx_name }}_fn_(
+{%- for arg in method.args -%}
+        {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+    );
+  }
+{%- endif %}
 {%- if let Some(proxy) = cb.proxy %}
 {%- if let Some(sym) = method.uniffi_symbol %}
   // Rust-backed proxy (Rust handed us this trait object): dispatch the call
@@ -206,14 +248,19 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
         free_status_buffer({{ arg.ts_name }}_lowered);
 {%- endif %}
 {%- endfor %}
-        // Call the JS method — it returns `std::shared_ptr<Promise<T>>`. The
-        // listeners capture `self` + `promise` so both stay alive until the
-        // promise settles and we fire `uniffi_callback`.
-        auto promise = self->{{ method.cxx_name }}(
+        // Call the JS method — it returns
+        // `std::shared_ptr<ForeignAsyncResult<T>>`, whose `.promise` is a C++
+        // `Promise<T>` already chained (via the wrapper's `JSIConverter`, see
+        // `nitro-uniffi/js_async_callback.hpp`) to the JS method's returned JS
+        // Promise — i.e. it settles when the JS `async` method's Promise does.
+        // The listeners capture `self` + `promise` so both stay alive until
+        // the promise settles and we fire `uniffi_callback`.
+        auto __result = self->{{ method.cxx_name }}(
 {%- for arg in method.args -%}
             {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
         );
+        auto promise = __result->promise;
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
         promise->addOnResolvedListener(

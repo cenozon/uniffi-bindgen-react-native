@@ -7,6 +7,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 // ---------------------------------------------------------------------------
 // String / bytes / array roundtrips (original suite)
 // ---------------------------------------------------------------------------
@@ -246,6 +248,37 @@ pub extern "C" fn ubrn_bench_get_bytes_raw(length: u32, out_len: *mut usize) -> 
 #[no_mangle]
 pub unsafe extern "C" fn ubrn_bench_free_bytes_raw(ptr: *mut u8, len: usize) {
     drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
+}
+
+// ---------------------------------------------------------------------------
+// Callback dispatch — Rust invokes a JS-implemented foreign callback
+// ---------------------------------------------------------------------------
+//
+// `BenchCallback` is a `with_foreign` trait: JS supplies the implementation,
+// Rust dispatches into it. `run_sync` measures the synchronous foreign-call
+// crossing; `run_async` exercises uniffi's foreign-future ABI end to end
+// (Rust calls a JS `async` method, awaits its Promise, and reads the value).
+
+#[uniffi::export(with_foreign)]
+#[async_trait]
+pub trait BenchCallback: Send + Sync {
+    /// Synchronous callback: receives `x`, returns a value derived from it.
+    fn run_sync(&self, x: u32) -> u32;
+    /// Asynchronous callback: receives `x`, returns a value via a Promise.
+    async fn run_async(&self, x: u32) -> u32;
+}
+
+/// Sync callback dispatch: Rust invokes the foreign `run_sync` and returns it.
+#[uniffi::export]
+pub fn invoke_sync_callback(cb: Arc<dyn BenchCallback>, x: u32) -> u32 {
+    cb.run_sync(x)
+}
+
+/// Async callback dispatch: Rust invokes the foreign `run_async`, awaits the
+/// resulting future, and returns the lifted value.
+#[uniffi::export]
+pub async fn invoke_async_callback(cb: Arc<dyn BenchCallback>, x: u32) -> u32 {
+    cb.run_async(x).await
 }
 
 uniffi::setup_scaffolding!();

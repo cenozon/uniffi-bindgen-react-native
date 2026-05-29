@@ -35,6 +35,7 @@
 
 #include <NitroModules/Promise.hpp>
 #include <UniffiRustCallStatus.h>
+#include <nitro-uniffi/js_dispatcher.hpp>
 
 #include <cstdint>
 #include <exception>
@@ -73,11 +74,34 @@ struct RustFutureAsyncState {
 /// state. May fire on the JS thread (synchronously inside `poll` for a
 /// ready future) or a Rust executor thread; `Promise::resolve` handles the
 /// thread marshaling.
+///
+/// The `Wake` re-poll is *deferred* onto the JS thread's task queue rather than
+/// run inline. uniffi delivers a `Wake` from inside `Scheduler::wake()`, which
+/// holds the RustFuture's *scheduler* mutex while it calls this continuation
+/// (`uniffi_core` `rustfuture/scheduler.rs`). Re-polling inline re-enters
+/// `RustFuture::poll`, which — if the future suspends again — calls
+/// `Scheduler::store()` and re-locks that same (non-reentrant `std::sync`)
+/// mutex on the same thread: a self-deadlock. This is exactly the path a
+/// suspending future hits when an awaited foreign (JS) async callback completes
+/// and wakes the driving future. Deferring the re-poll lets `wake()` unwind and
+/// release the scheduler lock first; the deferred task then re-polls on a clean
+/// stack. The immediately-ready case (`Ready` on the first poll) is unaffected
+/// — it never re-polls; it runs `on_ready()` synchronously here. If no JS
+/// Dispatcher is available (process teardown / a host without one), we fall
+/// back to an inline re-poll so a wakeup is never silently dropped.
 extern "C" inline void
 rust_future_async_continuation(uint64_t cb_data, int8_t poll_result) noexcept {
   auto *state = reinterpret_cast<RustFutureAsyncState *>(cb_data);
   if (poll_result == static_cast<int8_t>(RustFuturePoll::Wake)) {
-    state->poll_fn(state->handle, &rust_future_async_continuation, cb_data);
+    if (auto dispatcher = get_js_dispatcher()) {
+      dispatcher->runAsync([state]() {
+        state->poll_fn(state->handle, &rust_future_async_continuation,
+                       reinterpret_cast<uint64_t>(state));
+      });
+    } else {
+      state->poll_fn(state->handle, &rust_future_async_continuation,
+                     reinterpret_cast<uint64_t>(state));
+    }
     return;
   }
   state->on_ready();

@@ -11,6 +11,7 @@ name = "uniffi_benchmark"
 
 [dependencies]
 uniffi = { workspace = true, features = ["tokio"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 ubrn_macros = { workspace = true }

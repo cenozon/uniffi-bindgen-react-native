@@ -20,6 +20,8 @@ import {
   getStringArray,
   getStringArrayAsync,
   getStringAsync,
+  invokeAsyncCallback,
+  invokeSyncCallback,
   noop,
   noopAsync,
   takeBytes,
@@ -30,7 +32,23 @@ import {
   takeStringArrayAsync,
   takeStringAsync,
 } from "@/generated/uniffi_benchmark";
+// `BenchCallback` is a *type* on every backend; on Nitro it is *also* a
+// runtime factory value (the JS-impl wrapper). Import the type for the
+// signatures and grab the namespace separately to probe for that factory at
+// runtime — see `makeBenchCallback` below.
+import type { BenchCallback } from "@/generated/uniffi_benchmark";
+import * as benchmarkModule from "@/generated/uniffi_benchmark";
 import { asyncTest, test } from "@/asserts";
+
+// Register the module's callback-interface vtables with Rust. On
+// jsi/napi/wasm the generated module ships a default export whose
+// `initialize()` installs the `BenchCallback` vtable (without it, the first
+// `invokeSyncCallback` call panics Rust-side with "Foreign pointer not set").
+// The Nitro backend has no default export / `initialize()` — it installs the
+// vtable lazily on first lowering — so the call is guarded as optional.
+(
+  benchmarkModule as unknown as { default?: { initialize?: () => void } }
+).default?.initialize?.();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -80,6 +98,35 @@ function fmtMs(ms: number): string {
   if (ms >= 10) return ms.toFixed(1);
   if (ms >= 1) return ms.toFixed(2);
   return ms.toFixed(3);
+}
+
+// ---------------------------------------------------------------------------
+// Flavor-aware callback construction
+// ---------------------------------------------------------------------------
+//
+// A callback parameter has a different shape per backend:
+//   * jsi / napi / wasm: `BenchCallback` is a plain interface — JS just
+//     passes an object implementing the methods.
+//   * Nitro: `BenchCallback` is a `HybridObject`, so a bare object is
+//     rejected (no C++ NativeState). The generated module exports a runtime
+//     `BenchCallback(impl)` *factory* (same name as the type) that wraps the
+//     impl in the generated HybridObject and binds the methods via C++
+//     `setJsImpl`.
+//
+// `makeBenchCallback` papers over the difference: if the module exposes a
+// callable `BenchCallback`, use it (Nitro); otherwise pass the impl object
+// through unchanged (jsi/napi/wasm).
+interface BenchCallbackImpl {
+  runSync(x: number): number;
+  runAsync(x: number): Promise<number>;
+}
+
+function makeBenchCallback(impl: BenchCallbackImpl): BenchCallback {
+  const factory = (benchmarkModule as Record<string, unknown>).BenchCallback;
+  if (typeof factory === "function") {
+    return (factory as (i: BenchCallbackImpl) => BenchCallback)(impl);
+  }
+  return impl as unknown as BenchCallback;
 }
 
 const RUNS = 3;
@@ -466,6 +513,62 @@ test("MEM: heap + wasm-memory profile", (_t) => {
             `take=${fmtMs(tTake).padStart(7)}ms (${(tTake / ITERS).toFixed(2)} ms/call)`,
         );
       }
+      t.end();
+    },
+    TIMEOUT_MS,
+  );
+
+  // -------------------------------------------------------------------------
+  // Callback dispatch — Rust invokes a JS-implemented foreign callback.
+  // The impl derives its result from `x` (x*2+1) so a correct round-trip is
+  // distinguishable from a no-op / wrong-value path.
+  // -------------------------------------------------------------------------
+  const cbImpl: BenchCallbackImpl = {
+    runSync(x: number): number {
+      return x * 2 + 1;
+    },
+    async runAsync(x: number): Promise<number> {
+      return x * 2 + 1;
+    },
+  };
+
+  await asyncTest(
+    "bench: invokeSyncCallback (Rust -> JS sync callback dispatch)",
+    async (t) => {
+      console.log("\n--- invokeSyncCallback: sync foreign-callback crossing ---");
+      const cb = makeBenchCallback(cbImpl);
+      // Correctness gate: a wired callback returns x*2+1.
+      t.assertEqual(invokeSyncCallback(cb, 21), 43);
+
+      const ITERS = 10_000;
+      const ms = bench(() => {
+        invokeSyncCallback(cb, 42);
+      }, ITERS, RUNS);
+      console.log(
+        `  x${ITERS}: ${fmtMs(ms)}ms  (~${((ms * 1000) / ITERS).toFixed(3)} µs/call)`,
+      );
+      t.end();
+    },
+    TIMEOUT_MS,
+  );
+
+  // Async foreign-callback dispatch (`invokeAsyncCallback`): Rust calls the
+  // JS-implemented `async runAsync`, awaits its Promise, and returns the lifted
+  // value. The JS impl derives `x*2+1` so a correct round-trip is
+  // distinguishable from a no-op / wrong-value path.
+  await asyncTest(
+    "bench: invokeAsyncCallback (Rust -> JS async callback dispatch)",
+    async (t) => {
+      console.log("\n--- invokeAsyncCallback: async foreign-callback crossing ---");
+      const cb = makeBenchCallback(cbImpl);
+      // Correctness gate: a wired async callback resolves to x*2+1.
+      t.assertEqual(await invokeAsyncCallback(cb, 21), 43);
+
+      const ITERS = 10_000;
+      const ms = await benchAsync(() => invokeAsyncCallback(cb, 42), ITERS, RUNS);
+      console.log(
+        `  x${ITERS}: ${fmtMs(ms)}ms  (~${((ms * 1000) / ITERS).toFixed(3)} µs/call)`,
+      );
       t.end();
     },
     TIMEOUT_MS,

@@ -65,14 +65,21 @@ public:
   /// shared ownership of the instance — callers can drop their own
   /// shared_ptr immediately and it'll stay alive until `remove` is
   /// called.
+  ///
+  /// Handles are **odd** values (1, 3, 5, …). This is load-bearing, not
+  /// cosmetic: uniffi distinguishes foreign-generated handles from
+  /// Rust-generated ones by the lowest bit. `Handle::is_foreign()` is
+  /// `(raw & 1) == 1`, and a `with_foreign` trait's `try_lift` takes the
+  /// foreign path (wrap the handle in a vtable-backed proxy) only when that
+  /// bit is set — otherwise it treats the value as a leaked `Arc` pointer
+  /// and does `Arc::from_raw(handle)`, which segfaults for a small integer.
+  /// (uniffi-core `ffi/handle.rs`: "Foreign handles are generated with a
+  /// handle map that only generates odd values." Mirrors the JSI runtime's
+  /// `UniffiHandleMap`, which starts at 1 and steps by 2.)
   uint64_t insert(std::shared_ptr<HybridT> instance) {
     std::lock_guard<std::mutex> guard(mu_);
-    uint64_t handle = next_++;
-    if (handle == 0) {
-      // Handle 0 is reserved as "null / not present" by uniffi's
-      // wire format for optional callbacks. Skip it on wrap.
-      handle = next_++;
-    }
+    uint64_t handle = next_;
+    next_ += 2; // stay odd
     map_.emplace(handle, std::move(instance));
     return handle;
   }
@@ -104,8 +111,9 @@ private:
 
   mutable std::mutex mu_;
   std::unordered_map<uint64_t, std::shared_ptr<HybridT>> map_;
-  // Start at 1 so 0 is reserved (uniffi treats handle 0 as "no
-  // instance" for optional callback args).
+  // Start at 1 and step by 2 (in `insert`) so every handle is odd: 0 is
+  // reserved (uniffi treats it as "no instance" for optional callback
+  // args) and the lowest bit marks the handle as foreign — see `insert`.
   std::atomic<uint64_t> next_{1};
 };
 

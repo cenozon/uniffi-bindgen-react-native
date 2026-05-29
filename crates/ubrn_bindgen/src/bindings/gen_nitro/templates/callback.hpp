@@ -17,9 +17,11 @@
 #include <NitroModules/Promise.hpp>
 #include <NitroUniffi.hpp>
 #include <nitro-uniffi/foreign_future.hpp>
+#include <nitro-uniffi/js_async_callback.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
 #include <nitro-uniffi/jsi_converter_map.hpp>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +81,32 @@ public:
   );
 {%- endfor %}
 
+{%- if cb.has_js_impl_methods() %}
+  // JS-implementation setter. JS code creates a `{{ cb.cxx_class }}` via
+  // `NitroModules.createHybridObject('{{ cb.ts_name }}')` then calls this
+  // once with one function per trait method (the consumer-facing
+  // `{{ cb.ts_name }}(...)` factory in the `.ts` module does this), binding
+  // the JS impl. Nitro's `JSIConverter<std::function<...>>` turns each JS
+  // function into a `SyncJSCallback`, so the virtuals below invoke JS
+  // directly. A sync method runs inline and returns its value; an async
+  // method returns `std::shared_ptr<ForeignAsyncResult<T>>` — the
+  // `SyncJSCallback` converts the JS method's returned JS Promise via the
+  // wrapper's `JSIConverter` (`nitro-uniffi/js_async_callback.hpp`), which
+  // chains `.then`/`.catch` and yields the C++ `Promise<T>` the async
+  // trampoline awaits. (A `Promise`-typed bound function would instead make
+  // Nitro build an `AsyncJSCallback` that mis-reads the JS Promise as the raw
+  // value — see `NitroCallbackMethod::cxx_return_signature`.)
+  void setJsImpl(
+{%- for method in cb.js_impl_methods() -%}
+    std::function<{{ method.cxx_return_signature() }}(
+{%- for arg in method.args -%}
+      {{ arg.ty.cxx_type() }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+    )> {{ method.cxx_name }}_fn{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+  );
+{%- endif %}
+
   // Install this callback's vtable with Rust (idempotent). Generic handle
   // codecs (`ubrn::nitro::write_callback_handle{,_w}`) call this before the
   // first hand-off without needing to name the per-type free hook.
@@ -96,13 +124,24 @@ public:
 protected:
   void loadHybridMethods() override;
 
-{%- if let Some(proxy) = cb.proxy %}
 private:
+{%- if let Some(proxy) = cb.proxy %}
   // Non-zero when this instance is a Rust-backed proxy (Rust returned the
   // trait object); zero for a JS-implemented instance. RAII-frees via the
   // trait's uniffi free symbol on destruction.
   ubrn::nitro::UniffiObjectHandle<&{{ proxy.free_symbol }}> proxy_handle_;
 {%- endif %}
+  // The JS impl, bound by `setJsImpl`. Empty until then; a JS-implemented
+  // instance always binds these before being handed to Rust. Each
+  // JS-impl-supported method's virtual prefers this over the proxy / throw
+  // paths. (Async-void methods are excluded — see `supports_js_impl`.)
+{%- for method in cb.js_impl_methods() %}
+  std::function<{{ method.cxx_return_signature() }}(
+{%- for arg in method.args -%}
+    {{ arg.ty.cxx_type() }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+  )> {{ method.cxx_name }}_fn_;
+{%- endfor %}
 };
 
 /// Idempotent vtable installation. Called from

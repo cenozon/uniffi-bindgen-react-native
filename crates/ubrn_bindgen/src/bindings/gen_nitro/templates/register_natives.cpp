@@ -18,7 +18,9 @@
 // explicit `registerNatives()` call funnel through a `std::once_flag`, so
 // registration is idempotent and never happens twice.
 
+#include <NitroModules/Dispatcher.hpp>
 #include <NitroModules/HybridObjectRegistry.hpp>
+#include <nitro-uniffi/js_dispatcher.hpp>
 #include <jsi/jsi.h>
 #include <memory>
 #include <mutex>
@@ -56,11 +58,23 @@ struct RegisterOnLoad {
 RegisterOnLoad register_on_load;
 } // namespace
 
-extern "C" void registerNatives(facebook::jsi::Runtime& /*runtime*/) {
-  // Runtime is unused: Nitro's HybridObjectRegistry is process-global, and
-  // the host runner installs the Dispatcher separately via `installNitro`.
-  // We keep the `jsi::Runtime&` param only so the dlsym signature is stable
-  // across loaders. The `std::once_flag` makes this a no-op if the static
-  // initializer above has already registered (the common mobile case).
+extern "C" void registerNatives(facebook::jsi::Runtime& runtime) {
+  // Nitro's HybridObjectRegistry is process-global, and the host runner
+  // installs the Dispatcher separately via `installNitro` *before* calling
+  // this. The `std::once_flag` makes the registration a no-op if the static
+  // initializer above has already run (the common mobile case).
   std::call_once(g_register_once, register_natives_impl);
+
+  // Cache the JS-thread Dispatcher for the runtime-less RustFuture continuation
+  // to defer re-polls onto (see `nitro-uniffi/future.hpp`). This is the one
+  // place we're handed a runtime after the Dispatcher is installed. Guarded so
+  // a runtime without a Dispatcher (older host) is a non-fatal no-op.
+  try {
+    ::ubrn::nitro::set_js_dispatcher(
+        ::margelo::nitro::Dispatcher::getRuntimeGlobalDispatcher(runtime));
+  } catch (...) {
+    // No Dispatcher installed for this runtime — the continuation falls back to
+    // an inline re-poll (correct for single-poll futures; the deferral only
+    // matters for genuinely-suspending ones).
+  }
 }
