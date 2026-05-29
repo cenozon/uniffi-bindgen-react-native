@@ -79,28 +79,32 @@ pub fn run_test(crate_name: &str, test_script: &str, target_tmpdir: &str) {
     let target_dir = &metadata::workspace_metadata().target_directory;
     let so_file = compile_cpp(&cpp_dir, &out_dir, &lib_name, target_dir);
 
-    // Step 4: Bundle the TS test. `react-native-nitro-modules` is vendored
-    // (not in `node_modules`) so we register it as a Metro `extraNodeModules`
-    // + TSC `paths` entry. Bind the owned PathBuf first so the `&Utf8Path`
-    // borrow below outlives the slice.
-    let nitro_modules_pkg = paths::nitro_modules_pkg_dir();
+    // Step 4: Bundle the TS test. `react-native-nitro-modules` is installed
+    // in `node_modules`, so Metro/tsc resolve it natively — no remapping. Only
+    // when a `UBRN_NITRO_LOCAL` override points outside the module tree do we
+    // register it as a Metro `extraNodeModules` + TSC `paths` entry.
+    //
     // `react-native-nitro-modules` statically requires `react-native` and
-    // `react-native-worklets` (the latter inside a try/catch at runtime,
-    // but Metro still chokes if it can't resolve the spec). Materialize
-    // tiny no-op stub packages so the bundle resolves cleanly.
+    // `react-native-worklets` (the latter inside a try/catch at runtime, but
+    // Metro still chokes if it can't resolve the spec). Materialize tiny no-op
+    // stub packages so the bundle resolves cleanly. Bind owned PathBufs first
+    // so the `&Utf8Path` borrows below outlive the slice.
     let stubs_root = out_dir.join("stub_modules");
     let rn_stub = make_stub_module(&stubs_root, "react-native");
     let rn_worklets_stub = make_stub_module(&stubs_root, "react-native-worklets");
-    let extras: &[(&str, &Utf8Path)] = &[
-        ("react-native-nitro-modules", nitro_modules_pkg.as_path()),
+    let nitro_override = paths::nitro_local_override();
+    let mut extras: Vec<(&str, &Utf8Path)> = vec![
         ("react-native", rn_stub.as_path()),
         ("react-native-worklets", rn_worklets_stub.as_path()),
     ];
+    if let Some(ref pkg) = nitro_override {
+        extras.push(("react-native-nitro-modules", pkg.as_path()));
+    }
     let bundle = typescript::prepare_for_jsi_with_extras_and_platform(
         test_script,
         &out_dir,
         Some(&ts_dir),
-        extras,
+        &extras,
         // `react-native-nitro-modules` ships a `.web.js` whose proxy
         // throws on every access. Pin Metro to a non-web platform so it
         // resolves to the bare `.js` that checks `global.NitroModulesProxy`

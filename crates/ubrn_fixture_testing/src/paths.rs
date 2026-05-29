@@ -6,6 +6,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
+use ubrn_common::nitro;
 
 use crate::metadata;
 
@@ -64,43 +65,28 @@ pub(crate) fn assert_wasm_bootstrap() {
 
 // === Nitro paths ===
 
-/// Vendored Nitro source tree, placed alongside hermes in `cpp_modules/`.
-/// The `xtask bootstrap nitro` step populates it — either as a real clone
-/// or, when a local checkout exists, as a **symlink** into it (see
-/// `NitroCmd::checkout`).
+/// Nitro's C++ source root (`cpp/`) inside the resolved
+/// `react-native-nitro-modules` package — the include/compile root for the
+/// per-fixture glue. Resolved from `node_modules` (or the `UBRN_NITRO_LOCAL`
+/// override) via [`ubrn_common::nitro`], exactly like the `xtask` build steps.
 ///
-/// We canonicalize the path here so every consumer sees the real on-disk
-/// location rather than the symlink. This matters for Metro: it builds its
-/// module graph from realpaths and refuses to resolve a module whose
-/// realpath falls outside `projectRoot ∪ watchFolders`. Handing it the
-/// symlink path (while its file map keys on the realpath) makes the Nitro
-/// package unresolvable. Canonicalizing means nothing downstream — Metro
-/// extras *or* the cmake include dirs — depends on the symlink surviving.
-/// On a real clone (e.g. CI) canonicalize is a no-op.
-pub(crate) fn nitro_src_dir() -> Utf8PathBuf {
-    let p = repo_root().join("cpp_modules").join("nitro");
-    // Fall back to the un-resolved path if it doesn't exist yet (so the
-    // bootstrap-missing checks still surface a friendly path) or isn't UTF-8.
-    match dunce::canonicalize(&p) {
-        Ok(real) => Utf8PathBuf::from_path_buf(real).unwrap_or(p),
-        Err(_) => p,
-    }
-}
-
-/// Per-package `cpp/` source root for `react-native-nitro-modules`.
+/// Only called after [`assert_nitro_bootstrap`] has confirmed the package
+/// resolves, so the `expect` is unreachable in the test flow.
 pub(crate) fn nitro_cpp_src_dir() -> Utf8PathBuf {
-    nitro_src_dir()
-        .join("packages")
-        .join("react-native-nitro-modules")
-        .join("cpp")
+    nitro::cpp_dir(repo_root())
+        .expect("react-native-nitro-modules cpp/ (checked by assert_nitro_bootstrap)")
 }
 
-/// JS-side `react-native-nitro-modules` package root — used by Metro's
-/// `extraNodeModules` so bundled tests resolve the runtime import.
-pub(crate) fn nitro_modules_pkg_dir() -> Utf8PathBuf {
-    nitro_src_dir()
-        .join("packages")
-        .join("react-native-nitro-modules")
+/// The `UBRN_NITRO_LOCAL` override package directory, if set.
+///
+/// When `None` (the common case), `react-native-nitro-modules` is installed
+/// in `node_modules` and Metro/tsc resolve it natively — no remapping needed.
+/// When `Some`, the package lives outside the module tree, so callers must
+/// register it as a Metro `extraNodeModules` + tsc `paths` entry. The path is
+/// already canonicalized by [`nitro::local_override`], so it
+/// never reintroduces a symlink for Metro to choke on.
+pub(crate) fn nitro_local_override() -> Option<Utf8PathBuf> {
+    nitro::local_override().ok().flatten()
 }
 
 /// Build directory hosting `libNitroModules.{so,dylib,dll}` — written
@@ -162,12 +148,11 @@ pub(crate) fn assert_nitro_bootstrap() -> Result<(), String> {
              Run `cargo xtask bootstrap nitro` first."
         ));
     }
-    let src = nitro_cpp_src_dir();
-    if !src.exists() {
-        return Err(format!(
-            "Nitro cpp source dir not found at {src}. \
-             Run `cargo xtask bootstrap nitro` first."
-        ));
+    // The Nitro package itself: installed under node_modules (run
+    // `yarn install`) or pointed at by `UBRN_NITRO_LOCAL`, and it must carry
+    // its `cpp/` source tree so the per-fixture glue can compile.
+    if let Err(e) = nitro::cpp_dir(repo_root()) {
+        return Err(e.to_string());
     }
     let nm = repo_root().join("node_modules");
     if !nm.exists() {

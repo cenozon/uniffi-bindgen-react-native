@@ -51,11 +51,10 @@ impl NitroTestRunnerCmd {
     }
 
     /// Path to the NitroModules cpp/ source tree, used as the include root.
+    /// Resolved from the `react-native-nitro-modules` npm package (or the
+    /// `UBRN_NITRO_LOCAL` override), same as the `libNitroModules` build.
     fn nitro_include_dir() -> Result<Utf8PathBuf> {
-        Ok(NitroCmd::src_dir()?
-            .join("packages")
-            .join("react-native-nitro-modules")
-            .join("cpp"))
+        NitroCmd::cpp_src_dir()
     }
 }
 
@@ -72,7 +71,7 @@ impl Bootstrap for NitroTestRunnerCmd {
     fn prepare(&self) -> Result<()> {
         // Make sure all upstream dependencies are built before we configure cmake.
         HermesCmd::default().ensure_ready()?;
-        NitroCmd::default().ensure_ready()?;
+        NitroCmd.ensure_ready()?;
 
         let dir = Self::build_dir()?;
         let hermes_src = HermesCmd::src_dir()?;

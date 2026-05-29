@@ -56,7 +56,7 @@ impl BootstrapCmd {
         HermesCmd::default().bootstrap(false)?;
         TestRunnerCmd.bootstrap(false)?;
         YarnCmd.bootstrap(false)?;
-        NitroCmd::default().bootstrap(false)?;
+        NitroCmd.bootstrap(false)?;
         NitroTestRunnerCmd.bootstrap(false)?;
         Ok(())
     }
@@ -86,9 +86,10 @@ enum SubsystemCmd {
     Yarn(YarnCmd),
     /// react-native-nitro-modules' C++ runtime.
     ///
-    /// This command clones (or, by preference, symlinks an existing local
-    /// checkout of) nitro and builds a host-linkable `libNitroModules`
-    /// against Hermes' JSI for use by the test-runner.
+    /// Builds a host-linkable `libNitroModules` against Hermes' JSI for use by
+    /// the test-runner, compiling the Nitro C++ sources straight out of the
+    /// `react-native-nitro-modules` npm package in `node_modules` (or the
+    /// `UBRN_NITRO_LOCAL` override) — the same package a real app consumes.
     Nitro(NitroCmd),
     /// The Nitro-aware counterpart to the JSI `TestRunner`. Builds a Hermes
     /// host that installs `global.NitroModulesProxy` and a CallInvoker-backed

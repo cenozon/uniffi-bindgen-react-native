@@ -6,49 +6,21 @@
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use clap::Args;
-use ubrn_common::{mk_dir, rm_dir, run_cmd};
+use ubrn_common::{mk_dir, nitro, rm_dir, run_cmd};
 
 use crate::{
-    bootstrap::HermesCmd,
-    util::{build_root, cpp_modules, repository_root},
+    bootstrap::{HermesCmd, YarnCmd},
+    util::{build_root, repository_root},
 };
 
 use super::Bootstrap;
 
-/// Local checkout of the user's in-progress Nitro work, used in preference
-/// to a fresh clone when it exists. Mirrors the path described in the
-/// xtask docs.
-const LOCAL_NITRO_PATH: &str = "/home/agent-grant/dev/nitro";
-
-#[derive(Debug, Args)]
-pub(crate) struct NitroCmd {
-    /// Fetch nitro from this GitHub repo (used only if no local checkout is found).
-    #[clap(long, default_value = "mrousavy/nitro")]
-    repo: String,
-
-    /// Fetch this branch from the nitro repo (used only if no local checkout is found).
-    #[clap(long, short = 'b', default_value = "main")]
-    branch: String,
-}
-
-impl Default for NitroCmd {
-    fn default() -> Self {
-        Self {
-            repo: "mrousavy/nitro".to_owned(),
-            branch: "main".to_owned(),
-        }
-    }
-}
+#[derive(Debug, Args, Default)]
+pub(crate) struct NitroCmd;
 
 impl NitroCmd {
-    /// Where the nitro source tree lives (either a git clone or a symlink to
-    /// a local checkout). Sits alongside hermes in `cpp_modules/`.
-    pub fn src_dir() -> Result<Utf8PathBuf> {
-        Ok(cpp_modules()?.join("nitro"))
-    }
-
     /// Where the cmake build artefacts (including `libNitroModules.*`) live.
     pub fn build_dir() -> Result<Utf8PathBuf> {
         Ok(build_root()?.join("nitro-build"))
@@ -61,6 +33,14 @@ impl NitroCmd {
     /// convention is what mobile autolinking would otherwise stage.
     pub(crate) fn include_dir() -> Result<Utf8PathBuf> {
         Ok(Self::build_dir()?.join("include"))
+    }
+
+    /// The C++ source root of the `react-native-nitro-modules` package
+    /// (its `cpp/` dir). Resolved from `node_modules` — or the
+    /// `UBRN_NITRO_LOCAL` override — exactly like a real consumer, so no
+    /// separate Nitro checkout is required.
+    pub(crate) fn cpp_src_dir() -> Result<Utf8PathBuf> {
+        nitro::cpp_dir(repository_root()?.as_path())
     }
 
     /// Mirror every `.hpp` under `cpp_src` into a flat
@@ -77,12 +57,6 @@ impl NitroCmd {
         mk_dir(&flat_dir)?;
 
         let cpp_src = Self::cpp_src_dir()?;
-        if !cpp_src.exists() {
-            return Err(anyhow!(
-                "Nitro cpp source dir {cpp_src} missing; cannot populate flat NitroModules/ include dir"
-            ));
-        }
-
         let mut entries = Vec::new();
         collect_hpp_files(cpp_src.as_std_path(), &mut entries)?;
         for src in entries {
@@ -109,53 +83,9 @@ impl NitroCmd {
         }
     }
 
-    /// Path to the cpp sources inside whatever src_dir resolves to.
-    fn cpp_src_dir() -> Result<Utf8PathBuf> {
-        Ok(Self::src_dir()?
-            .join("packages")
-            .join("react-native-nitro-modules")
-            .join("cpp"))
-    }
-
-    /// Populate `src_dir`. Precedence:
-    ///   1. If `src_dir` already exists, do nothing.
-    ///   2. Else, if `LOCAL_NITRO_PATH` exists, symlink it to `src_dir`
-    ///      (avoids a redundant clone of in-progress local work).
-    ///   3. Else, `git clone -b <branch> --depth 1 https://github.com/<repo>.git`.
-    fn checkout(&self) -> Result<()> {
-        let dir = Self::src_dir()?;
-        if dir.exists() {
-            return Ok(());
-        }
-        let parent = dir.parent().expect("Nitro src dir has no parent");
-        ubrn_common::mk_dir(parent)?;
-
-        let local = Utf8Path::new(LOCAL_NITRO_PATH);
-        if local.exists() {
-            symlink_dir(local, &dir)?;
-            return Ok(());
-        }
-
-        let repo = format!("https://github.com/{}.git", self.repo);
-        run_cmd(
-            Command::new("git")
-                .arg("clone")
-                .arg("--single-branch")
-                .arg("--depth")
-                .arg("1")
-                .arg("-b")
-                .arg(self.branch.as_str())
-                .arg(&repo)
-                .arg(&dir),
-        )?;
-
-        Ok(())
-    }
-
-    /// Write a CMakeLists.txt into `build_dir`. We deliberately do *not* drop
-    /// it into `src_dir` because src_dir may be a symlink into the user's
-    /// working tree (see `checkout`). Keeping the cmake file in the build
-    /// tree avoids polluting that external repo.
+    /// Write a CMakeLists.txt into `build_dir`. We keep it in the build tree
+    /// (rather than next to the sources) because the Nitro sources live in
+    /// `node_modules` — an artefact of `yarn install`, not something we own.
     fn write_cmake_lists(&self) -> Result<Utf8PathBuf> {
         let build_dir = Self::build_dir()?;
         ubrn_common::mk_dir(&build_dir)?;
@@ -168,12 +98,6 @@ impl NitroCmd {
             .join("cpp")
             .join("test-harness")
             .join("platform-host");
-
-        if !cpp_src.exists() {
-            return Err(anyhow!(
-                "Nitro cpp directory not found at {cpp_src}; was src_dir populated?"
-            ));
-        }
 
         let cmake = format!(
             r#"# Auto-generated by xtask bootstrap nitro. Do not edit by hand.
@@ -214,12 +138,12 @@ foreach (sub ${{NITRO_INCLUDE_SUBDIRS}})
 endforeach ()
 
 # `cpp/platform/ThreadUtils.hpp` declares static methods whose impls live
-# in the per-platform tree (android/ios). For host bootstrap we
-# substitute a stub from `cpp/test-harness/platform-host/` that
-# implements the same surface with std::thread + a synchronous
-# InlineDispatcher. Without this libNitroModules fails to link on
-# `ThreadUtils::createUIThreadDispatcher`, `isUIThread`, `getThreadName`,
-# `setThreadName`.
+# in the per-platform tree (android/ios) — the npm package ships those under
+# `ios/` and `android/`, not `cpp/`. For host bootstrap we substitute a stub
+# from `cpp/test-harness/platform-host/` that implements the same surface
+# with std::thread + a synchronous InlineDispatcher. Without this
+# libNitroModules fails to link on `ThreadUtils::createUIThreadDispatcher`,
+# `isUIThread`, `getThreadName`, `setThreadName`.
 set(HOST_PLATFORM_DIR "{platform_host_dir}")
 list(APPEND NITRO_SOURCES "${{HOST_PLATFORM_DIR}}/ThreadUtils.cpp")
 list(APPEND NITRO_INCLUDE_DIRS "${{HOST_PLATFORM_DIR}}")
@@ -273,10 +197,9 @@ impl Bootstrap for NitroCmd {
     }
 
     fn clean() -> Result<()> {
+        // Only the build tree is ours to remove; the Nitro sources live in
+        // `node_modules` (managed by yarn) or behind `UBRN_NITRO_LOCAL`.
         rm_dir(Self::build_dir()?)?;
-        // src_dir may be a symlink into the user's working tree; rm_dir on a
-        // symlink-to-dir removes only the link, not the target. Safe either way.
-        rm_dir(Self::src_dir()?)?;
         Ok(())
     }
 
@@ -284,8 +207,10 @@ impl Bootstrap for NitroCmd {
         // Hermes is a hard prerequisite — we link against its libjsi and need
         // its headers.
         HermesCmd::default().ensure_ready()?;
+        // The Nitro C++ sources come from the `react-native-nitro-modules`
+        // npm package; make sure `yarn install` has populated `node_modules`.
+        YarnCmd.ensure_ready()?;
 
-        self.checkout()?;
         let _ = self.write_cmake_lists()?;
 
         let build_dir = Self::build_dir()?;
@@ -362,16 +287,4 @@ fn mirror_header(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
             .map_err(|e| anyhow!("failed to copy {} -> {}: {e}", src.display(), dst.display()))?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn symlink_dir(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {
-    std::os::unix::fs::symlink(src.as_std_path(), dst.as_std_path())
-        .map_err(|e| anyhow!("failed to symlink {src} -> {dst}: {e}"))
-}
-
-#[cfg(windows)]
-fn symlink_dir(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {
-    std::os::windows::fs::symlink_dir(src.as_std_path(), dst.as_std_path())
-        .map_err(|e| anyhow!("failed to symlink {src} -> {dst}: {e}"))
 }

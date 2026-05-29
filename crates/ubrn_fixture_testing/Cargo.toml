@@ -12,3 +12,4 @@ dunce = "1.0.5"
 heck = { workspace = true }
 pathdiff = { workspace = true }
 ubrn_bindgen = { path = "../ubrn_bindgen" }
+ubrn_common = { path = "../ubrn_common" }

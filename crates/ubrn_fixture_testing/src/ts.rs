@@ -51,11 +51,16 @@ pub fn run_test(test_script: &str, flavor: Flavor, target_tmpdir: &str) {
                 return;
             }
             let _lock = crate::lock_fixture();
-            let nitro_modules_pkg = paths::nitro_modules_pkg_dir();
-            let extras: &[(&str, &camino::Utf8Path)] =
-                &[("react-native-nitro-modules", nitro_modules_pkg.as_path())];
+            // `react-native-nitro-modules` resolves natively from
+            // `node_modules`; only a `UBRN_NITRO_LOCAL` override needs a Metro
+            // `extraNodeModules` + TSC `paths` entry.
+            let nitro_override = paths::nitro_local_override();
+            let extras: Vec<(&str, &camino::Utf8Path)> = match nitro_override {
+                Some(ref pkg) => vec![("react-native-nitro-modules", pkg.as_path())],
+                None => Vec::new(),
+            };
             let bundle =
-                typescript::prepare_for_jsi_with_extras(test_script, &out_dir, None, extras);
+                typescript::prepare_for_jsi_with_extras(test_script, &out_dir, None, &extras);
             run_test_runner_nitro_no_lib(&bundle);
         }
     }
