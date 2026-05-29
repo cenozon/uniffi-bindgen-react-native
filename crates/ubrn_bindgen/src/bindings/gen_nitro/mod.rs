@@ -109,6 +109,22 @@ pub fn generate_all(
     let mut modules = Vec::new();
     let mut hybrid_objects: BTreeSet<HybridObjectEntry> = BTreeSet::new();
 
+    // Register every foreign-implementable callback trait across all
+    // namespaces *before* lowering any module, so a cross-crate use site
+    // whose `Type::Interface.imp` was downgraded to `Trait` by a `typedef
+    // trait` import is still recognized as a callback. The definition side
+    // always carries the authoritative `imp == CallbackTrait`.
+    model::clear_callback_traits();
+    for (_, namespace) in &root.namespaces {
+        for td in &namespace.type_definitions {
+            if let general::TypeDefinition::Interface(iface) = td {
+                if matches!(iface.imp, general::ObjectImpl::CallbackTrait) {
+                    model::register_callback_trait(&namespace.name, &iface.name);
+                }
+            }
+        }
+    }
+
     for (name, namespace) in &root.namespaces {
         let nitro_module = NitroModule::from_general(namespace)?;
         let module = ModuleMetadata::new(name);
@@ -154,6 +170,10 @@ pub fn generate_all(
     // but emitting unconditionally keeps the CMakeLists source list
     // invariant across platforms.
     cpp::write_register_natives(cpp_dir, &hybrid_objects)?;
+
+    // Leave the thread-local clean for the next generate in this thread (the
+    // next run also clears up-front, so a `?` early-return above is harmless).
+    model::clear_callback_traits();
 
     Ok(NitroEmission {
         modules,

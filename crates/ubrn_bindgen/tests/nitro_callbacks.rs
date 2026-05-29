@@ -146,14 +146,22 @@ fn nitro_emit_against_callbacks_cdylib() {
         "expected HybridRustGetters.cpp at {interface_cpp}"
     );
     let cpp = std::fs::read_to_string(&interface_cpp).unwrap();
+    // The callback's `Hybrid<Name>` C++ type is namespace-qualified (every
+    // generated class lives in `margelo::nitro::<ns>`), mirroring how a plain
+    // interface arg is spelled — an absolute path resolves from any emitting
+    // file, same-namespace or cross-crate.
     assert!(
-        cpp.contains("std::shared_ptr<HybridForeignGetters>"),
-        "RustGetters methods should take shared_ptr<HybridForeignGetters>:\n{cpp}"
+        cpp.contains("std::shared_ptr<::margelo::nitro::callbacks::HybridForeignGetters>"),
+        "RustGetters methods should take a qualified shared_ptr<HybridForeignGetters>:\n{cpp}"
     );
-    // Lowering for callback args goes through CallbackHandleMap::insert.
+    // Lowering for a callback arg installs the vtable then turns the
+    // shared_ptr into the u64 handle via the class's `lower_to_handle`
+    // surface (which registers a JS impl with the CallbackHandleMap / clones
+    // a proxy handle).
     assert!(
-        cpp.contains("CallbackHandleMap<HybridForeignGetters>::instance().insert"),
-        "callback arg lowering should register with the handle map:\n{cpp}"
+        cpp.contains("::margelo::nitro::callbacks::HybridForeignGetters::ensure_vtable()")
+            && cpp.contains("->lower_to_handle("),
+        "callback arg lowering should install the vtable + lower to a handle:\n{cpp}"
     );
     // Optional / sequence lowering for the composite-typed RustGetters
     // methods. The fixture's `get_option(string? v, ...)` and

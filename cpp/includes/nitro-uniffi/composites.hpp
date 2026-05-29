@@ -55,6 +55,7 @@
 #include <NitroModules/ArrayBuffer.hpp>
 
 #include "converters.hpp"
+#include "handle.hpp"
 #include "rust_buffer.hpp"
 
 namespace ubrn::nitro {
@@ -222,6 +223,49 @@ inline std::shared_ptr<HybridT> read_interface_handle(RustBufferReader &r) {
 }
 
 // -----------------------------------------------------------------------
+// Callback interfaces inside a composite.
+//
+// A uniffi callback interface / `with_foreign` trait object also crosses
+// the C ABI as a bare `uint64_t` handle, but the two directions differ
+// from a plain interface:
+//
+//   * WRITE (us -> Rust): the value is a `std::shared_ptr<Hybrid<Name>>`
+//     that is either a JS-implemented instance (must be registered with the
+//     per-type `CallbackHandleMap` after its vtable is installed) or a
+//     Rust-backed proxy (its existing Rust handle must be cloned). Both
+//     cases — plus the per-callback vtable install, which a generic thunk
+//     can't name — are funnelled through the generated `Hybrid<Name>`
+//     class's `static ensure_vtable()` + instance `lower_to_handle(self)`
+//     surface (see `templates/callback.{hpp,cpp}`). `self` is passed as the
+//     `shared_ptr` so the handle map takes shared ownership of the JS impl.
+//
+//   * READ (Rust -> us): Rust embedded an `Arc<dyn Trait>` as a handle;
+//     wrap it in a Rust-backed proxy `Hybrid<Name>` via the `FromRustHandle`
+//     ctor (mirrors the top-level `lift_expr` callback path).
+// -----------------------------------------------------------------------
+
+template <typename HybridT, RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
+          RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
+inline void write_callback_handle(Writer<A, R> &w,
+                                  const std::shared_ptr<HybridT> &v) {
+  HybridT::ensure_vtable();
+  w.write_u64(v->lower_to_handle(v));
+}
+
+// Writer-type-generic callback-handle write thunk for the writer-templated
+// record / enum stream codecs.
+template <typename HybridT, typename W>
+inline void write_callback_handle_w(W &w, const std::shared_ptr<HybridT> &v) {
+  HybridT::ensure_vtable();
+  w.write_u64(v->lower_to_handle(v));
+}
+
+template <typename HybridT>
+inline std::shared_ptr<HybridT> read_callback_proxy(RustBufferReader &r) {
+  return std::make_shared<HybridT>(::ubrn::nitro::FromRustHandle{r.read_u64()});
+}
+
+// -----------------------------------------------------------------------
 // Fallback for any uniffi type the Nitro backend doesn't model in
 // composite-element position. `from_type` is total over uniffi's type
 // universe, so these are never instantiated in practice — but referencing
@@ -233,12 +277,6 @@ template <typename W, typename T>
 inline void unsupported_compound_inside_composite(W &, const T &) {
   throw std::runtime_error(
       "Nitro: unsupported uniffi type in composite-element position");
-}
-
-template <typename W, typename T>
-inline void unsupported_callback_inside_composite(W &, const T &) {
-  throw std::runtime_error(
-      "Nitro: callback interface in composite-element position not supported");
 }
 
 // -----------------------------------------------------------------------

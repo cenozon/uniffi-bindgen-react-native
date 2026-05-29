@@ -10,6 +10,7 @@
 //! HybridObject method, not a host-object property keyed by
 //! `ubrn_<symbol>`.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use anyhow::{anyhow, Result};
@@ -18,6 +19,45 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use uniffi_bindgen::pipeline::general;
 
 use super::HybridObjectEntry;
+
+thread_local! {
+    /// `(namespace, name)` of every foreign-implementable callback trait —
+    /// proc-macro `#[uniffi::export(with_foreign)]` traits AND UDL
+    /// `[Trait, WithForeign]` traits — across *all* namespaces in the current
+    /// generate. Built from the authoritative type *definitions* (which always
+    /// carry `imp == CallbackTrait`) so that a use-site `Type::Interface` whose
+    /// `imp` was downgraded to `Trait` by a cross-crate `typedef trait` import
+    /// is still recognized as a callback. See [`NitroType::from_type`]'s
+    /// `Type::Interface` arm.
+    ///
+    /// Empty when generation hasn't registered anything (e.g. a unit test that
+    /// builds a `NitroType` directly), which yields the plain-interface
+    /// behavior — the correct default for a non-foreign `Trait`.
+    static CALLBACK_TRAITS: RefCell<BTreeSet<(String, String)>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// Record `(namespace, name)` as a foreign-implementable callback trait for the
+/// duration of the current generate. Called once per such definition before any
+/// module is lowered (see `gen_nitro::generate_all`). Idempotent.
+pub fn register_callback_trait(namespace: &str, name: &str) {
+    CALLBACK_TRAITS.with(|set| {
+        set.borrow_mut()
+            .insert((namespace.to_string(), name.to_string()));
+    });
+}
+
+/// Drop every registered callback trait. Called at the end of a generate so a
+/// later run in the same thread starts clean.
+pub fn clear_callback_traits() {
+    CALLBACK_TRAITS.with(|set| set.borrow_mut().clear());
+}
+
+fn is_registered_callback_trait(namespace: &str, name: &str) -> bool {
+    CALLBACK_TRAITS.with(|set| {
+        set.borrow()
+            .contains(&(namespace.to_string(), name.to_string()))
+    })
+}
 
 /// What flavor of HybridObject the entry corresponds to. Currently
 /// purely informational — both kinds register under `language: c++` in
@@ -1115,9 +1155,20 @@ pub enum NitroType {
     Sequence(Box<NitroType>),
     Map(Box<NitroType>, Box<NitroType>),
     /// A foreign-implemented callback. The C++ side accepts a
-    /// `std::shared_ptr<Hybrid<Name>Spec>` and registers it with the
+    /// `std::shared_ptr<Hybrid<Name>>` and registers it with the
     /// vtable handle map before passing the handle to Rust.
-    CallbackInterface(String),
+    ///
+    /// `namespace` is the owning namespace of the callback's generated
+    /// `Hybrid<Name>` class / `ensure_<Name>_vtable_init` hook (both live in
+    /// `margelo::nitro::<namespace>`). A cross-namespace callback (a
+    /// `with_foreign` trait exported by another crate, used inside this
+    /// module) must be spelled fully-qualified; a same-namespace callback
+    /// stays unqualified. An empty `namespace` means "same namespace /
+    /// unqualified" — see [`Self::codec_ns_prefix`] / the consumers.
+    CallbackInterface {
+        namespace: String,
+        name: String,
+    },
     /// A uniffi `dictionary` / Rust struct. Crosses the FFI as a
     /// `RustBuffer`; lift/lower expressions delegate to the per-record
     /// codec emitted in `<namespace>_codecs.hpp`.
@@ -1177,9 +1228,10 @@ impl NitroType {
                 Box::new(Self::from_type(key_type)?),
                 Box::new(Self::from_type(value_type)?),
             ),
-            Type::CallbackInterface { name, .. } => {
-                Self::CallbackInterface(name.to_upper_camel_case())
-            }
+            Type::CallbackInterface { namespace, name } => Self::CallbackInterface {
+                namespace: namespace.clone(),
+                name: name.to_upper_camel_case(),
+            },
             Type::Record { namespace, name } => Self::Record {
                 namespace: namespace.clone(),
                 name: name.clone(),
@@ -1188,19 +1240,35 @@ impl NitroType {
                 namespace: namespace.clone(),
                 name: name.clone(),
             },
+            // A `with_foreign` trait — foreign-implementable, so its use site
+            // must round-trip through the callback `Hybrid<Name>` proxy, not
+            // the plain-interface handle path. uniffi reports `imp ==
+            // CallbackTrait` for a proc-macro `#[uniffi::export(with_foreign)]`
+            // trait, but a UDL `[Trait, WithForeign]` trait *imported into
+            // another crate via `typedef trait`* loses the `WithForeign` bit
+            // at the use site (`imp == Trait`). So a plain `imp == Trait` is
+            // additionally checked against the cross-namespace registry of
+            // foreign-implementable traits (populated from every namespace's
+            // *definitions*, which always carry the authoritative `imp`).
             Type::Interface {
                 namespace,
                 name,
                 imp,
-            } => match imp {
-                general::ObjectImpl::CallbackTrait => {
-                    Self::CallbackInterface(name.to_upper_camel_case())
+            } => {
+                let is_callback = matches!(imp, general::ObjectImpl::CallbackTrait)
+                    || is_registered_callback_trait(namespace, name);
+                if is_callback {
+                    Self::CallbackInterface {
+                        namespace: namespace.clone(),
+                        name: name.to_upper_camel_case(),
+                    }
+                } else {
+                    Self::Interface {
+                        namespace: namespace.clone(),
+                        name: name.clone(),
+                    }
                 }
-                _ => Self::Interface {
-                    namespace: namespace.clone(),
-                    name: name.clone(),
-                },
-            },
+            }
             // A uniffi `custom` type is a thin wrapper around a builtin
             // (e.g. `Url`/`String`, `JsonValue`/`String`) whose only role
             // on the FFI side is to inherit the builtin's wire format.
@@ -1242,7 +1310,7 @@ impl NitroType {
                     format!("Map<{}, {}>", k.ts_type(), v.ts_type())
                 }
             }
-            Self::CallbackInterface(name) => name.clone(),
+            Self::CallbackInterface { name, .. } => name.clone(),
             Self::Record { name, .. } => name.to_upper_camel_case(),
             Self::Enum { name, .. } => name.to_upper_camel_case(),
             Self::Interface { name, .. } => name.to_upper_camel_case(),
@@ -1294,8 +1362,12 @@ impl NitroType {
             Self::Optional(inner) => format!("std::optional<{}>", inner.cxx_type()),
             Self::Sequence(inner) => format!("std::vector<{}>", inner.cxx_type()),
             Self::Map(k, v) => format!("std::unordered_map<{}, {}>", k.cxx_type(), v.cxx_type()),
-            Self::CallbackInterface(name) => {
-                format!("std::shared_ptr<Hybrid{}>", name)
+            Self::CallbackInterface { namespace, name } => {
+                format!(
+                    "std::shared_ptr<{prefix}Hybrid{name}>",
+                    prefix = Self::cxx_class_ns_prefix(namespace),
+                    name = name.to_upper_camel_case(),
+                )
             }
             // Records / enums live in `margelo::nitro::<namespace>`. Always
             // fully-qualify so the spelling resolves both inside that
@@ -1342,7 +1414,7 @@ impl NitroType {
             | Self::Record { .. }
             | Self::Enum { .. }
             | Self::Stub => "RustBuffer",
-            Self::CallbackInterface(_) | Self::Interface { .. } => "uint64_t",
+            Self::CallbackInterface { .. } | Self::Interface { .. } => "uint64_t",
         }
     }
 
@@ -1368,6 +1440,22 @@ impl NitroType {
     /// qualify `Hybrid<Name>` with its owning namespace.
     fn codec_ns_prefix(type_ns: &str, current_ns: &str) -> String {
         if type_ns == current_ns {
+            String::new()
+        } else {
+            format!("::margelo::nitro::{type_ns}::")
+        }
+    }
+
+    /// Absolute `::margelo::nitro::<ns>::` qualifier for a generated C++
+    /// *class* / free function (`Hybrid<Name>`, `ensure_<Name>_vtable_init`)
+    /// living in namespace `type_ns`. Unlike [`Self::codec_ns_prefix`] this
+    /// is independent of the emitting file's namespace — an absolute path
+    /// resolves everywhere, including from inside `margelo::nitro::<type_ns>`
+    /// itself — mirroring how the `Interface` arms always fully-qualify
+    /// `Hybrid<Name>`. An empty `type_ns` (a same-namespace UDL callback for
+    /// which `from_type` saw no foreign namespace) stays unqualified.
+    fn cxx_class_ns_prefix(type_ns: &str) -> String {
+        if type_ns.is_empty() {
             String::new()
         } else {
             format!("::margelo::nitro::{type_ns}::")
@@ -1439,14 +1527,20 @@ impl NitroType {
                     vw = v_writer,
                 )
             }
-            Self::CallbackInterface(cb_name) => {
+            Self::CallbackInterface { namespace, name: cb_name } => {
                 // Install the vtable (idempotent) before the first hand-off,
-                // then register the JS-side instance with the handle map and
-                // pass the resulting u64 handle to Rust. The comma operator
-                // keeps this a single expression usable in `auto x = …;`.
+                // then turn the `shared_ptr<Hybrid<Name>>` into the u64 handle
+                // Rust names it by: a JS-implemented instance is registered
+                // with the handle map; a Rust-backed proxy (e.g. handed back
+                // to Rust) clones its existing handle. Both paths live in
+                // `Hybrid<Name>::lower_to_handle`. The comma operator keeps
+                // this a single expression usable in `auto x = …;`. The class +
+                // vtable hook live in the callback's owning namespace, so
+                // qualify when it's foreign.
                 format!(
-                    "(ensure_{cb}_vtable_init(), ubrn::nitro::CallbackHandleMap<Hybrid{cb}>::instance().insert({name}))",
-                    cb = cb_name,
+                    "({prefix}Hybrid{cb}::ensure_vtable(), {name}->lower_to_handle({name}))",
+                    prefix = Self::cxx_class_ns_prefix(namespace),
+                    cb = cb_name.to_upper_camel_case(),
                 )
             }
             // Records + enums delegate to the free functions in their owning
@@ -1520,7 +1614,7 @@ impl NitroType {
                     vr = v_reader,
                 )
             }
-            Self::CallbackInterface(cb_name) => {
+            Self::CallbackInterface { namespace, name: cb_name } => {
                 // Rust handed back an `Arc<dyn Trait>` as a u64 handle. Wrap
                 // it in a Rust-backed PROXY: a handle-bearing `Hybrid<Name>`
                 // whose (non-overridden) methods dispatch into Rust via the
@@ -1528,10 +1622,13 @@ impl NitroType {
                 // of `callback.{hpp,cpp}`). This only arises for `with_foreign`
                 // traits — a foreign-only UDL callback interface has no Rust
                 // impl that could be returned. The proxy ctor takes ownership
-                // of the handle (uniffi already gave us our own reference).
+                // of the handle (uniffi already gave us our own reference). The
+                // class lives in the callback's owning namespace, so qualify
+                // when it's foreign.
                 format!(
-                    "std::make_shared<Hybrid{cb}>(::ubrn::nitro::FromRustHandle{{{name}}})",
-                    cb = cb_name
+                    "std::make_shared<{prefix}Hybrid{cb}>(::ubrn::nitro::FromRustHandle{{{name}}})",
+                    prefix = Self::cxx_class_ns_prefix(namespace),
+                    cb = cb_name.to_upper_camel_case(),
                 )
             }
             // Records + enums delegate to the free functions in their owning
@@ -1649,12 +1746,17 @@ impl NitroType {
             Self::Duration => {
                 format!("&ubrn::nitro::write_duration<&{alloc_symbol}, &{reserve_symbol}>")
             }
-            Self::CallbackInterface(_) => {
-                // Composites containing callback interfaces aren't a
-                // uniffi shape that appears in practice — surface as
-                // unimplemented if it ever does.
-                "&ubrn::nitro::unsupported_callback_inside_composite".into()
-            }
+            // A callback interface inside a composite crosses as its u64
+            // handle. `write_callback_handle` installs the vtable + turns the
+            // `shared_ptr<Hybrid<Name>>` into the handle (register JS impl /
+            // clone proxy) via the class's `ensure_vtable` / `lower_to_handle`
+            // surface. The class lives in the callback's owning namespace, so
+            // qualify when it's foreign.
+            Self::CallbackInterface { namespace, name } => format!(
+                "&ubrn::nitro::write_callback_handle<{prefix}Hybrid{name}, &{alloc_symbol}, &{reserve_symbol}>",
+                prefix = Self::cxx_class_ns_prefix(namespace),
+                name = name.to_upper_camel_case(),
+            ),
             // Nested record / enum inside a composite delegate to the
             // per-type `write_<Name>` stream thunk emitted in
             // `<namespace>_codecs.hpp`. Those are *templated on the writer
@@ -1744,9 +1846,14 @@ impl NitroType {
                     vw = v_writer,
                 )
             }
-            Self::CallbackInterface(_) => {
-                "&ubrn::nitro::unsupported_callback_inside_composite".into()
-            }
+            // Writer-type-generic callback-handle write thunk for the
+            // writer-templated record / enum stream codecs (see
+            // `write_fn_template_arg`'s `CallbackInterface` arm).
+            Self::CallbackInterface { namespace, name } => format!(
+                "&ubrn::nitro::write_callback_handle_w<{prefix}Hybrid{name}>",
+                prefix = Self::cxx_class_ns_prefix(namespace),
+                name = name.to_upper_camel_case(),
+            ),
             Self::Record {
                 namespace,
                 name: type_name,
@@ -1807,9 +1914,16 @@ impl NitroType {
                     vr = v_reader,
                 )
             }
-            Self::CallbackInterface(_) => {
-                "&ubrn::nitro::unsupported_callback_inside_composite".into()
-            }
+            // A callback interface decoded out of a composite is an
+            // `Arc<dyn Trait>` Rust embedded — wrap its u64 handle in a
+            // Rust-backed proxy `Hybrid<Name>` (see `lift_expr`). The class
+            // lives in the callback's owning namespace, so qualify when it's
+            // foreign.
+            Self::CallbackInterface { namespace, name } => format!(
+                "&ubrn::nitro::read_callback_proxy<{prefix}Hybrid{name}>",
+                prefix = Self::cxx_class_ns_prefix(namespace),
+                name = name.to_upper_camel_case(),
+            ),
             // The read stream codec signature (`<Name>(RustBufferReader&)`)
             // is namespace-independent, so a foreign type's `read_<Name>`
             // nests just by fully qualifying the symbol — no writer pinning
@@ -1869,7 +1983,7 @@ impl NitroType {
             Self::Record { name, .. } | Self::Enum { name, .. } => {
                 vec![format!("{}.hpp", name.to_upper_camel_case())]
             }
-            Self::Interface { name, .. } | Self::CallbackInterface(name) => {
+            Self::Interface { name, .. } | Self::CallbackInterface { name, .. } => {
                 vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
             }
             _ => Vec::new(),
@@ -1896,7 +2010,7 @@ impl NitroType {
             // use site (the lowering calls `ensure_<Name>_vtable_init()` +
             // `CallbackHandleMap<Hybrid<Name>>`), so include the full header
             // rather than forward-declaring.
-            Self::CallbackInterface(name) => {
+            Self::CallbackInterface { name, .. } => {
                 vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
             }
             _ => Vec::new(),
@@ -2014,7 +2128,7 @@ impl NitroType {
             Self::Record { .. }
             | Self::Enum { .. }
             | Self::Interface { .. }
-            | Self::CallbackInterface(_)
+            | Self::CallbackInterface { .. }
             | Self::Stub => false,
         }
     }

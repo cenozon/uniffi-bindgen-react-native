@@ -106,10 +106,11 @@ fn nitro_emit_against_futures_cdylib() {
     assert!(api_cpp_path.exists(), "C++ impl at {api_cpp_path}");
     let api_cpp = std::fs::read_to_string(&api_cpp_path).unwrap();
 
-    // Async methods must go through Promise::async.
+    // Async methods return a `Promise<bool>` driven by the event-driven
+    // rust_future poll loop (`drive_rust_future_async`, asserted below).
     assert!(
-        api_cpp.contains("Promise<bool>::async"),
-        "async fn always_ready should return Promise<bool> via Promise::async, got:\n{api_cpp}"
+        api_cpp.contains("Promise<bool>>"),
+        "async fn always_ready should return Promise<bool>, got:\n{api_cpp}"
     );
     // The rust_future poll loop helper must be invoked.
     assert!(

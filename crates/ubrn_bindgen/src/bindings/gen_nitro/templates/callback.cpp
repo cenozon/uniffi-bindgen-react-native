@@ -139,6 +139,22 @@ void {{ cb.cxx_class }}::loadHybridMethods() {
 }
 {% endfor %}
 
+uint64_t {{ cb.cxx_class }}::lower_to_handle(const std::shared_ptr<{{ cb.cxx_class }}>& self) {
+{%- if let Some(proxy) = cb.proxy %}
+  // Rust-backed proxy: re-vend a freshly cloned Rust handle (uniffi consumes
+  // one reference for every hand-off; our own `proxy_handle_` stays valid).
+  if (proxy_handle_.raw() != 0) {
+    auto __status = ubrn::nitro::make_status();
+    uint64_t __cloned = {{ proxy.clone_symbol }}(proxy_handle_.raw(), &__status);
+    ubrn::nitro::check_status(__status, free_status_buffer);
+    return __cloned;
+  }
+{%- endif %}
+  // JS-implemented instance: register it (the map co-owns `self` until Rust
+  // calls the `free` trampoline).
+  return ubrn::nitro::CallbackHandleMap<{{ cb.cxx_class }}>::instance().insert(self);
+}
+
 namespace {
 
 using HandleMap = ubrn::nitro::CallbackHandleMap<{{ cb.cxx_class }}>;

@@ -46,6 +46,10 @@ void {{ proxy.free_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
 
 namespace margelo::nitro::{{ module.namespace }} {
 
+// Forward declaration so the class's inline `ensure_vtable()` can name the
+// per-callback init hook (defined out-of-line, after the class).
+void ensure_{{ cb.ts_name }}_vtable_init();
+
 /// Trampoline HybridObject for `{{ cb.ts_name }}`. The methods are
 /// virtual so a JS-implementing HybridObject subclass can override them;
 /// the default impls throw if the JS side hasn't supplied an override.
@@ -72,6 +76,20 @@ public:
 {%- endfor -%}
   );
 {%- endfor %}
+
+  // Install this callback's vtable with Rust (idempotent). Generic handle
+  // codecs (`ubrn::nitro::write_callback_handle{,_w}`) call this before the
+  // first hand-off without needing to name the per-type free hook.
+  static void ensure_vtable() { ensure_{{ cb.ts_name }}_vtable_init(); }
+
+  // Turn this instance into the `uint64_t` handle Rust names it by. A
+  // JS-implemented instance is registered with the per-type
+  // `CallbackHandleMap` (which takes shared ownership via `self`, so the
+  // instance stays alive while Rust holds the handle); a Rust-backed proxy
+  // clones its existing Rust handle (uniffi consumes one reference per
+  // hand-off). `self` is this same instance as a `shared_ptr` (the codecs
+  // hold one already), passed so the map can co-own it.
+  uint64_t lower_to_handle(const std::shared_ptr<{{ cb.cxx_class }}>& self);
 
 protected:
   void loadHybridMethods() override;
