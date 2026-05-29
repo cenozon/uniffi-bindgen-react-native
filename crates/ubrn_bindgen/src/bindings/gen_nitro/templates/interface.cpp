@@ -10,6 +10,9 @@ extern "C" {
 RustBuffer {{ module.rustbuffer_alloc }}(uint64_t size, UniffiRustCallStatus* status);
 void {{ module.rustbuffer_free }}(RustBuffer buf, UniffiRustCallStatus* status);
 RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiRustCallStatus* status);
+{%- if let Some(ctor) = iface.primary_constructor() %}
+uint64_t {{ ctor.uniffi_symbol }}(UniffiRustCallStatus* status);
+{%- endif %}
 
 {%- for method in iface.methods %}
 {%- if method.is_async %}
@@ -44,6 +47,15 @@ inline void free_status_buffer(RustBuffer buf) noexcept {
   {{ module.rustbuffer_free }}(buf, &s);
 }
 } // namespace
+
+{%- if let Some(ctor) = iface.primary_constructor() %}
+uint64_t {{ iface.cxx_class }}::make_handle() {
+  auto __status = ubrn::nitro::make_status();
+  uint64_t __raw = {{ ctor.uniffi_symbol }}(&__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  return __raw;
+}
+{%- endif %}
 
 void {{ iface.cxx_class }}::loadHybridMethods() {
   HybridObject::loadHybridMethods();
@@ -108,7 +120,13 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
+{%- if method.return_kind.returns_owned_rustbuffer() %}
+        auto __lifted = {{ ret_ty.lift_expr("__raw") }};
+        free_status_buffer(__raw);
+        return __lifted;
+{%- else %}
         return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- endmatch %}
       });
 {%- endif %}
@@ -154,7 +172,13 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- else %}
   ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
+{%- if method.return_kind.returns_owned_rustbuffer() %}
+  auto __lifted = {{ ret_ty.lift_expr("__raw") }};
+  free_status_buffer(__raw);
+  return __lifted;
+{%- else %}
   return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- endmatch %}
 {%- endif %}
 }

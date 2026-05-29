@@ -3,9 +3,21 @@
 #pragma once
 
 #include <NitroModules/HybridObject.hpp>
+#include <NitroModules/Promise.hpp>
 #include <NitroUniffi.hpp>
+#include <nitro-uniffi/jsi_converter_ints.hpp>
 
+#include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+// Per-type headers for every record / enum / interface this API's methods
+// take or return — ubrn emits these directly (no Nitrogen).
+{%- for header in module.api_dependency_headers() %}
+#include "{{ header }}"
+{%- endfor %}
 
 namespace margelo::nitro::{{ module.namespace }} {
 

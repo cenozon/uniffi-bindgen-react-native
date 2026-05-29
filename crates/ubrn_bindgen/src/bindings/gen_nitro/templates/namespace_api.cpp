@@ -119,7 +119,13 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
+{%- if func.return_kind.returns_owned_rustbuffer() %}
+        auto __lifted = {{ ret_ty.lift_expr("__raw") }};
+        free_status_buffer(__raw);
+        return __lifted;
+{%- else %}
         return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- endmatch %}
       });
 {%- endif %}
@@ -165,7 +171,16 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- else %}
   ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
+{%- if func.return_kind.returns_owned_rustbuffer() %}
+  // Lift copies the payload out of the Rust-owned buffer; free it before
+  // returning so the buffer doesn't leak (and Rust's allocator stays
+  // consistent — the buffer was uniquely handed to us).
+  auto __lifted = {{ ret_ty.lift_expr("__raw") }};
+  free_status_buffer(__raw);
+  return __lifted;
+{%- else %}
   return {{ ret_ty.lift_expr("__raw") }};
+{%- endif %}
 {%- endmatch %}
 {%- endif %}
 }

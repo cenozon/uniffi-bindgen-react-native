@@ -171,6 +171,15 @@ impl NitroModule {
         format!("{}_codecs.hpp", self.namespace)
     }
 
+    /// Per-type headers the namespace API's method declarations reference.
+    /// Deduped + sorted so the emitted `#include` block is stable.
+    pub fn api_dependency_headers(&self) -> Vec<String> {
+        dedup_headers(
+            self.functions.iter().flat_map(|f| f.referenced_headers()),
+            "",
+        )
+    }
+
     pub fn autolinking_entries(&self) -> Vec<HybridObjectEntry> {
         let mut entries = Vec::new();
         entries.push(HybridObjectEntry {
@@ -391,6 +400,21 @@ impl NitroFunction {
             inner
         }
     }
+
+    /// Per-type C++ headers (`<Record>.hpp` / `<Enum>.hpp` /
+    /// `Hybrid<Interface>.hpp`) this function's signature references,
+    /// across all args + the return type. Used by the `.hpp` emitters so
+    /// the method declarations see the complete struct/enum types.
+    fn referenced_headers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for arg in &self.args {
+            out.extend(arg.ty.referenced_headers());
+        }
+        if let ReturnKind::Value(t) = &self.return_kind {
+            out.extend(t.referenced_headers());
+        }
+        out
+    }
 }
 
 pub struct NitroInterface {
@@ -402,9 +426,10 @@ pub struct NitroInterface {
     /// when methods take other interface references as args.
     #[allow(dead_code)]
     pub clone_symbol: String,
-    /// Parsed from uniffi metadata; not yet emitted (HybridObjects are
-    /// vended via the namespace API, so constructors aren't surfaced yet).
-    #[allow(dead_code)]
+    /// Parsed from uniffi metadata. The argless primary constructor (if
+    /// any) is wired into the C++ default constructor so
+    /// `NitroModules.createHybridObject('<Name>')` yields a live Rust
+    /// object; see [`Self::primary_constructor`].
     pub constructors: Vec<NitroFunction>,
     pub methods: Vec<NitroFunction>,
 }
@@ -443,6 +468,31 @@ impl NitroInterface {
             constructors,
             methods,
         })
+    }
+
+    /// The interface's primary (argless, sync, infallible) constructor,
+    /// if any. Nitro vends HybridObjects through
+    /// `NitroModules.createHybridObject('<Name>')`, which runs the C++
+    /// default constructor with no arguments — so we can only wire a
+    /// uniffi constructor into that path when it takes no args. The
+    /// common `#[uniffi::constructor] fn new() -> Arc<Self>` shape fits.
+    /// Interfaces whose construction needs arguments stay default-handle
+    /// (the namespace API can still hand them back from method returns).
+    pub fn primary_constructor(&self) -> Option<&NitroFunction> {
+        self.constructors
+            .iter()
+            .find(|c| c.args.is_empty() && !c.is_async && c.throws.is_none())
+    }
+
+    /// Per-type headers this interface's method declarations reference,
+    /// excluding its own (an interface method that returns / takes the
+    /// same interface resolves via this class's own declaration).
+    pub fn dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.cxx_class);
+        dedup_headers(
+            self.methods.iter().flat_map(|m| m.referenced_headers()),
+            &own,
+        )
     }
 }
 
@@ -595,12 +645,12 @@ pub enum NitroType {
         namespace: String,
         name: String,
     },
-    /// A placeholder for any uniffi type the Nitro backend doesn't yet
-    /// understand in *record / enum field* position (e.g. an Interface
-    /// reference in a SimpleDict field). Surfaces as `unknown` in TS and
-    /// is gated by [`NitroType::has_rb_suffix`] in codec emission, which
-    /// flips the record's `codec_ready` flag to false and produces a
-    /// runtime-throwing codec body.
+    /// A placeholder for any uniffi type the Nitro backend can't model.
+    /// `from_type` is total over uniffi's type universe today, so this is
+    /// unreachable in practice; it remains as a defensive surface
+    /// (`unknown` in TS, runtime-throwing codec thunks) so a future
+    /// uniffi type addition degrades loudly rather than failing the whole
+    /// module emission.
     Stub,
 }
 
@@ -683,7 +733,7 @@ impl NitroType {
             Self::F32 | Self::F64 => "number".into(),
             Self::U64 | Self::I64 => "bigint".into(),
             Self::String => "string".into(),
-            Self::Bytes => "Uint8Array".into(),
+            Self::Bytes => "ArrayBuffer".into(),
             Self::Timestamp => "Date".into(),
             Self::Duration => "number".into(),
             Self::Optional(inner) => format!("({}) | null", inner.ts_type()),
@@ -735,7 +785,10 @@ impl NitroType {
             Self::F32 => "float".into(),
             Self::F64 => "double".into(),
             Self::String => "std::string".into(),
-            Self::Bytes => "std::vector<uint8_t>".into(),
+            // `Vec<u8>` ⇄ Nitro `ArrayBuffer` (JS `ArrayBuffer`): one copy
+            // per direction instead of two, and zero-copy on the JS read
+            // side. See `nitro-uniffi/composites.hpp` bytes section.
+            Self::Bytes => "std::shared_ptr<::margelo::nitro::ArrayBuffer>".into(),
             Self::Timestamp => "std::chrono::system_clock::time_point".into(),
             // uniffi-rs Durations are non-negative; the TS/JSI backend
             // exposes them as a JS `number` (milliseconds). Nitrogen
@@ -749,11 +802,16 @@ impl NitroType {
             Self::CallbackInterface(name) => {
                 format!("std::shared_ptr<Hybrid{}>", name)
             }
-            // Nitrogen emits the C++ struct/enum into the same
-            // `margelo::nitro::<namespace>` namespace we're already inside,
-            // so the unqualified name resolves.
-            Self::Record { name, .. } => name.to_upper_camel_case(),
-            Self::Enum { name, .. } => name.to_upper_camel_case(),
+            // Records / enums live in `margelo::nitro::<namespace>`. Always
+            // fully-qualify so the spelling resolves both inside that
+            // namespace (method signatures, codecs) and inside the bare
+            // `margelo::nitro` (where the `JSIConverter` specializations and
+            // composite element types — `std::vector<Tree>` — are named).
+            Self::Record { namespace, name } | Self::Enum { namespace, name } => format!(
+                "::margelo::nitro::{}::{}",
+                namespace,
+                name.to_upper_camel_case()
+            ),
             Self::Interface { namespace, name } => format!(
                 "std::shared_ptr<::margelo::nitro::{}::Hybrid{}>",
                 namespace,
@@ -945,38 +1003,6 @@ impl NitroType {
         }
     }
 
-    /// The `RustBufferReader::read_*` / `RustBufferWriter::write_*` suffix
-    /// for serializing this type field-by-field inside a record codec.
-    /// Returns an empty string for types whose codec is per-instance
-    /// (records, enums) or unsupported (Stub) — those need a separate
-    /// dispatch path and are gated by [`NitroType::has_rb_suffix`] from
-    /// the template side.
-    pub fn rb_suffix(&self) -> &'static str {
-        match self {
-            Self::Bool => "bool",
-            Self::U8 => "u8",
-            Self::U16 => "u16",
-            Self::U32 => "u32",
-            Self::U64 => "u64",
-            Self::I8 => "i8",
-            Self::I16 => "i16",
-            Self::I32 => "i32",
-            Self::I64 => "i64",
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-            Self::String => "string",
-            Self::Timestamp => "timestamp",
-            Self::Duration => "duration",
-            _ => "",
-        }
-    }
-
-    /// True iff [`NitroType::rb_suffix`] is a valid `RustBufferReader`
-    /// method name — used in templates to gate per-field codec emission.
-    pub fn has_rb_suffix(&self) -> bool {
-        !self.rb_suffix().is_empty()
-    }
-
     /// Template argument used as the per-element `write_` thunk when
     /// this type appears inside a composite. Composites nest via
     /// function pointers, so the inner write/read are spelled as
@@ -1039,12 +1065,29 @@ impl NitroType {
                 // unimplemented if it ever does.
                 "&ubrn::nitro::unsupported_callback_inside_composite".into()
             }
-            // Nested record / enum inside a composite isn't yet wired —
-            // would need a thunk that takes a `RustBufferWriter&` and
-            // calls `lower_<Name>` inline. Track as future work.
-            Self::Record { .. } | Self::Enum { .. } | Self::Interface { .. } | Self::Stub => {
-                "&ubrn::nitro::unsupported_compound_inside_composite".into()
+            // Nested record / enum inside a composite delegate to the
+            // per-type `write_<Name>` stream thunk emitted in
+            // `<namespace>_codecs.hpp`. Those have the exact
+            // `(RustBufferWriter<Alloc, Reserve>&, const T&)` signature the
+            // composite thunks expect, so they nest as function-pointer
+            // template args without any wrapper.
+            Self::Record {
+                name: type_name, ..
             }
+            | Self::Enum {
+                name: type_name, ..
+            } => format!("&write_{}", type_name.to_upper_camel_case()),
+            // An interface inside a composite crosses as its u64 handle.
+            // `write_interface_handle` reads `raw_handle()` off the
+            // shared_ptr and writes the bare u64; lowering ownership stays
+            // with the C++ side (uniffi clones on its end when it consumes
+            // a handle-by-value out of a buffer).
+            Self::Interface { namespace, name } => format!(
+                "&ubrn::nitro::write_interface_handle<::margelo::nitro::{}::Hybrid{}>",
+                namespace,
+                name.to_upper_camel_case()
+            ),
+            Self::Stub => "&ubrn::nitro::unsupported_compound_inside_composite".into(),
             _ => format!(
                 "&ubrn::nitro::write_{}<&{alloc_symbol}, &{reserve_symbol}>",
                 self.lower_suffix()
@@ -1093,9 +1136,18 @@ impl NitroType {
             Self::CallbackInterface(_) => {
                 "&ubrn::nitro::unsupported_callback_inside_composite".into()
             }
-            Self::Record { .. } | Self::Enum { .. } | Self::Interface { .. } | Self::Stub => {
-                "&ubrn::nitro::unsupported_compound_inside_composite".into()
+            Self::Record {
+                name: type_name, ..
             }
+            | Self::Enum {
+                name: type_name, ..
+            } => format!("&read_{}", type_name.to_upper_camel_case()),
+            Self::Interface { namespace, name } => format!(
+                "&ubrn::nitro::read_interface_handle<::margelo::nitro::{}::Hybrid{}>",
+                namespace,
+                name.to_upper_camel_case()
+            ),
+            Self::Stub => "&ubrn::nitro::unsupported_compound_inside_composite".into(),
             _ => format!("&ubrn::nitro::read_{}", self.lower_suffix()),
         }
     }
@@ -1114,6 +1166,57 @@ impl NitroType {
             Self::F64 => "f64",
             _ => "",
         }
+    }
+
+    /// Header file basenames this type pulls in transitively for its C++
+    /// struct definition + `JSIConverter`. Records / enums live in
+    /// `<Name>.hpp`; interfaces in `Hybrid<Name>.hpp`. Composites recurse
+    /// into their element types. Primitives / string / bytes / date /
+    /// duration need no extra header (they're covered by Nitro core +
+    /// `<NitroUniffi.hpp>`).
+    pub fn referenced_headers(&self) -> Vec<String> {
+        match self {
+            Self::Optional(inner) | Self::Sequence(inner) => inner.referenced_headers(),
+            Self::Map(k, v) => {
+                let mut out = k.referenced_headers();
+                out.extend(v.referenced_headers());
+                out
+            }
+            Self::Record { name, .. } | Self::Enum { name, .. } => {
+                vec![format!("{}.hpp", name.to_upper_camel_case())]
+            }
+            Self::Interface { name, .. } => {
+                vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Statement that serializes `<base>.<field>` into the open
+    /// `RustBufferWriter` named `w`, field-by-field, inside a record /
+    /// enum stream codec. Every type — primitive, composite, nested
+    /// record/enum, interface — funnels through the same `(writer, value)`
+    /// thunk shape, so the record codec body is a uniform field walk.
+    pub fn stream_write_stmt(
+        &self,
+        base: &str,
+        field: &str,
+        alloc_symbol: &str,
+        reserve_symbol: &str,
+    ) -> String {
+        // The composite / nested thunks are spelled as function-pointer
+        // template args (`&fn<...>`); strip the leading `&` to call them.
+        let thunk = self.write_fn_template_arg(alloc_symbol, reserve_symbol);
+        let callee = thunk.strip_prefix('&').unwrap_or(&thunk);
+        format!("{callee}(w, {base}.{field});")
+    }
+
+    /// Expression that deserializes one field of this type from the open
+    /// `RustBufferReader` named `r`. Mirror of [`Self::stream_write_stmt`].
+    pub fn stream_read_expr(&self) -> String {
+        let thunk = self.read_fn_template_arg();
+        let callee = thunk.strip_prefix('&').unwrap_or(&thunk);
+        format!("{callee}(r)")
     }
 }
 
@@ -1151,40 +1254,42 @@ impl ReturnKind {
             Self::Value(t) => t.c_type(),
         }
     }
+
+    /// True when the FFI return value is a `RustBuffer` the C++ side owns
+    /// and must free after lifting (strings, bytes, records, enums,
+    /// optionals, sequences, maps, date/duration). Primitives, handles
+    /// and `void` are not buffer-backed. The generated method body frees
+    /// the buffer via the namespace `rustbuffer_free` once the lifted
+    /// value has been copied out.
+    pub fn returns_owned_rustbuffer(&self) -> bool {
+        matches!(self, Self::Value(t) if t.c_type() == "RustBuffer")
+    }
 }
 
-/// A uniffi record (UDL `dictionary` / Rust struct). Nitrogen emits the
-/// C++ struct + JSI converter from the `.nitro.ts` interface; ubrn
-/// emits the RustBuffer codec in `<namespace>_codecs.hpp`.
+/// A uniffi record (UDL `dictionary` / Rust struct). ubrn emits the C++
+/// struct + `JSIConverter` (`<Name>.hpp`) and the RustBuffer codec in
+/// `<namespace>_codecs.hpp`.
 pub struct NitroRecord {
     pub ts_name: String,
     pub fields: Vec<NitroRecordField>,
-    /// True iff every field has a primitive wire format
-    /// (`NitroType::has_rb_suffix() == true`). If any field is a nested
-    /// record / enum / composite / Stub we skip emitting the codec body
-    /// and the generated `lift_X` / `lower_X` functions throw at
-    /// runtime. The signatures themselves are still emitted so call
-    /// sites compile against any record's `.cxx_type()`.
-    pub codec_ready: bool,
 }
 
 impl NitroRecord {
     fn from_general(record: &general::Record) -> Result<Self> {
         let ts_name = record.name.to_upper_camel_case();
-        let mut fields = Vec::with_capacity(record.fields.len());
-        let mut codec_ready = true;
-        for field in &record.fields {
-            let f = NitroRecordField::from_general(field);
-            if !f.ty.has_rb_suffix() {
-                codec_ready = false;
-            }
-            fields.push(f);
-        }
-        Ok(Self {
-            ts_name,
-            fields,
-            codec_ready,
-        })
+        let fields = record
+            .fields
+            .iter()
+            .map(NitroRecordField::from_general)
+            .collect();
+        Ok(Self { ts_name, fields })
+    }
+
+    /// Headers this record's struct definition depends on (nested
+    /// records / enums / interfaces), deduped and excluding its own.
+    pub fn dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.ts_name);
+        dedup_headers(self.fields.iter().flat_map(|f| f.ty.referenced_headers()), &own)
     }
 }
 
@@ -1232,20 +1337,55 @@ impl NitroEnum {
             flat: en.is_flat,
         })
     }
+
+    /// Headers this enum's payload structs depend on, deduped and
+    /// excluding its own (a recursive enum references itself, which is
+    /// handled by in-file forward declaration, not an include).
+    pub fn dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.ts_name);
+        dedup_headers(
+            self.variants
+                .iter()
+                .flat_map(|v| v.fields.iter())
+                .flat_map(|f| f.ty.referenced_headers()),
+            &own,
+        )
+    }
+}
+
+/// Dedup + sort a header-name iterator, dropping `own` (a type never
+/// includes its own header — recursion is handled by forward declaration).
+fn dedup_headers(headers: impl Iterator<Item = String>, own: &str) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = headers.collect();
+    set.remove(own);
+    set.into_iter().collect()
 }
 
 pub struct NitroEnumVariant {
     /// UpperCamelCase variant name as it appears in the TS union literal.
     pub ts_name: String,
-    /// Associated-data fields, if any. Empty for flat enums.
-    #[allow(dead_code)]
+    /// lowerCamelCase discriminant tag string used on the JS side
+    /// (`{ type: '<tag>' }`). Distinct from `ts_name` so the union member
+    /// reads naturally in TS while the C++ enum member stays UpperCamel.
+    pub tag: String,
+    /// Associated-data fields, if any. Empty for unit variants.
     pub fields: Vec<NitroRecordField>,
+}
+
+impl NitroEnumVariant {
+    /// Per-variant C++ payload struct name, e.g. `Tree_Node`. One struct
+    /// per variant holds that variant's fields; the enum itself is a
+    /// `std::variant` over these. Unit variants get an empty struct.
+    pub fn cxx_struct_name(&self, enum_name: &str) -> String {
+        format!("{}_{}", enum_name.to_upper_camel_case(), self.ts_name)
+    }
 }
 
 impl NitroEnumVariant {
     fn from_general(variant: &general::Variant) -> Self {
         Self {
             ts_name: variant.name.to_upper_camel_case(),
+            tag: variant.name.to_lower_camel_case(),
             fields: variant
                 .fields
                 .iter()

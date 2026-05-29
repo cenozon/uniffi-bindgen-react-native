@@ -4,14 +4,29 @@
 // Records and enums cross the uniffi C ABI as a `RustBuffer`. The
 // field-by-field wire format is big-endian (see uniffi-rs's
 // `lower_into_buffer`); the `RustBufferReader` / `RustBufferWriter`
-// helpers in `<NitroUniffi.hpp>` handle each primitive.
+// helpers in `<NitroUniffi.hpp>` handle each primitive, and the composite
+// thunks in `nitro-uniffi/composites.hpp` handle Option / Vec / Map /
+// Bytes / interface-handle field types — recursively.
 //
-// Nitrogen auto-emits the C++ struct for every record interface in
-// `{{ module.namespace_camel }}.nitro.ts` and the discriminated union
-// for every flat enum, so this header just needs to declare the
-// `lift_<Name>` / `lower_<Name>` free functions. The generated
-// `Hybrid<Namespace>Api.cpp` includes this header to get the lift/lower
-// expressions used in each method body's argument lowering.
+// ubrn emits the C++ struct (records) / `std::variant` representation
+// (tagged enums) / `enum class` (flat enums) plus their `JSIConverter`
+// specializations into the per-type `<Name>.hpp` headers included below.
+// This file then layers the RustBuffer codec on top:
+//
+//   * `write_<Name>(RustBufferWriter&, const <Name>&)` /
+//     `read_<Name>(RustBufferReader&) -> <Name>` — the *stream* codec.
+//     These have the uniform `(writer, value)` / `(reader) -> value`
+//     signature the composite thunks expect, so a record / enum nests
+//     inside any Option / Vec / Map (and recursively into itself) just by
+//     handing `&write_<Name>` / `&read_<Name>` as the per-element thunk.
+//
+//   * `lower_<Name>(const <Name>&) -> RustBuffer` /
+//     `lift_<Name>(RustBuffer) -> <Name>` — thin top-level wrappers that
+//     own the `RustBuffer` lifecycle for the FFI boundary; both delegate
+//     to the stream codec.
+//
+// Forward declarations of every stream codec are emitted first so mutually
+// recursive types (`Tree { Node { children: Vec<Tree> } }`) resolve.
 #pragma once
 
 #include <NitroUniffi.hpp>
@@ -30,76 +45,131 @@ RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiR
 
 namespace margelo::nitro::{{ module.namespace }} {
 
+// Namespace-local writer type: every codec in this file allocates through
+// this namespace's `rustbuffer_alloc` / `rustbuffer_reserve` symbols, so a
+// single alias keeps the stream-codec signatures terse and makes the
+// `&write_<Name>` function pointers concrete (matching the composite
+// thunks' `void (*)(Writer&, const T&)` parameter type exactly).
+using Writer =
+    ::ubrn::nitro::RustBufferWriter<&{{ module.rustbuffer_alloc }}, &{{ module.rustbuffer_reserve }}>;
+using ::ubrn::nitro::RustBufferReader;
+
+// ---- Forward declarations (mutual recursion) ----
+{%- for record in module.records %}
+inline void write_{{ record.ts_name }}(Writer& w, const {{ record.ts_name }}& value);
+inline {{ record.ts_name }} read_{{ record.ts_name }}(RustBufferReader& r);
+{%- endfor %}
+{%- for en in module.enums %}
+inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value);
+inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r);
+{%- endfor %}
+
 {%- for record in module.records %}
 
 // ---- Record `{{ record.ts_name }}` ----
-inline {{ record.ts_name }} lift_{{ record.ts_name }}(RustBuffer buf) {
-{%- if record.codec_ready %}
-  ::ubrn::nitro::RustBufferReader __reader(buf);
+inline void write_{{ record.ts_name }}(Writer& w, const {{ record.ts_name }}& value) {
+{%- for field in record.fields %}
+  {{ field.ty.stream_write_stmt("value", field.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
+{%- endfor %}
+  (void)w;
+  (void)value;
+}
+
+inline {{ record.ts_name }} read_{{ record.ts_name }}(RustBufferReader& r) {
   {{ record.ts_name }} __out{};
 {%- for field in record.fields %}
-  __out.{{ field.ts_name }} = __reader.read_{{ field.ty.rb_suffix() }}();
+  __out.{{ field.ts_name }} = {{ field.ty.stream_read_expr() }};
 {%- endfor %}
+  (void)r;
   return __out;
-{%- else %}
-  // Codec generation skipped — at least one field of `{{ record.ts_name }}`
-  // uses a uniffi type the Nitro backend doesn't yet model (Optional /
-  // Sequence / Map / Interface / Bytes). Calling this lifter at runtime
-  // is a programming error.
-  (void)buf;
-  throw std::runtime_error("lift_{{ record.ts_name }}: codec not yet emitted");
-{%- endif %}
 }
 
 inline RustBuffer lower_{{ record.ts_name }}(const {{ record.ts_name }}& value) {
-{%- if record.codec_ready %}
-  ::ubrn::nitro::RustBufferWriter<&{{ module.rustbuffer_alloc }}, &{{ module.rustbuffer_reserve }}> __writer;
-{%- for field in record.fields %}
-  __writer.write_{{ field.ty.rb_suffix() }}(value.{{ field.ts_name }});
-{%- endfor %}
-  return __writer.finish();
-{%- else %}
-  (void)value;
-  throw std::runtime_error("lower_{{ record.ts_name }}: codec not yet emitted");
-{%- endif %}
+  Writer w;
+  write_{{ record.ts_name }}(w, value);
+  return w.finish();
+}
+
+inline {{ record.ts_name }} lift_{{ record.ts_name }}(RustBuffer buf) {
+  RustBufferReader r{buf};
+  return read_{{ record.ts_name }}(r);
 }
 {%- endfor %}
 
 {%- for en in module.enums %}
 
 // ---- Enum `{{ en.ts_name }}` ----
-inline {{ en.ts_name }} lift_{{ en.ts_name }}(RustBuffer buf) {
 {%- if en.flat %}
-  ::ubrn::nitro::RustBufferReader __reader(buf);
-  int32_t __ordinal = __reader.read_i32();
-  switch (__ordinal) {
-{%- for variant in en.variants %}
-    case {{ loop.index }}: return {{ en.ts_name }}::{{ variant.ts_name }};
-{%- endfor %}
-    default:
-      throw std::runtime_error("lift_{{ en.ts_name }}: unknown ordinal");
-  }
-{%- else %}
-  (void)buf;
-  throw std::runtime_error("lift_{{ en.ts_name }}: tagged-enum codecs not yet emitted");
-{%- endif %}
-}
-
-inline RustBuffer lower_{{ en.ts_name }}(const {{ en.ts_name }}& value) {
-{%- if en.flat %}
-  ::ubrn::nitro::RustBufferWriter<&{{ module.rustbuffer_alloc }}, &{{ module.rustbuffer_reserve }}> __writer;
+inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value) {
   int32_t __ordinal = 0;
   switch (value) {
 {%- for variant in en.variants %}
     case {{ en.ts_name }}::{{ variant.ts_name }}: __ordinal = {{ loop.index }}; break;
 {%- endfor %}
   }
-  __writer.write_i32(__ordinal);
-  return __writer.finish();
+  w.write_i32(__ordinal);
+}
+
+inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r) {
+  int32_t __ordinal = r.read_i32();
+  switch (__ordinal) {
+{%- for variant in en.variants %}
+    case {{ loop.index }}: return {{ en.ts_name }}::{{ variant.ts_name }};
+{%- endfor %}
+    default:
+      throw std::runtime_error("read_{{ en.ts_name }}: unknown ordinal");
+  }
+}
 {%- else %}
-  (void)value;
-  throw std::runtime_error("lower_{{ en.ts_name }}: tagged-enum codecs not yet emitted");
+inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value) {
+  // Wire format: i32 tag (1-based, in declaration order) then the variant's
+  // fields in order. `value.variant` is a `std::variant` over the per-
+  // variant payload structs; the index lines up with the tag.
+  switch (value.variant.index()) {
+{%- for variant in en.variants %}
+    case {{ loop.index0 }}: {
+      w.write_i32({{ loop.index }});
+{%- if !variant.fields.is_empty() %}
+      const auto& __v = std::get<{{ loop.index0 }}>(value.variant);
+{%- for field in variant.fields %}
+      {{ field.ty.stream_write_stmt("__v", field.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
+{%- endfor %}
 {%- endif %}
+      break;
+    }
+{%- endfor %}
+    default:
+      throw std::runtime_error("write_{{ en.ts_name }}: unknown variant index");
+  }
+}
+
+inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r) {
+  int32_t __tag = r.read_i32();
+  switch (__tag) {
+{%- for variant in en.variants %}
+    case {{ loop.index }}: {
+      {{ variant.cxx_struct_name(en.ts_name) }} __v{};
+{%- for field in variant.fields %}
+      __v.{{ field.ts_name }} = {{ field.ty.stream_read_expr() }};
+{%- endfor %}
+      return {{ en.ts_name }}{ {{ en.ts_name }}::Variant{std::move(__v)} };
+    }
+{%- endfor %}
+    default:
+      throw std::runtime_error("read_{{ en.ts_name }}: unknown tag");
+  }
+}
+{%- endif %}
+
+inline RustBuffer lower_{{ en.ts_name }}(const {{ en.ts_name }}& value) {
+  Writer w;
+  write_{{ en.ts_name }}(w, value);
+  return w.finish();
+}
+
+inline {{ en.ts_name }} lift_{{ en.ts_name }}(RustBuffer buf) {
+  RustBufferReader r{buf};
+  return read_{{ en.ts_name }}(r);
 }
 {%- endfor %}
 

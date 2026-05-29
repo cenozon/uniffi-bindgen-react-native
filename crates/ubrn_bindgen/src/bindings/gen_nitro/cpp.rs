@@ -19,8 +19,30 @@ use anyhow::Result;
 use askama::Template;
 use camino::Utf8Path;
 
-use super::model::{NitroCallbackInterface, NitroInterface, NitroModule};
+use super::model::{NitroCallbackInterface, NitroEnum, NitroInterface, NitroModule, NitroRecord};
 use super::HybridObjectEntry;
+
+/// Emit the per-record `<Name>.hpp` (struct definition + `JSIConverter`).
+/// This is the source of truth ubrn owns directly — no Nitrogen.
+pub(super) fn write_record(
+    cpp_dir: &Utf8Path,
+    module: &NitroModule,
+    record: &NitroRecord,
+) -> Result<()> {
+    let text = RecordHpp { module, record }.render()?;
+    let path = cpp_dir.join(format!("{}.hpp", record.ts_name));
+    ubrn_common::write_file(path, text)?;
+    Ok(())
+}
+
+/// Emit the per-enum `<Name>.hpp` (flat `enum class` or tagged
+/// `std::variant` representation + `JSIConverter`).
+pub(super) fn write_enum(cpp_dir: &Utf8Path, module: &NitroModule, en: &NitroEnum) -> Result<()> {
+    let text = EnumHpp { module, en }.render()?;
+    let path = cpp_dir.join(format!("{}.hpp", en.ts_name));
+    ubrn_common::write_file(path, text)?;
+    Ok(())
+}
 
 pub(super) fn write_namespace_api(cpp_dir: &Utf8Path, module: &NitroModule) -> Result<()> {
     let hpp_text = NamespaceApiHpp { module }.render()?;
@@ -122,6 +144,20 @@ struct InterfaceCpp<'a> {
 #[template(syntax = "cpp", escape = "none", path = "codecs.hpp")]
 struct CodecsHpp<'a> {
     module: &'a NitroModule,
+}
+
+#[derive(Template)]
+#[template(syntax = "cpp", escape = "none", path = "record.hpp")]
+struct RecordHpp<'a> {
+    module: &'a NitroModule,
+    record: &'a NitroRecord,
+}
+
+#[derive(Template)]
+#[template(syntax = "cpp", escape = "none", path = "enum.hpp")]
+struct EnumHpp<'a> {
+    module: &'a NitroModule,
+    en: &'a NitroEnum,
 }
 
 #[derive(Template)]

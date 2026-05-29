@@ -306,6 +306,17 @@ public:
     buf_.len += s.size();
   }
 
+  /// Append `n` raw bytes from `src` with no length prefix or per-byte
+  /// encoding. Used for `Vec<u8>` payloads (length is written separately).
+  /// A single `memcpy` rather than a per-byte loop.
+  void write_raw_bytes(const uint8_t *src, size_t n) {
+    if (n == 0)
+      return;
+    ensure(n);
+    std::memcpy(buf_.data + buf_.len, src, n);
+    buf_.len += n;
+  }
+
   /// Hand ownership of the underlying RustBuffer to the caller. After
   /// this the writer is consumed and must not be used.
   RustBuffer finish() {

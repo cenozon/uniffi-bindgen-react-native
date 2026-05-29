@@ -4,10 +4,27 @@
 #pragma once
 
 #include <NitroModules/HybridObject.hpp>
+#include <NitroModules/Promise.hpp>
 #include <NitroUniffi.hpp>
+#include <nitro-uniffi/jsi_converter_ints.hpp>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// Per-type headers for every record / enum / interface this interface's
+// methods take or return.
+{%- for header in iface.dependency_headers() %}
+#include "{{ header }}"
+{%- endfor %}
 
 extern "C" {
 void {{ iface.free_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
+{%- if let Some(ctor) = iface.primary_constructor() %}
+uint64_t {{ ctor.uniffi_symbol }}(UniffiRustCallStatus* status);
+{%- endif %}
 }
 
 namespace margelo::nitro::{{ module.namespace }} {
@@ -16,10 +33,18 @@ class {{ iface.cxx_class }} : public ::margelo::nitro::HybridObject {
 public:
   static constexpr auto TAG = "{{ iface.ts_name }}";
 
-  // Default constructor — required for Nitrogen's default-constructible
-  // registry factory. Real instances should be vended via the namespace
-  // API HybridObject's constructor methods rather than this path.
+{%- if let Some(ctor) = iface.primary_constructor() %}
+  // Default constructor — runs the uniffi `{{ ctor.uniffi_symbol }}`
+  // constructor so `NitroModules.createHybridObject('{{ iface.ts_name }}')`
+  // (and the JS `new {{ iface.ts_name }}()` shim) yield a live Rust object.
+  {{ iface.cxx_class }}() : HybridObject(TAG), handle_(make_handle()) {}
+{%- else %}
+  // Default constructor — yields a null-handle instance. This interface's
+  // construction needs arguments (or is fallible/async), which Nitro's
+  // argless `createHybridObject` factory can't drive; live instances are
+  // vended from method/function returns instead.
   {{ iface.cxx_class }}() : HybridObject(TAG), handle_() {}
+{%- endif %}
 
   // Borrowed-handle construction — used internally by the namespace API
   // when invoking a uniffi constructor or interface-returning method.
@@ -43,6 +68,12 @@ protected:
   void loadHybridMethods() override;
 
 private:
+{%- if iface.primary_constructor().is_some() %}
+  // Drives the uniffi constructor (defined in the .cpp, where the
+  // namespace buffer-free symbol is in scope), surfacing any
+  // `RustCallStatus` error as a C++ exception that Nitro relays to JS.
+  static uint64_t make_handle();
+{%- endif %}
   ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> handle_;
 };
 

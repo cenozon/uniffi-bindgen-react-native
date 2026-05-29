@@ -50,6 +50,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include <memory>
+
+#include <NitroModules/ArrayBuffer.hpp>
+
 #include "converters.hpp"
 #include "rust_buffer.hpp"
 
@@ -79,10 +83,15 @@ template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*Reserve)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 using Writer = RustBufferWriter<Alloc, Reserve>;
 
+// The `const T&` parameter spelling is load-bearing: the composite thunks
+// (`write_optional`, `write_sequence`, `write_map`) declare their inner
+// writer as `void (*)(Writer<A, R>&, const T&)`, so a by-value primitive
+// writer would be a different function-pointer type and fail to match as a
+// template argument. Taking `const T&` keeps every writer thunk uniform.
 #define UBRN_NITRO_PRIM_THUNK(T, suffix)                                       \
   template <RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),                 \
             RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>     \
-  inline void write_##suffix(Writer<A, R> &w, T v) {                           \
+  inline void write_##suffix(Writer<A, R> &w, const T &v) {                    \
     w.write_##suffix(v);                                                       \
   }                                                                            \
   inline T read_##suffix(RustBufferReader &r) { return r.read_##suffix(); }
@@ -132,6 +141,52 @@ inline void write_duration(Writer<A, R> &w, const double &ms) {
 }
 
 inline double read_duration(RustBufferReader &r) { return r.read_duration(); }
+
+// -----------------------------------------------------------------------
+// Interface handles inside a composite.
+//
+// A uniffi `interface` crosses the C ABI as a bare `uint64_t` Arc handle.
+// When one appears *inside* a composite (`Vec<Counter>`, `Option<Counter>`,
+// a record field, an enum payload) it's wire-encoded as that u64. The
+// write thunk reads `raw_handle()` off the `std::shared_ptr<HybridT>`; the
+// read thunk wraps the decoded handle back into a fresh `HybridT`.
+//
+// Lowering does not transfer ownership of the C++-side handle: uniffi
+// clones the Arc on its end when it consumes a handle out of a buffer, so
+// the `shared_ptr` the JS side holds stays valid.
+// -----------------------------------------------------------------------
+
+template <typename HybridT, RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
+          RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
+inline void write_interface_handle(Writer<A, R> &w,
+                                   const std::shared_ptr<HybridT> &v) {
+  w.write_u64(v->raw_handle());
+}
+
+template <typename HybridT>
+inline std::shared_ptr<HybridT> read_interface_handle(RustBufferReader &r) {
+  return std::make_shared<HybridT>(r.read_u64());
+}
+
+// -----------------------------------------------------------------------
+// Fallback for any uniffi type the Nitro backend doesn't model in
+// composite-element position. `from_type` is total over uniffi's type
+// universe, so these are never instantiated in practice — but referencing
+// a defined symbol keeps a hypothetical `Stub` field from producing an
+// opaque link error instead of a clear runtime throw.
+// -----------------------------------------------------------------------
+
+template <typename W, typename T>
+inline void unsupported_compound_inside_composite(W &, const T &) {
+  throw std::runtime_error(
+      "Nitro: unsupported uniffi type in composite-element position");
+}
+
+template <typename W, typename T>
+inline void unsupported_callback_inside_composite(W &, const T &) {
+  throw std::runtime_error(
+      "Nitro: callback interface in composite-element position not supported");
+}
 
 // -----------------------------------------------------------------------
 // Optional<T>.
@@ -277,39 +332,47 @@ inline std::unordered_map<K, V> lift_map(RustBuffer buf) {
 // -----------------------------------------------------------------------
 // Bytes / Vec<u8>.
 //
-// Uniffi encodes `Vec<u8>` as length-prefixed raw bytes, *not* as a
-// generic `Vec<u8>` (no per-element encoding). We model it as
-// `std::vector<uint8_t>` on the C++ side.
+// Uniffi encodes `Vec<u8>` as a length-prefixed raw byte run (i32 length
+// then `len` bytes — no per-element encoding). The C++ surface is Nitro's
+// `std::shared_ptr<ArrayBuffer>`, which JS sees directly as a JS
+// `ArrayBuffer`: zero-copy on the read side (JS reads the native buffer in
+// place) and a single copy on each direction's native boundary (vs the two
+// copies a `Uint8Array` round-trip would cost). See CLAUDE-TODO §2.3.
+//
+// `read_bytes` copies the wire bytes once into a fresh owning ArrayBuffer.
+// `write_bytes` copies the ArrayBuffer's bytes once into the RustBuffer.
 // -----------------------------------------------------------------------
+
+using BytesT = std::shared_ptr<::margelo::nitro::ArrayBuffer>;
 
 template <RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
-inline void write_bytes(Writer<A, R> &w, const std::vector<uint8_t> &v) {
-  w.write_i32(static_cast<int32_t>(v.size()));
-  for (uint8_t b : v) {
-    w.write_u8(b);
+inline void write_bytes(Writer<A, R> &w, const BytesT &v) {
+  size_t n = (v == nullptr) ? 0 : v->size();
+  w.write_i32(static_cast<int32_t>(n));
+  if (n > 0) {
+    w.write_raw_bytes(v->data(), n);
   }
 }
 
-inline std::vector<uint8_t> read_bytes(RustBufferReader &r) {
+inline BytesT read_bytes(RustBufferReader &r) {
   int32_t len = r.read_i32();
-  std::vector<uint8_t> out;
-  if (len <= 0)
-    return out;
+  if (len <= 0) {
+    return ::margelo::nitro::ArrayBuffer::allocate(0);
+  }
   auto view = r.read_view(static_cast<size_t>(len));
-  out.assign(view.data, view.data + view.len);
-  return out;
+  return ::margelo::nitro::ArrayBuffer::copy(view.data, view.len);
 }
 
 template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*Reserve)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
-inline RustBuffer lower_bytes(const std::vector<uint8_t> &v) {
+inline RustBuffer lower_bytes(const BytesT &v) {
   Writer<Alloc, Reserve> w;
   write_bytes<Alloc, Reserve>(w, v);
   return w.finish();
 }
 
-inline std::vector<uint8_t> lift_bytes(RustBuffer buf) {
+inline BytesT lift_bytes(RustBuffer buf) {
   RustBufferReader r{buf};
   return read_bytes(r);
 }

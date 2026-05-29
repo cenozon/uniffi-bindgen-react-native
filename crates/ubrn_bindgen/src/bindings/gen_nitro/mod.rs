@@ -126,6 +126,15 @@ pub fn generate_all(
         for cb in &nitro_module.callback_interfaces {
             cpp::write_callback_interface(cpp_dir, &nitro_module, cb)?;
         }
+        // Per-record / per-enum struct + JSIConverter headers (the
+        // single source of truth — replaces Nitrogen's struct/converter
+        // emission), then the RustBuffer codecs that build on them.
+        for record in &nitro_module.records {
+            cpp::write_record(cpp_dir, &nitro_module, record)?;
+        }
+        for en in &nitro_module.enums {
+            cpp::write_enum(cpp_dir, &nitro_module, en)?;
+        }
         cpp::write_codecs(cpp_dir, &nitro_module)?;
 
         // Collect autolinking entries.

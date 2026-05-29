@@ -4,10 +4,10 @@ import type { HybridObject } from 'react-native-nitro-modules'
 
 {% for record in module.records %}
 /**
- * Uniffi record `{{ record.ts_name }}`. Nitrogen auto-generates the C++
- * struct + JSI converter from this declaration; ubrn emits the matching
- * `lift_{{ record.ts_name }}` / `lower_{{ record.ts_name }}` codec
- * functions in `{{ module.namespace }}_codecs.hpp`.
+ * Uniffi record `{{ record.ts_name }}`. ubrn emits the C++ struct + its
+ * `JSIConverter` in `{{ record.ts_name }}.hpp` and the RustBuffer codec
+ * (`lift_{{ record.ts_name }}` / `lower_{{ record.ts_name }}`) in
+ * `{{ module.namespace }}_codecs.hpp` — no Nitrogen involved.
  */
 export interface {{ record.ts_name }} {
 {%- for field in record.fields %}
@@ -20,9 +20,14 @@ export interface {{ record.ts_name }} {
  * Uniffi enum `{{ en.ts_name }}`.
  */
 {%- if en.flat %}
-export type {{ en.ts_name }} = {% for variant in en.variants %}'{{ variant.ts_name }}'{% if !loop.last %} | {% endif %}{% endfor %}
+export type {{ en.ts_name }} = {% for variant in en.variants %}'{{ variant.tag }}'{% if !loop.last %} | {% endif %}{% endfor %}
 {%- else %}
-export type {{ en.ts_name }} = {% for variant in en.variants %}{ tag: '{{ variant.ts_name }}' }{% if !loop.last %} | {% endif %}{% endfor %}
+// Discriminated union keyed on `type` — matches the `JSIConverter` ubrn
+// emits in `{{ en.ts_name }}.hpp`.
+export type {{ en.ts_name }} =
+{%- for variant in en.variants %}
+  | { type: '{{ variant.tag }}'{% for field in variant.fields %}; {{ field.ts_name }}: {{ field.ty.ts_type() }}{% endfor %} }
+{%- endfor %}
 {%- endif %}
 {% endfor %}
 {% for err in module.errors %}
