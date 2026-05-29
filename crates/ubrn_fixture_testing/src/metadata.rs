@@ -71,6 +71,6 @@ pub(crate) fn find_cdylib_from_name(lib_name: &str) -> Utf8PathBuf {
         "lib"
     };
     target_dir
-        .join("debug")
+        .join(crate::fixture_profile_dir())
         .join(format!("{prefix}{lib_name}.{}", shared_lib_ext()))
 }

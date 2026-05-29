@@ -141,15 +141,37 @@ pub(crate) fn run_cmd_quietly(cmd: &mut Command) {
     }
 }
 
-/// `cargo build -p <crate_name>`
+/// Whether fixture artifacts (the Rust cdylib that gets linked into the C++
+/// test `.so`, and the bindgen input library) are built optimized. Off by
+/// default — the correctness suite doesn't need it and pays the build cost —
+/// and flipped on with `UBRN_FIXTURE_RELEASE=1` (or `=true`) so the benchmark
+/// fixture measures an optimized Rust workload rather than a `debug` one.
+pub(crate) fn fixture_release() -> bool {
+    std::env::var("UBRN_FIXTURE_RELEASE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Profile subdir under `target/` for fixture artifacts: `release` when
+/// [`fixture_release`] is set, else `debug`. Used by every site that resolves
+/// or links the fixture cdylib, so the three stay consistent.
+pub(crate) fn fixture_profile_dir() -> &'static str {
+    if fixture_release() {
+        "release"
+    } else {
+        "debug"
+    }
+}
+
+/// `cargo build -p <crate_name> --lib` (with `--release` when
+/// [`fixture_release`] is set).
 pub(crate) fn cargo_build(crate_name: &str) {
-    run_cmd_quietly(
-        Command::new("cargo")
-            .arg("build")
-            .arg("-p")
-            .arg(crate_name)
-            .arg("--lib"),
-    );
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build").arg("-p").arg(crate_name).arg("--lib");
+    if fixture_release() {
+        cmd.arg("--release");
+    }
+    run_cmd_quietly(&mut cmd);
 }
 
 /// Write a minimal tsconfig.json into the fixture directory so that tsx
