@@ -8,11 +8,6 @@ members = [
     "xtask",
 ]
 
-# `runtimes/nitro` is an npm-only package shipping header-only C++ —
-# nothing for cargo to build there. Exclude it so `runtimes/*` membership
-# doesn't try to find a Cargo.toml.
-exclude = ["runtimes/nitro"]
-
 resolver = "2"
 
 [workspace.dependencies]

@@ -95,10 +95,7 @@ impl NitroModule {
             // can be wired into Nitro once its type support lands.
             match NitroFunction::from_function(func) {
                 Ok(f) => functions.push(f),
-                Err(e) => eprintln!(
-                    "nitro: skipping function `{}`: {e}",
-                    func.name
-                ),
+                Err(e) => eprintln!("nitro: skipping function `{}`: {e}", func.name),
             }
         }
 
@@ -237,6 +234,9 @@ pub struct NitroErrorRef {
 impl NitroErrorRef {
     /// C++ exception class name — `<TsName>Error` to disambiguate from
     /// a same-named data enum, mirroring the codec class.
+    // Reserved for the typed-error emission path (not yet wired into the
+    // templates, which currently lift errors via `lift_fn`).
+    #[allow(dead_code)]
     pub fn cxx_class(&self) -> String {
         format!("{}Error", self.ts_name)
     }
@@ -402,6 +402,9 @@ pub struct NitroInterface {
     /// when methods take other interface references as args.
     #[allow(dead_code)]
     pub clone_symbol: String,
+    /// Parsed from uniffi metadata; not yet emitted (HybridObjects are
+    /// vended via the namespace API, so constructors aren't surfaced yet).
+    #[allow(dead_code)]
     pub constructors: Vec<NitroFunction>,
     pub methods: Vec<NitroFunction>,
 }
@@ -573,16 +576,25 @@ pub enum NitroType {
     /// A uniffi `dictionary` / Rust struct. Crosses the FFI as a
     /// `RustBuffer`; lift/lower expressions delegate to the per-record
     /// codec emitted in `<namespace>_codecs.hpp`.
-    Record { namespace: String, name: String },
+    Record {
+        namespace: String,
+        name: String,
+    },
     /// A uniffi enum. `flat=true` means every variant has zero fields —
     /// the enum is encoded as an `i32` ordinal. Tagged enums use the
     /// same RustBuffer transport but reserve future codec extensions.
-    Enum { namespace: String, name: String },
+    Enum {
+        namespace: String,
+        name: String,
+    },
     /// A uniffi `interface` (Rust struct). Crosses the FFI as a `uint64_t`
     /// handle. Lowering reads the handle out of a `std::shared_ptr<Hybrid<Name>>`
     /// via the impl's public `raw_handle()` accessor; lifting wraps the raw
     /// handle in `std::make_shared<Hybrid<Name>>(raw)`.
-    Interface { namespace: String, name: String },
+    Interface {
+        namespace: String,
+        name: String,
+    },
     /// A placeholder for any uniffi type the Nitro backend doesn't yet
     /// understand in *record / enum field* position (e.g. an Interface
     /// reference in a SimpleDict field). Surfaces as `unknown` in TS and
@@ -611,12 +623,8 @@ impl NitroType {
             Type::Bytes => Self::Bytes,
             Type::Timestamp => Self::Timestamp,
             Type::Duration => Self::Duration,
-            Type::Optional { inner_type } => {
-                Self::Optional(Box::new(Self::from_type(inner_type)?))
-            }
-            Type::Sequence { inner_type } => {
-                Self::Sequence(Box::new(Self::from_type(inner_type)?))
-            }
+            Type::Optional { inner_type } => Self::Optional(Box::new(Self::from_type(inner_type)?)),
+            Type::Sequence { inner_type } => Self::Sequence(Box::new(Self::from_type(inner_type)?)),
             Type::Map {
                 key_type,
                 value_type,
@@ -635,7 +643,11 @@ impl NitroType {
                 namespace: namespace.clone(),
                 name: name.clone(),
             },
-            Type::Interface { namespace, name, imp } => match imp {
+            Type::Interface {
+                namespace,
+                name,
+                imp,
+            } => match imp {
                 general::ObjectImpl::CallbackTrait => {
                     Self::CallbackInterface(name.to_upper_camel_case())
                 }
@@ -790,15 +802,15 @@ impl NitroType {
         match self {
             Self::Bool => format!("ubrn::nitro::lower_bool({name})"),
             Self::String => format!("ubrn::nitro::lower_string<&{alloc_symbol}>({name})"),
-            Self::Bytes => format!(
-                "ubrn::nitro::lower_bytes<&{alloc_symbol}, &{reserve_symbol}>({name})"
-            ),
-            Self::Timestamp => format!(
-                "ubrn::nitro::lower_timestamp<&{alloc_symbol}, &{reserve_symbol}>({name})"
-            ),
-            Self::Duration => format!(
-                "ubrn::nitro::lower_duration<&{alloc_symbol}, &{reserve_symbol}>({name})"
-            ),
+            Self::Bytes => {
+                format!("ubrn::nitro::lower_bytes<&{alloc_symbol}, &{reserve_symbol}>({name})")
+            }
+            Self::Timestamp => {
+                format!("ubrn::nitro::lower_timestamp<&{alloc_symbol}, &{reserve_symbol}>({name})")
+            }
+            Self::Duration => {
+                format!("ubrn::nitro::lower_duration<&{alloc_symbol}, &{reserve_symbol}>({name})")
+            }
             Self::Optional(inner) => {
                 let inner_cxx = inner.cxx_type();
                 let inner_writer = inner.write_fn_template_arg(alloc_symbol, reserve_symbol);
@@ -855,9 +867,9 @@ impl NitroType {
                 name: type_name, ..
             } => format!("lower_{}({name})", type_name.to_upper_camel_case()),
             Self::Interface { .. } => format!("{name}->raw_handle()"),
-            Self::Stub => format!(
-                "::ubrn::nitro::lower_stub(/* unsupported in nitro v1 */ {name})"
-            ),
+            Self::Stub => {
+                format!("::ubrn::nitro::lower_stub(/* unsupported in nitro v1 */ {name})")
+            }
             _ => format!("ubrn::nitro::lower_{}({name})", self.lower_suffix()),
         }
     }
@@ -920,14 +932,15 @@ impl NitroType {
             | Self::Enum {
                 name: type_name, ..
             } => format!("lift_{}({name})", type_name.to_upper_camel_case()),
-            Self::Interface { namespace, name: type_name } => format!(
+            Self::Interface {
+                namespace,
+                name: type_name,
+            } => format!(
                 "std::make_shared<::margelo::nitro::{}::Hybrid{}>({name})",
                 namespace,
                 type_name.to_upper_camel_case()
             ),
-            Self::Stub => format!(
-                "::ubrn::nitro::lift_stub(/* unsupported in nitro v1 */ {name})"
-            ),
+            Self::Stub => format!("::ubrn::nitro::lift_stub(/* unsupported in nitro v1 */ {name})"),
             _ => format!("ubrn::nitro::lift_{}({name})", self.lower_suffix()),
         }
     }

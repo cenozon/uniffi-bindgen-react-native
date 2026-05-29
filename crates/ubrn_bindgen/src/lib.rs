@@ -12,8 +12,8 @@ mod wasm;
 
 pub use self::{
     bindings::{
-        generate_entrypoint,
         gen_nitro::{HybridObjectEntry, HybridObjectKind},
+        generate_entrypoint,
         metadata::ModuleMetadata,
     },
     cli::{BindingsArgs, BindingsOutcome, OutputArgs, SourceArgs},

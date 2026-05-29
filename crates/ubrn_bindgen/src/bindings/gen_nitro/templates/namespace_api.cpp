@@ -2,7 +2,7 @@
 // Namespace API HybridObject impl for uniffi crate `{{ module.crate_name }}`.
 //
 // Every method here is a direct call into the uniffi C ABI. The
-// `@ubrn/nitro-runtime` helpers handle lowering/lifting; we just hand the
+// nitro-uniffi helpers handle lowering/lifting; we just hand the
 // generated symbols + buffer-management hooks to them.
 #include "{{ module.namespace_api_cxx_class() }}.hpp"
 #include "{{ module.codecs_header_filename() }}"

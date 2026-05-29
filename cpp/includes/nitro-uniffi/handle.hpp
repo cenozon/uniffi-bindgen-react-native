@@ -44,54 +44,52 @@ namespace ubrn::nitro {
 /// `uniffi_<crate>_fn_clone_<obj>` when explicit reference duplication is
 /// needed (e.g., passing the same object across two method boundaries in
 /// one call).
-template <void (*FreeFn)(uint64_t, UniffiRustCallStatus*)>
+template <void (*FreeFn)(uint64_t, UniffiRustCallStatus *)>
 class UniffiObjectHandle {
 public:
-    UniffiObjectHandle() noexcept : raw_(0) {}
-    explicit UniffiObjectHandle(uint64_t raw) noexcept : raw_(raw) {}
+  UniffiObjectHandle() noexcept : raw_(0) {}
+  explicit UniffiObjectHandle(uint64_t raw) noexcept : raw_(raw) {}
 
-    UniffiObjectHandle(const UniffiObjectHandle&) = delete;
-    UniffiObjectHandle& operator=(const UniffiObjectHandle&) = delete;
+  UniffiObjectHandle(const UniffiObjectHandle &) = delete;
+  UniffiObjectHandle &operator=(const UniffiObjectHandle &) = delete;
 
-    UniffiObjectHandle(UniffiObjectHandle&& other) noexcept : raw_(other.raw_) {
-        other.raw_ = 0;
+  UniffiObjectHandle(UniffiObjectHandle &&other) noexcept : raw_(other.raw_) {
+    other.raw_ = 0;
+  }
+
+  UniffiObjectHandle &operator=(UniffiObjectHandle &&other) noexcept {
+    if (this != &other) {
+      release();
+      raw_ = std::exchange(other.raw_, 0);
     }
+    return *this;
+  }
 
-    UniffiObjectHandle& operator=(UniffiObjectHandle&& other) noexcept {
-        if (this != &other) {
-            release();
-            raw_ = std::exchange(other.raw_, 0);
-        }
-        return *this;
-    }
+  ~UniffiObjectHandle() noexcept { release(); }
 
-    ~UniffiObjectHandle() noexcept { release(); }
+  uint64_t raw() const noexcept { return raw_; }
+  explicit operator bool() const noexcept { return raw_ != 0; }
 
-    uint64_t raw() const noexcept { return raw_; }
-    explicit operator bool() const noexcept { return raw_ != 0; }
-
-    /// Drop the handle without invoking `FreeFn` — used when the handle
-    /// is being handed off to Rust (e.g., as a method argument that the
-    /// callee will take ownership of).
-    uint64_t take() noexcept {
-        return std::exchange(raw_, 0);
-    }
+  /// Drop the handle without invoking `FreeFn` — used when the handle
+  /// is being handed off to Rust (e.g., as a method argument that the
+  /// callee will take ownership of).
+  uint64_t take() noexcept { return std::exchange(raw_, 0); }
 
 private:
-    void release() noexcept {
-        if (raw_ != 0) {
-            UniffiRustCallStatus status{};
-            FreeFn(raw_, &status);
-            // Free hooks are infallible on the Rust side — they can only
-            // panic, and a panic in the dtor is unrecoverable. We swallow
-            // status here for the same reason `std::shared_ptr`'s
-            // deleter is noexcept.
-            (void)status;
-            raw_ = 0;
-        }
+  void release() noexcept {
+    if (raw_ != 0) {
+      UniffiRustCallStatus status{};
+      FreeFn(raw_, &status);
+      // Free hooks are infallible on the Rust side — they can only
+      // panic, and a panic in the dtor is unrecoverable. We swallow
+      // status here for the same reason `std::shared_ptr`'s
+      // deleter is noexcept.
+      (void)status;
+      raw_ = 0;
     }
+  }
 
-    uint64_t raw_;
+  uint64_t raw_;
 };
 
 } // namespace ubrn::nitro

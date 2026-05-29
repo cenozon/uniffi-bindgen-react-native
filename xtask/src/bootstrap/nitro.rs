@@ -95,7 +95,7 @@ impl NitroCmd {
         Ok(())
     }
 
-    /// The linkable library the desktop test-runner needs.
+    /// The linkable library the host test-runner needs.
     /// File extension differs per-platform; mirrors `TestRunnerCmd::exe`.
     pub fn lib_path() -> Result<Utf8PathBuf> {
         let dir = Self::build_dir()?;
@@ -164,11 +164,10 @@ impl NitroCmd {
         let hermes_src = HermesCmd::src_dir()?;
         let hermes_build = HermesCmd::build_dir()?;
         let stubs_dir = repository_root()?.join("cpp").join("stubs");
-        let platform_desktop_dir = repository_root()?
-            .join("runtimes")
-            .join("nitro")
+        let platform_host_dir = repository_root()?
             .join("cpp")
-            .join("platform-desktop");
+            .join("test-harness")
+            .join("platform-host");
 
         if !cpp_src.exists() {
             return Err(anyhow!(
@@ -215,15 +214,15 @@ foreach (sub ${{NITRO_INCLUDE_SUBDIRS}})
 endforeach ()
 
 # `cpp/platform/ThreadUtils.hpp` declares static methods whose impls live
-# in the per-platform tree (android/ios). For desktop bootstrap we
-# substitute a stub from `runtimes/nitro/cpp/platform-desktop/` that
+# in the per-platform tree (android/ios). For host bootstrap we
+# substitute a stub from `cpp/test-harness/platform-host/` that
 # implements the same surface with std::thread + a synchronous
 # InlineDispatcher. Without this libNitroModules fails to link on
 # `ThreadUtils::createUIThreadDispatcher`, `isUIThread`, `getThreadName`,
 # `setThreadName`.
-set(DESKTOP_PLATFORM_DIR "{platform_desktop_dir}")
-list(APPEND NITRO_SOURCES "${{DESKTOP_PLATFORM_DIR}}/ThreadUtils.cpp")
-list(APPEND NITRO_INCLUDE_DIRS "${{DESKTOP_PLATFORM_DIR}}")
+set(HOST_PLATFORM_DIR "{platform_host_dir}")
+list(APPEND NITRO_SOURCES "${{HOST_PLATFORM_DIR}}/ThreadUtils.cpp")
+list(APPEND NITRO_INCLUDE_DIRS "${{HOST_PLATFORM_DIR}}")
 
 add_library(NitroModules SHARED ${{NITRO_SOURCES}})
 
@@ -316,7 +315,7 @@ impl Bootstrap for NitroCmd {
         // directory. Consumer code references Nitro headers via
         // `<NitroModules/Foo.hpp>` (the convention the npm autolinking
         // sets up on mobile); the flat dir is what downstream cmake
-        // include paths point at on desktop.
+        // include paths point at on the host.
         Self::populate_flat_includes()?;
 
         Ok(())
@@ -326,9 +325,7 @@ impl Bootstrap for NitroCmd {
 /// Recursively collect every `.hpp` file under `dir`. Used to build the
 /// flat `NitroModules/` include directory mirror.
 fn collect_hpp_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .map_err(|e| anyhow!("read_dir {}: {e}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).map_err(|e| anyhow!("read_dir {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| anyhow!("read_dir entry under {}: {e}", dir.display()))?;
         let path = entry.path();
         let ft = entry
@@ -336,9 +333,7 @@ fn collect_hpp_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -
             .map_err(|e| anyhow!("file_type {}: {e}", path.display()))?;
         if ft.is_dir() {
             collect_hpp_files(&path, out)?;
-        } else if ft.is_file()
-            && path.extension().and_then(|e| e.to_str()) == Some("hpp")
-        {
+        } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("hpp") {
             out.push(path);
         }
     }
@@ -363,13 +358,8 @@ fn mirror_header(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        std::fs::copy(src, dst).map_err(|e| {
-            anyhow!(
-                "failed to copy {} -> {}: {e}",
-                src.display(),
-                dst.display()
-            )
-        })?;
+        std::fs::copy(src, dst)
+            .map_err(|e| anyhow!("failed to copy {} -> {}: {e}", src.display(), dst.display()))?;
     }
     Ok(())
 }

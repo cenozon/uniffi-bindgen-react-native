@@ -64,10 +64,27 @@ pub(crate) fn assert_wasm_bootstrap() {
 
 // === Nitro paths ===
 
-/// Vendored Nitro source tree (clone or symlink), placed alongside hermes
-/// in `cpp_modules/`. The `xtask bootstrap nitro` step populates it.
+/// Vendored Nitro source tree, placed alongside hermes in `cpp_modules/`.
+/// The `xtask bootstrap nitro` step populates it — either as a real clone
+/// or, when a local checkout exists, as a **symlink** into it (see
+/// `NitroCmd::checkout`).
+///
+/// We canonicalize the path here so every consumer sees the real on-disk
+/// location rather than the symlink. This matters for Metro: it builds its
+/// module graph from realpaths and refuses to resolve a module whose
+/// realpath falls outside `projectRoot ∪ watchFolders`. Handing it the
+/// symlink path (while its file map keys on the realpath) makes the Nitro
+/// package unresolvable. Canonicalizing means nothing downstream — Metro
+/// extras *or* the cmake include dirs — depends on the symlink surviving.
+/// On a real clone (e.g. CI) canonicalize is a no-op.
 pub(crate) fn nitro_src_dir() -> Utf8PathBuf {
-    repo_root().join("cpp_modules").join("nitro")
+    let p = repo_root().join("cpp_modules").join("nitro");
+    // Fall back to the un-resolved path if it doesn't exist yet (so the
+    // bootstrap-missing checks still surface a friendly path) or isn't UTF-8.
+    match dunce::canonicalize(&p) {
+        Ok(real) => Utf8PathBuf::from_path_buf(real).unwrap_or(p),
+        Err(_) => p,
+    }
 }
 
 /// Per-package `cpp/` source root for `react-native-nitro-modules`.
@@ -84,11 +101,6 @@ pub(crate) fn nitro_modules_pkg_dir() -> Utf8PathBuf {
     nitro_src_dir()
         .join("packages")
         .join("react-native-nitro-modules")
-}
-
-/// `@ubrn/nitro-runtime` package root (lives in-tree under `runtimes/nitro`).
-pub(crate) fn ubrn_nitro_runtime_pkg_dir() -> Utf8PathBuf {
-    repo_root().join("runtimes").join("nitro")
 }
 
 /// Build directory hosting `libNitroModules.{so,dylib,dll}` — written
@@ -118,7 +130,7 @@ pub(crate) fn nitro_lib_path() -> Utf8PathBuf {
     }
 }
 
-/// The Hermes-aware desktop Nitro test-runner. Built by
+/// The Hermes-aware host Nitro test-runner. Built by
 /// `xtask bootstrap nitro-test-runner` into `<build_root>/test-runner-nitro/`.
 pub(crate) fn nitro_test_runner_binary() -> Utf8PathBuf {
     let dir = build_root().join("test-runner-nitro");
@@ -175,10 +187,7 @@ pub(crate) fn add_nitro_dll_paths(cmd: &mut Command) {
         let nitro_dir = nitro_build_dir().join("Debug");
         let hermes_dll_dir = hermes_build_dir().join("API/hermes/Debug");
         let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env(
-            "PATH",
-            format!("{};{};{}", nitro_dir, hermes_dll_dir, path),
-        );
+        cmd.env("PATH", format!("{};{};{}", nitro_dir, hermes_dll_dir, path));
     }
 }
 

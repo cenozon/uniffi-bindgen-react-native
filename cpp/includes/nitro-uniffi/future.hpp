@@ -59,24 +59,24 @@ namespace ubrn::nitro {
 /// Poll-result codes — mirror `RustFuturePoll` on the Rust side
 /// (`uniffi_core::ffi::rustfuture::RustFuturePoll`).
 enum class RustFuturePoll : int8_t {
-    /// The future has completed. The foreign side should call
-    /// `rust_future_complete_*` to extract the result.
-    Ready = 0,
-    /// The future woke up but isn't done. The foreign side should call
-    /// `rust_future_poll_*` again to re-arm the continuation.
-    Wake = 1,
+  /// The future has completed. The foreign side should call
+  /// `rust_future_complete_*` to extract the result.
+  Ready = 0,
+  /// The future woke up but isn't done. The foreign side should call
+  /// `rust_future_poll_*` again to re-arm the continuation.
+  Wake = 1,
 };
 
 /// State block held alive for the duration of a single poll/complete
 /// cycle. `cb_data` is a pointer to this struct, reinterpret-cast to
 /// `uint64_t` for the C ABI.
 struct RustFutureContinuation {
-    std::mutex mutex;
-    std::condition_variable cv;
-    /// Set to true once the C-ABI continuation callback has fired.
-    bool fired = false;
-    /// The poll code Rust last reported.
-    int8_t poll_result = 0;
+  std::mutex mutex;
+  std::condition_variable cv;
+  /// Set to true once the C-ABI continuation callback has fired.
+  bool fired = false;
+  /// The poll code Rust last reported.
+  int8_t poll_result = 0;
 };
 
 /// C-ABI compatible continuation. Signature matches uniffi's
@@ -87,14 +87,15 @@ struct RustFutureContinuation {
 /// possibly the same worker we're blocking on, possibly a different
 /// one — so we have to take the mutex before signalling.
 extern "C" inline void
-rust_future_continuation_trampoline(uint64_t cb_data, int8_t poll_result) noexcept {
-    auto* state = reinterpret_cast<RustFutureContinuation*>(cb_data);
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->poll_result = poll_result;
-        state->fired = true;
-    }
-    state->cv.notify_one();
+rust_future_continuation_trampoline(uint64_t cb_data,
+                                    int8_t poll_result) noexcept {
+  auto *state = reinterpret_cast<RustFutureContinuation *>(cb_data);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->poll_result = poll_result;
+    state->fired = true;
+  }
+  state->cv.notify_one();
 }
 
 /// Pointer to the per-namespace `ffi_<crate>_rust_future_poll_<T>`
@@ -114,34 +115,33 @@ using PollFn = void (*)(uint64_t, void (*)(uint64_t, int8_t), uint64_t);
 /// `T`-dependent, and the free-symbol is paired 1:1 with the eager
 /// `_fn_func_*` call the method body already made.
 inline void drive_rust_future(uint64_t handle, PollFn poll_fn) {
-    RustFutureContinuation state;
-    while (true) {
-        // Reset for this iteration. We must reset *before* re-arming
-        // the continuation, otherwise Rust could fire the callback
-        // before we sit on the condvar and we'd miss the wake.
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            state.fired = false;
-            state.poll_result = 0;
-        }
-
-        poll_fn(handle,
-                &rust_future_continuation_trampoline,
-                reinterpret_cast<uint64_t>(&state));
-
-        // Wait for the continuation to fire. The `wait` predicate is
-        // checked under the mutex, so the wake from the trampoline is
-        // race-free.
-        {
-            std::unique_lock<std::mutex> lock(state.mutex);
-            state.cv.wait(lock, [&state] { return state.fired; });
-        }
-
-        if (state.poll_result == static_cast<int8_t>(RustFuturePoll::Ready)) {
-            return;
-        }
-        // Else `Wake` — loop and re-poll.
+  RustFutureContinuation state;
+  while (true) {
+    // Reset for this iteration. We must reset *before* re-arming
+    // the continuation, otherwise Rust could fire the callback
+    // before we sit on the condvar and we'd miss the wake.
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.fired = false;
+      state.poll_result = 0;
     }
+
+    poll_fn(handle, &rust_future_continuation_trampoline,
+            reinterpret_cast<uint64_t>(&state));
+
+    // Wait for the continuation to fire. The `wait` predicate is
+    // checked under the mutex, so the wake from the trampoline is
+    // race-free.
+    {
+      std::unique_lock<std::mutex> lock(state.mutex);
+      state.cv.wait(lock, [&state] { return state.fired; });
+    }
+
+    if (state.poll_result == static_cast<int8_t>(RustFuturePoll::Ready)) {
+      return;
+    }
+    // Else `Wake` — loop and re-poll.
+  }
 }
 
 } // namespace ubrn::nitro

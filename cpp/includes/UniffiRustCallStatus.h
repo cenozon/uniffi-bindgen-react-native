@@ -17,7 +17,7 @@ struct RustCallStatus {
 };
 
 // `UniffiRustCallStatus` is the spelling the Nitro-backed code (both the
-// gen_nitro templates and `runtimes/nitro/cpp/nitro-uniffi/*`) uses for
+// gen_nitro templates and `cpp/includes/nitro-uniffi/*`) uses for
 // the same C ABI status struct. The original JSI-backed code uses the
 // shorter `RustCallStatus` name; keep both in sync with a typedef so
 // either include order resolves correctly.

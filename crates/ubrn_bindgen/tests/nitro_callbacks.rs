@@ -36,7 +36,7 @@ fn find_built_cdylib(crate_lib_name: &str) -> Option<Utf8PathBuf> {
     for c in candidates {
         let p = workspace_root.join(c);
         if p.exists() {
-            return Some(Utf8PathBuf::from_path_buf(p).ok()?);
+            return Utf8PathBuf::from_path_buf(p).ok();
         }
     }
     None
@@ -56,7 +56,7 @@ fn nitro_emit_against_callbacks_cdylib() {
         .prefix("ubrn-nitro-callbacks-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir")
-        .into_path();
+        .keep();
     let ts_dir = Utf8PathBuf::from_path_buf(out.join("ts")).unwrap();
     let cpp_dir = Utf8PathBuf::from_path_buf(out.join("cpp")).unwrap();
     std::fs::create_dir_all(&ts_dir).unwrap();
@@ -71,7 +71,11 @@ fn nitro_emit_against_callbacks_cdylib() {
     let args = BindingsArgs::new(switches, source, output);
 
     let outcome = args.run(None).expect("nitro emission");
-    assert_eq!(outcome.modules.len(), 1, "callbacks fixture has a single namespace");
+    assert_eq!(
+        outcome.modules.len(),
+        1,
+        "callbacks fixture has a single namespace"
+    );
 
     // ---- Autolinking: callback interfaces show up as HybridObject entries ----
     let names: Vec<&str> = outcome
@@ -109,8 +113,14 @@ fn nitro_emit_against_callbacks_cdylib() {
     //   `sequence<f64?>?` → `((number) | null)[] | null`
     //   The exact `(x) | null` parenthesization matters for the recursive
     //   composer; assert on both the inner and outer markers separately.
-    assert!(spec.contains("| null"), "spec should mention nullable type:\n{spec}");
-    assert!(spec.contains(")[]"), "spec should mention array type:\n{spec}");
+    assert!(
+        spec.contains("| null"),
+        "spec should mention nullable type:\n{spec}"
+    );
+    assert!(
+        spec.contains(")[]"),
+        "spec should mention array type:\n{spec}"
+    );
     // `Uint8Array` only appears if a bytes type is present in callbacks
     // — this fixture doesn't use one, so we don't assert that.
 
@@ -131,7 +141,10 @@ fn nitro_emit_against_callbacks_cdylib() {
 
     // ---- C++ namespace API impl uses shared_ptr<Hybrid*Spec> for callback args ----
     let interface_cpp = cpp_dir.join("HybridRustGetters.cpp");
-    assert!(interface_cpp.exists(), "expected HybridRustGetters.cpp at {interface_cpp}");
+    assert!(
+        interface_cpp.exists(),
+        "expected HybridRustGetters.cpp at {interface_cpp}"
+    );
     let cpp = std::fs::read_to_string(&interface_cpp).unwrap();
     assert!(
         cpp.contains("std::shared_ptr<HybridForeignGetters>"),
@@ -157,8 +170,14 @@ fn nitro_emit_against_callbacks_cdylib() {
     // ---- Callback trampoline header + cpp got emitted ----
     let cb_hpp = cpp_dir.join("HybridForeignGetters.hpp");
     let cb_cpp = cpp_dir.join("HybridForeignGetters.cpp");
-    assert!(cb_hpp.exists(), "expected callback trampoline header at {cb_hpp}");
-    assert!(cb_cpp.exists(), "expected callback trampoline impl at {cb_cpp}");
+    assert!(
+        cb_hpp.exists(),
+        "expected callback trampoline header at {cb_hpp}"
+    );
+    assert!(
+        cb_cpp.exists(),
+        "expected callback trampoline impl at {cb_cpp}"
+    );
     let cb_cpp_text = std::fs::read_to_string(&cb_cpp).unwrap();
 
     // The vtable init hook is declared and idempotently invoked.

@@ -51,63 +51,62 @@ namespace ubrn::nitro {
 /// `HybridT` is the Nitrogen-generated spec base class — typically
 /// `HybridFooCallbackSpec`. The generated code registers a vtable that
 /// uses a CallbackHandleMap<HybridFooCallbackSpec> to dispatch.
-template <typename HybridT>
-class CallbackHandleMap {
+template <typename HybridT> class CallbackHandleMap {
 public:
-    /// Singleton accessor. Lifetime is process lifetime — uniffi's
-    /// callback registration semantics don't have a teardown moment
-    /// that we could hook to drop the map.
-    static CallbackHandleMap& instance() {
-        static CallbackHandleMap inst;
-        return inst;
-    }
+  /// Singleton accessor. Lifetime is process lifetime — uniffi's
+  /// callback registration semantics don't have a teardown moment
+  /// that we could hook to drop the map.
+  static CallbackHandleMap &instance() {
+    static CallbackHandleMap inst;
+    return inst;
+  }
 
-    /// Register a new instance and return its handle. The map takes
-    /// shared ownership of the instance — callers can drop their own
-    /// shared_ptr immediately and it'll stay alive until `remove` is
-    /// called.
-    uint64_t insert(std::shared_ptr<HybridT> instance) {
-        std::lock_guard<std::mutex> guard(mu_);
-        uint64_t handle = next_++;
-        if (handle == 0) {
-            // Handle 0 is reserved as "null / not present" by uniffi's
-            // wire format for optional callbacks. Skip it on wrap.
-            handle = next_++;
-        }
-        map_.emplace(handle, std::move(instance));
-        return handle;
+  /// Register a new instance and return its handle. The map takes
+  /// shared ownership of the instance — callers can drop their own
+  /// shared_ptr immediately and it'll stay alive until `remove` is
+  /// called.
+  uint64_t insert(std::shared_ptr<HybridT> instance) {
+    std::lock_guard<std::mutex> guard(mu_);
+    uint64_t handle = next_++;
+    if (handle == 0) {
+      // Handle 0 is reserved as "null / not present" by uniffi's
+      // wire format for optional callbacks. Skip it on wrap.
+      handle = next_++;
     }
+    map_.emplace(handle, std::move(instance));
+    return handle;
+  }
 
-    /// Look up the instance for a given handle. Throws if the handle
-    /// is unknown — that would mean Rust held a stale handle past the
-    /// `free` call, which is a uniffi protocol violation.
-    std::shared_ptr<HybridT> get(uint64_t handle) const {
-        std::lock_guard<std::mutex> guard(mu_);
-        auto it = map_.find(handle);
-        if (it == map_.end()) {
-            throw std::runtime_error(
-                "CallbackHandleMap: unknown handle (use-after-free?)");
-        }
-        return it->second;
+  /// Look up the instance for a given handle. Throws if the handle
+  /// is unknown — that would mean Rust held a stale handle past the
+  /// `free` call, which is a uniffi protocol violation.
+  std::shared_ptr<HybridT> get(uint64_t handle) const {
+    std::lock_guard<std::mutex> guard(mu_);
+    auto it = map_.find(handle);
+    if (it == map_.end()) {
+      throw std::runtime_error(
+          "CallbackHandleMap: unknown handle (use-after-free?)");
     }
+    return it->second;
+  }
 
-    /// Drop the entry for `handle`. After this, the underlying
-    /// HybridObject's shared_ptr refcount drops by one — if the
-    /// foreign side has already released its reference, the dtor
-    /// fires here.
-    void remove(uint64_t handle) {
-        std::lock_guard<std::mutex> guard(mu_);
-        map_.erase(handle);
-    }
+  /// Drop the entry for `handle`. After this, the underlying
+  /// HybridObject's shared_ptr refcount drops by one — if the
+  /// foreign side has already released its reference, the dtor
+  /// fires here.
+  void remove(uint64_t handle) {
+    std::lock_guard<std::mutex> guard(mu_);
+    map_.erase(handle);
+  }
 
 private:
-    CallbackHandleMap() = default;
+  CallbackHandleMap() = default;
 
-    mutable std::mutex mu_;
-    std::unordered_map<uint64_t, std::shared_ptr<HybridT>> map_;
-    // Start at 1 so 0 is reserved (uniffi treats handle 0 as "no
-    // instance" for optional callback args).
-    std::atomic<uint64_t> next_{1};
+  mutable std::mutex mu_;
+  std::unordered_map<uint64_t, std::shared_ptr<HybridT>> map_;
+  // Start at 1 so 0 is reserved (uniffi treats handle 0 as "no
+  // instance" for optional callback args).
+  std::atomic<uint64_t> next_{1};
 };
 
 } // namespace ubrn::nitro

@@ -39,30 +39,30 @@ namespace ubrn::nitro {
 // per-method body stays uniform across primitive vs compound returns.
 // -----------------------------------------------------------------------
 
-inline uint8_t  lower_u8 (uint8_t  v) noexcept { return v; }
+inline uint8_t lower_u8(uint8_t v) noexcept { return v; }
 inline uint16_t lower_u16(uint16_t v) noexcept { return v; }
 inline uint32_t lower_u32(uint32_t v) noexcept { return v; }
 inline uint64_t lower_u64(uint64_t v) noexcept { return v; }
-inline int8_t   lower_i8 (int8_t   v) noexcept { return v; }
-inline int16_t  lower_i16(int16_t  v) noexcept { return v; }
-inline int32_t  lower_i32(int32_t  v) noexcept { return v; }
-inline int64_t  lower_i64(int64_t  v) noexcept { return v; }
-inline float    lower_f32(float    v) noexcept { return v; }
-inline double   lower_f64(double   v) noexcept { return v; }
+inline int8_t lower_i8(int8_t v) noexcept { return v; }
+inline int16_t lower_i16(int16_t v) noexcept { return v; }
+inline int32_t lower_i32(int32_t v) noexcept { return v; }
+inline int64_t lower_i64(int64_t v) noexcept { return v; }
+inline float lower_f32(float v) noexcept { return v; }
+inline double lower_f64(double v) noexcept { return v; }
 // uniffi wire-encodes bool as int8 to keep ABI portable.
-inline int8_t   lower_bool(bool    v) noexcept { return v ? 1 : 0; }
+inline int8_t lower_bool(bool v) noexcept { return v ? 1 : 0; }
 
-inline uint8_t  lift_u8 (uint8_t  v) noexcept { return v; }
+inline uint8_t lift_u8(uint8_t v) noexcept { return v; }
 inline uint16_t lift_u16(uint16_t v) noexcept { return v; }
 inline uint32_t lift_u32(uint32_t v) noexcept { return v; }
 inline uint64_t lift_u64(uint64_t v) noexcept { return v; }
-inline int8_t   lift_i8 (int8_t   v) noexcept { return v; }
-inline int16_t  lift_i16(int16_t  v) noexcept { return v; }
-inline int32_t  lift_i32(int32_t  v) noexcept { return v; }
-inline int64_t  lift_i64(int64_t  v) noexcept { return v; }
-inline float    lift_f32(float    v) noexcept { return v; }
-inline double   lift_f64(double   v) noexcept { return v; }
-inline bool     lift_bool(int8_t  v) noexcept { return v != 0; }
+inline int8_t lift_i8(int8_t v) noexcept { return v; }
+inline int16_t lift_i16(int16_t v) noexcept { return v; }
+inline int32_t lift_i32(int32_t v) noexcept { return v; }
+inline int64_t lift_i64(int64_t v) noexcept { return v; }
+inline float lift_f32(float v) noexcept { return v; }
+inline double lift_f64(double v) noexcept { return v; }
+inline bool lift_bool(int8_t v) noexcept { return v != 0; }
 
 // -----------------------------------------------------------------------
 // std::string.
@@ -80,11 +80,11 @@ inline bool     lift_bool(int8_t  v) noexcept { return v != 0; }
 /// the generated method wraps the buffer in a `RustBufferOwned` (see
 /// `rust_buffer.hpp`) which frees on scope exit.
 inline std::string lift_string(RustBuffer buf) {
-    if (buf.data == nullptr || buf.len == 0) {
-        return {};
-    }
-    return std::string(reinterpret_cast<const char*>(buf.data),
-                       static_cast<size_t>(buf.len));
+  if (buf.data == nullptr || buf.len == 0) {
+    return {};
+  }
+  return std::string(reinterpret_cast<const char *>(buf.data),
+                     static_cast<size_t>(buf.len));
 }
 
 // -----------------------------------------------------------------------
@@ -97,16 +97,16 @@ inline std::string lift_string(RustBuffer buf) {
 // -----------------------------------------------------------------------
 
 inline std::chrono::system_clock::time_point lift_timestamp(RustBuffer buf) {
-    RustBufferReader r{buf};
-    return r.read_timestamp();
+  RustBufferReader r{buf};
+  return r.read_timestamp();
 }
 
-template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus*),
-          RustBuffer (*Reserve)(RustBuffer, uint64_t, UniffiRustCallStatus*)>
+template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus *),
+          RustBuffer (*Reserve)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline RustBuffer lower_timestamp(std::chrono::system_clock::time_point tp) {
-    RustBufferWriter<Alloc, Reserve> w;
-    w.write_timestamp(tp);
-    return w.finish();
+  RustBufferWriter<Alloc, Reserve> w;
+  w.write_timestamp(tp);
+  return w.finish();
 }
 
 // -----------------------------------------------------------------------
@@ -118,36 +118,36 @@ inline RustBuffer lower_timestamp(std::chrono::system_clock::time_point tp) {
 // -----------------------------------------------------------------------
 
 inline double lift_duration(RustBuffer buf) {
-    RustBufferReader r{buf};
-    return r.read_duration();
+  RustBufferReader r{buf};
+  return r.read_duration();
 }
 
-template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus*),
-          RustBuffer (*Reserve)(RustBuffer, uint64_t, UniffiRustCallStatus*)>
+template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus *),
+          RustBuffer (*Reserve)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline RustBuffer lower_duration(double ms) {
-    RustBufferWriter<Alloc, Reserve> w;
-    w.write_duration(ms);
-    return w.finish();
+  RustBufferWriter<Alloc, Reserve> w;
+  w.write_duration(ms);
+  return w.finish();
 }
 
 /// Lower a `std::string` to a uniffi `RustBuffer`. Allocates a new
 /// Rust-owned buffer via the provided namespace allocator and copies
 /// `s` into it. Ownership of the returned buffer transfers to the Rust
 /// callee — *do not* free on the C++ side.
-template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus*)>
-inline RustBuffer lower_string(const std::string& s) {
-    UniffiRustCallStatus status{};
-    RustBuffer buf = Alloc(static_cast<uint64_t>(s.size()), &status);
-    if (status.code != 0) {
-        throw std::runtime_error("RustBuffer alloc for string lower failed");
-    }
-    if (!s.empty()) {
-        std::memcpy(buf.data, s.data(), s.size());
-        buf.len = static_cast<uint64_t>(s.size());
-    } else {
-        buf.len = 0;
-    }
-    return buf;
+template <RustBuffer (*Alloc)(uint64_t, UniffiRustCallStatus *)>
+inline RustBuffer lower_string(const std::string &s) {
+  UniffiRustCallStatus status{};
+  RustBuffer buf = Alloc(static_cast<uint64_t>(s.size()), &status);
+  if (status.code != 0) {
+    throw std::runtime_error("RustBuffer alloc for string lower failed");
+  }
+  if (!s.empty()) {
+    std::memcpy(buf.data, s.data(), s.size());
+    buf.len = static_cast<uint64_t>(s.size());
+  } else {
+    buf.len = 0;
+  }
+  return buf;
 }
 
 } // namespace ubrn::nitro

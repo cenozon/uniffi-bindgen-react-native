@@ -27,8 +27,8 @@ static const char *s_jslib =
 #include <jsi/instrumentation.h>
 
 // Nitro entrypoint + Dispatcher implementation backed by a react::CallInvoker.
-#include <InstallNitro.hpp>
 #include <CallInvokerDispatcher.hpp>
+#include <InstallNitro.hpp>
 
 /// Read the contents of a file into a string.
 static std::optional<std::string> readFile(const char *path) {
@@ -116,13 +116,14 @@ static std::shared_ptr<facebook::jsi::Runtime> createRuntime() {
   // bind `X` and any later `var.X = X` reference throws
   // `ReferenceError: Property 'X' doesn't exist`. Forcing eager compilation
   // makes the class transform run uniformly.
-  auto runtimeConfig = ::hermes::vm::RuntimeConfig::Builder()
-                           .withIntl(false)
-                           .withMicrotaskQueue(true)
-                           .withES6Class(true)
-                           .withEnableBlockScoping(true)
-                           .withCompilationMode(::hermes::vm::ForceEagerCompilation)
-                           .build();
+  auto runtimeConfig =
+      ::hermes::vm::RuntimeConfig::Builder()
+          .withIntl(false)
+          .withMicrotaskQueue(true)
+          .withES6Class(true)
+          .withEnableBlockScoping(true)
+          .withCompilationMode(::hermes::vm::ForceEagerCompilation)
+          .build();
   return facebook::hermes::makeHermesRuntime(runtimeConfig);
 }
 
@@ -155,8 +156,9 @@ registerNativeLibraries(facebook::jsi::Runtime &rt,
 /// Must be called *before* any registered HybridObject constructor is invoked
 /// from JS, but Nitro doesn't care if it's called before or after a lib's
 /// `registerNatives()` populates the `HybridObjectRegistry`.
-static void installNitro(facebook::jsi::Runtime &runtime,
-                         std::shared_ptr<facebook::react::CallInvoker> invoker) {
+static void
+installNitro(facebook::jsi::Runtime &runtime,
+             std::shared_ptr<facebook::react::CallInvoker> invoker) {
   auto dispatcher =
       std::make_shared<margelo::nitro::CallInvokerDispatcher>(invoker);
   margelo::nitro::install(runtime, dispatcher);

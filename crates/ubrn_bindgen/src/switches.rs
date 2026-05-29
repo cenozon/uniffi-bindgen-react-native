@@ -33,7 +33,8 @@ pub enum AbiFlavor {
     Napi,
     /// Nitro Modules — one Nitro `HybridObject` per uniffi interface, no
     /// globalThis JSI host object middle layer. Methods invoke the uniffi
-    /// C ABI directly via the `@ubrn/nitro-runtime` headers.
+    /// C ABI directly via the in-tree nitro-uniffi headers
+    /// (`<NitroUniffi.hpp>`).
     Nitro,
     #[cfg(feature = "wasm")]
     Wasm,

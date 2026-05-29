@@ -21,9 +21,12 @@ use super::Bootstrap;
 pub(crate) struct NitroTestRunnerCmd;
 
 impl NitroTestRunnerCmd {
+    /// Shared test-harness source dir. Its single CMakeLists defines both
+    /// `test-runner` (JSI) and `test-runner-nitro`; we configure with the
+    /// NITRO_* vars set and build only the Nitro target (see `prepare`).
     fn src_dir() -> Result<Utf8PathBuf> {
         let root = repository_root()?;
-        Ok(root.join("cpp").join("test-harness-nitro"))
+        Ok(root.join("cpp").join("test-harness"))
     }
 
     fn build_dir() -> Result<Utf8PathBuf> {
@@ -103,12 +106,20 @@ impl Bootstrap for NitroTestRunnerCmd {
 
         run_cmd(&mut cmd)?;
 
+        // The shared CMakeLists also defines the JSI `test-runner` target;
+        // build only the Nitro one here.
         if cfg!(target_os = "windows") {
             let mut cmd = Command::new("cmake");
-            run_cmd(cmd.current_dir(&dir).arg("--build").arg(&dir))?;
+            run_cmd(
+                cmd.current_dir(&dir)
+                    .arg("--build")
+                    .arg(&dir)
+                    .arg("--target")
+                    .arg("test-runner-nitro"),
+            )?;
         } else {
             let mut cmd = Command::new("ninja");
-            run_cmd(cmd.current_dir(&dir))?;
+            run_cmd(cmd.current_dir(&dir).arg("test-runner-nitro"))?;
         }
 
         Ok(())

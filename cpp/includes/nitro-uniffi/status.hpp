@@ -34,10 +34,10 @@ namespace ubrn::nitro {
 /// `RustCallStatusCode` enum on the Rust side
 /// (uniffi_core::ffi::rustcalls::RustCallStatusCode).
 enum class RustCallStatusCode : int8_t {
-    Success = 0,
-    Error = 1,
-    UnexpectedError = 2,
-    Cancelled = 3,
+  Success = 0,
+  Error = 1,
+  UnexpectedError = 2,
+  Cancelled = 3,
 };
 
 /// Exception thrown when uniffi returns a typed error (`code == 1`). Holds
@@ -48,24 +48,23 @@ enum class RustCallStatusCode : int8_t {
 /// invoke a Rust allocator deallocation hook from a destructor.
 class UniffiTypedError : public std::runtime_error {
 public:
-    UniffiTypedError(RustBuffer error_buf)
-        : std::runtime_error("uniffi typed error (decode the error buffer)"),
-          error_buf_(error_buf),
-          released_(false) {}
+  UniffiTypedError(RustBuffer error_buf)
+      : std::runtime_error("uniffi typed error (decode the error buffer)"),
+        error_buf_(error_buf), released_(false) {}
 
-    /// Hand ownership of the buffer to the caller. The caller is responsible
-    /// for freeing it via the project's per-namespace
-    /// `ffi_<crate>_rustbuffer_free` symbol after decoding.
-    RustBuffer release() {
-        released_ = true;
-        return error_buf_;
-    }
+  /// Hand ownership of the buffer to the caller. The caller is responsible
+  /// for freeing it via the project's per-namespace
+  /// `ffi_<crate>_rustbuffer_free` symbol after decoding.
+  RustBuffer release() {
+    released_ = true;
+    return error_buf_;
+  }
 
-    ~UniffiTypedError() override = default;
+  ~UniffiTypedError() override = default;
 
 private:
-    RustBuffer error_buf_;
-    bool released_;
+  RustBuffer error_buf_;
+  bool released_;
 };
 
 /// Exception thrown for `code == 2`/`code == 3` paths — the Rust side
@@ -74,24 +73,24 @@ private:
 /// it carries no further state.
 class UniffiUnexpectedError : public std::runtime_error {
 public:
-    using std::runtime_error::runtime_error;
+  using std::runtime_error::runtime_error;
 };
 
 /// Default-construct a status struct in the "no error yet" state. The C-ABI
 /// requires status be zero-initialized — `{}` does that, but spelling it
 /// out makes the precondition obvious in generated code.
 inline UniffiRustCallStatus make_status() noexcept {
-    UniffiRustCallStatus s{};
-    s.code = static_cast<int8_t>(RustCallStatusCode::Success);
-    s.error_buf = RustBuffer{};
-    return s;
+  UniffiRustCallStatus s{};
+  s.code = static_cast<int8_t>(RustCallStatusCode::Success);
+  s.error_buf = RustBuffer{};
+  return s;
 }
 
 // Forward declaration — definition is below `check_status`; without this
 // forward decl the unqualified `decode_string_and_free` call inside the
 // `check_status` template body fails name lookup at the point of use.
 template <typename FreeFn>
-inline std::string decode_string_and_free(RustBuffer buf, FreeFn&& free_buffer);
+inline std::string decode_string_and_free(RustBuffer buf, FreeFn &&free_buffer);
 
 /// Post-call status check. If the call succeeded, returns immediately. If
 /// it raised a typed error, throws `UniffiTypedError` carrying the error
@@ -104,24 +103,25 @@ inline std::string decode_string_and_free(RustBuffer buf, FreeFn&& free_buffer);
 /// (`ffi_<crate>_rustbuffer_free`) — the generated code captures the right
 /// one in a lambda at the call site.
 template <typename FreeFn>
-inline void check_status(const UniffiRustCallStatus& status, FreeFn&& free_buffer) {
-    switch (static_cast<RustCallStatusCode>(status.code)) {
-        case RustCallStatusCode::Success:
-            return;
-        case RustCallStatusCode::Error:
-            // Hand the buffer off to the generated per-error decoder. We
-            // can't decode it ourselves — the variant shape is
-            // project-specific.
-            throw UniffiTypedError(status.error_buf);
-        case RustCallStatusCode::UnexpectedError: {
-            std::string message = decode_string_and_free(status.error_buf, free_buffer);
-            throw UniffiUnexpectedError(std::move(message));
-        }
-        case RustCallStatusCode::Cancelled:
-            throw UniffiUnexpectedError("uniffi call cancelled");
-    }
-    // The C ABI is in principle open-ended on `code` — defend the default.
-    throw UniffiUnexpectedError("uniffi call returned an unknown status code");
+inline void check_status(const UniffiRustCallStatus &status,
+                         FreeFn &&free_buffer) {
+  switch (static_cast<RustCallStatusCode>(status.code)) {
+  case RustCallStatusCode::Success:
+    return;
+  case RustCallStatusCode::Error:
+    // Hand the buffer off to the generated per-error decoder. We
+    // can't decode it ourselves — the variant shape is
+    // project-specific.
+    throw UniffiTypedError(status.error_buf);
+  case RustCallStatusCode::UnexpectedError: {
+    std::string message = decode_string_and_free(status.error_buf, free_buffer);
+    throw UniffiUnexpectedError(std::move(message));
+  }
+  case RustCallStatusCode::Cancelled:
+    throw UniffiUnexpectedError("uniffi call cancelled");
+  }
+  // The C ABI is in principle open-ended on `code` — defend the default.
+  throw UniffiUnexpectedError("uniffi call returned an unknown status code");
 }
 
 /// utf8-decode a uniffi RustBuffer into a `std::string`, then free the
@@ -129,14 +129,15 @@ inline void check_status(const UniffiRustCallStatus& status, FreeFn&& free_buffe
 /// layout matches `String::from_utf8` on the Rust side: bytes [0, len)
 /// from `data`, with `capacity` being the alloc-size (may exceed `len`).
 template <typename FreeFn>
-inline std::string decode_string_and_free(RustBuffer buf, FreeFn&& free_buffer) {
-    std::string out;
-    if (buf.data != nullptr && buf.len > 0) {
-        out.assign(reinterpret_cast<const char*>(buf.data),
-                   static_cast<size_t>(buf.len));
-    }
-    free_buffer(buf);
-    return out;
+inline std::string decode_string_and_free(RustBuffer buf,
+                                          FreeFn &&free_buffer) {
+  std::string out;
+  if (buf.data != nullptr && buf.len > 0) {
+    out.assign(reinterpret_cast<const char *>(buf.data),
+               static_cast<size_t>(buf.len));
+  }
+  free_buffer(buf);
+  return out;
 }
 
 } // namespace ubrn::nitro

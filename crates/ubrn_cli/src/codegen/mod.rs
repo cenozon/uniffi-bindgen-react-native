@@ -293,13 +293,8 @@ mod tests {
 
         let project_config = config::ProjectConfig::empty(name, crate_config);
         let modules = modules.iter().map(|s| ModuleMetadata::new(s)).collect();
-        let template = TemplateConfig::new(
-            project_config,
-            crate_metadata,
-            modules,
-            Vec::new(),
-            false,
-        );
+        let template =
+            TemplateConfig::new(project_config, crate_metadata, modules, Vec::new(), false);
         Ok(Rc::new(template))
     }
 
@@ -386,7 +381,6 @@ mod tests {
         assert!(s.contains("list of modules = ['NativeAlice', 'NativeBob', 'NativeCharlie']"));
         Ok(())
     }
-
 
     // -----------------------------------------------------------------
     // Nitro backend tests
@@ -573,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nitro_package_kt_triggers_loadLibrary_via_companion_init() -> Result<()> {
+    fn test_nitro_package_kt_triggers_load_library_via_companion_init() -> Result<()> {
         let config = nitro_template_config("react-native-acme", &["alice"])?;
         let file = nitro::codegen::NitroPackageKt::new(config.clone());
         let s = file.dyn_render()?;
@@ -595,9 +589,7 @@ mod tests {
         let file = nitro::codegen::ReactNativeConfig::new(config.clone());
         let s = file.dyn_render()?;
         assert!(s.contains("module.exports = {"));
-        assert!(s.contains(
-            "packageImportPath: 'import com.margelo.nitro.acme.AcmePackage;'"
-        ));
+        assert!(s.contains("packageImportPath: 'import com.margelo.nitro.acme.AcmePackage;'"));
         assert!(s.contains("packageInstance: 'new AcmePackage()'"));
         assert!(s.contains("sourceDir: './android'"));
         assert!(s.contains(".podspec"));
@@ -624,9 +616,9 @@ mod tests {
         let config = nitro_template_config("react-native-acme", &["alice"])?;
         let file = nitro::codegen::NitroPodspec::new(config.clone());
         let s = file.dyn_render()?;
-        assert!(s.contains(
-            r#"load File.join(__dir__, "nitrogen/generated/ios/Acme+autolinking.rb")"#
-        ));
+        assert!(
+            s.contains(r#"load File.join(__dir__, "nitrogen/generated/ios/Acme+autolinking.rb")"#)
+        );
         assert!(s.contains("add_nitrogen_files(s)"));
         assert!(s.contains("vendored_frameworks ="));
         // TurboModule-era fallbacks must not bring in turbomodule/core.
@@ -797,8 +789,7 @@ mod tests {
         // Reordered input produces identical output.
         let mut shuffled = hybrids.to_vec();
         shuffled.reverse();
-        let cfg3 =
-            nitro_template_config_with_hybrids("react-native-acme", &["alice"], &shuffled)?;
+        let cfg3 = nitro_template_config_with_hybrids("react-native-acme", &["alice"], &shuffled)?;
         let s3 = nitro::codegen::NitroJson::new(cfg3).dyn_render()?;
         assert_eq!(s1, s3, "emission must be invariant under input ordering");
         Ok(())

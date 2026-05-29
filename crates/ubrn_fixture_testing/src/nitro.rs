@@ -14,8 +14,7 @@
 //!      `register_natives.cpp`, linked against the fixture cdylib + the
 //!      bootstrapped NitroModules library.
 //!   5. tsc + metro-bundle the test script (reusing the JSI pipeline,
-//!      with `react-native-nitro-modules` and `@ubrn/nitro-runtime`
-//!      registered as `extraNodeModules`).
+//!      with `react-native-nitro-modules` registered as `extraNodeModules`).
 //!   6. Invoke `test-runner-nitro <bundle.js> <fixture.so>`.
 //!
 //! A missing bootstrap artifact *skips* the test (`eprintln!` + early
@@ -52,8 +51,8 @@ pub fn run_test(crate_name: &str, test_script: &str, target_tmpdir: &str) {
     let test_stem = test_script.file_stem().unwrap_or("test");
 
     // Per-test output directory.
-    let out_dir = Utf8PathBuf::from(target_tmpdir)
-        .join(format!("ubrn-tests/{crate_name}-{test_stem}-nitro"));
+    let out_dir =
+        Utf8PathBuf::from(target_tmpdir).join(format!("ubrn-tests/{crate_name}-{test_stem}-nitro"));
     std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
 
     // Step 1: Build the fixture crate (so the cdylib + uniffi metadata
@@ -80,13 +79,11 @@ pub fn run_test(crate_name: &str, test_script: &str, target_tmpdir: &str) {
     let target_dir = &metadata::workspace_metadata().target_directory;
     let so_file = compile_cpp(&cpp_dir, &out_dir, &lib_name, target_dir);
 
-    // Step 4: Bundle the TS test. `react-native-nitro-modules` and
-    // `@ubrn/nitro-runtime` are vendored (not in `node_modules`) so we
-    // register them as Metro `extraNodeModules` + TSC `paths` entries.
-    // Bind the owned PathBufs first so the `&Utf8Path` borrows below
-    // outlive the slice.
+    // Step 4: Bundle the TS test. `react-native-nitro-modules` is vendored
+    // (not in `node_modules`) so we register it as a Metro `extraNodeModules`
+    // + TSC `paths` entry. Bind the owned PathBuf first so the `&Utf8Path`
+    // borrow below outlives the slice.
     let nitro_modules_pkg = paths::nitro_modules_pkg_dir();
-    let ubrn_nitro_runtime_pkg = paths::ubrn_nitro_runtime_pkg_dir();
     // `react-native-nitro-modules` statically requires `react-native` and
     // `react-native-worklets` (the latter inside a try/catch at runtime,
     // but Metro still chokes if it can't resolve the spec). Materialize
@@ -96,7 +93,6 @@ pub fn run_test(crate_name: &str, test_script: &str, target_tmpdir: &str) {
     let rn_worklets_stub = make_stub_module(&stubs_root, "react-native-worklets");
     let extras: &[(&str, &Utf8Path)] = &[
         ("react-native-nitro-modules", nitro_modules_pkg.as_path()),
-        ("@ubrn/nitro-runtime", ubrn_nitro_runtime_pkg.as_path()),
         ("react-native", rn_stub.as_path()),
         ("react-native-worklets", rn_worklets_stub.as_path()),
     ];
@@ -108,7 +104,7 @@ pub fn run_test(crate_name: &str, test_script: &str, target_tmpdir: &str) {
         // `react-native-nitro-modules` ships a `.web.js` whose proxy
         // throws on every access. Pin Metro to a non-web platform so it
         // resolves to the bare `.js` that checks `global.NitroModulesProxy`
-        // (which `installNitro()` set up in the desktop runner).
+        // (which `installNitro()` set up in the host runner).
         Some("ios"),
     );
 
@@ -155,8 +151,7 @@ fn compile_cpp(
     for entry in read_dir.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("cpp") {
-            let canonical =
-                dunce::canonicalize(&path).expect("failed to canonicalize cpp path");
+            let canonical = dunce::canonicalize(&path).expect("failed to canonicalize cpp path");
             cpp_files.push(canonical.to_string_lossy().to_string());
         }
     }
@@ -167,13 +162,7 @@ fn compile_cpp(
 
     // Write the CMakeLists into the build dir to keep generated files
     // out of the source tree (mirrors the nitro-build bootstrap strategy).
-    let cmake_lists = write_cmake_lists(
-        &build_dir,
-        &cpp_files,
-        cpp_dir,
-        lib_name,
-        target_dir,
-    );
+    let cmake_lists = write_cmake_lists(&build_dir, &cpp_files, cpp_dir, lib_name, target_dir);
 
     // cmake configure
     let mut cmd = Command::new("cmake");
@@ -208,9 +197,9 @@ fn compile_cpp(
 /// Write a CMakeLists.txt for the per-fixture shared library. We don't
 /// reuse `cpp/hermes-rust-extension/CMakeLists.txt` because Nitro needs:
 ///   - `CMAKE_CXX_STANDARD 20` (vs 20 in jsi-rust-extension, but the
-///      header set is wholly different — Nitro core + nitro-uniffi).
-///   - The Nitro core headers + `@ubrn/nitro-runtime` (`runtimes/nitro/cpp`)
-///      on the include path.
+///     header set is wholly different — Nitro core + nitro-uniffi).
+///   - The Nitro core headers + the in-tree nitro-uniffi headers
+///     (`cpp/includes`) on the include path.
 ///   - The fixture cdylib *and* `libNitroModules` on the link line.
 fn write_cmake_lists(
     build_dir: &Utf8Path,
@@ -226,11 +215,10 @@ fn write_cmake_lists(
     let nitro_cpp_src = paths::nitro_cpp_src_dir();
     let nitro_lib_dir = paths::nitro_build_dir();
     let nitro_flat_include_dir = paths::nitro_flat_include_dir();
-    let ubrn_nitro_runtime_cpp = paths::ubrn_nitro_runtime_pkg_dir().join("cpp");
-    let cpp_gen_dir_abs = dunce::canonicalize(cpp_gen_dir.as_std_path())
-        .expect("failed to canonicalize cpp gen dir");
-    let cpp_gen_dir_abs = Utf8PathBuf::from_path_buf(cpp_gen_dir_abs)
-        .expect("non-UTF-8 cpp gen path");
+    let cpp_gen_dir_abs =
+        dunce::canonicalize(cpp_gen_dir.as_std_path()).expect("failed to canonicalize cpp gen dir");
+    let cpp_gen_dir_abs =
+        Utf8PathBuf::from_path_buf(cpp_gen_dir_abs).expect("non-UTF-8 cpp gen path");
     let rust_target_dir = target_dir.join("debug");
 
     let cmake = format!(
@@ -276,9 +264,9 @@ target_include_directories({target_name} PRIVATE
     # this with symlinks/copies of every Nitro .hpp so generated sources
     # can resolve `<NitroModules/Foo.hpp>`-style includes.
     "{nitro_flat_include_dir}"
-    # `@ubrn/nitro-runtime` headers (lift/lower converters, handle helpers, …).
-    "{ubrn_nitro_runtime_cpp}"
-    # In-tree shared headers + stubs (provides ReactCommon/CallInvoker.h).
+    # In-tree shared headers + stubs: provides ReactCommon/CallInvoker.h and
+    # the nitro-uniffi headers (`<NitroUniffi.hpp>` + `nitro-uniffi/*.hpp`)
+    # that generated code includes.
     "{repo_root_cpp}/includes"
     "{repo_root_cpp}/stubs"
 )
@@ -331,7 +319,7 @@ endif ()
 /// resolve `require('<name>')` (and any sub-path require) to *something*
 /// during bundling. The package exports an empty CommonJS object — both
 /// `react-native` and `react-native-worklets` are only referenced inside
-/// try/catch (or not exercised at all in the desktop tests), so an empty
+/// try/catch (or not exercised at all in the host tests), so an empty
 /// surface is enough to keep the bundle resolution happy.
 ///
 /// Extra subpaths can be requested to cover deep imports like
@@ -356,7 +344,7 @@ fn make_stub_module(root: &Utf8Path, name: &str) -> Utf8PathBuf {
     if name == "react-native" {
         // `react-native-nitro-modules` reaches into a couple of
         // deep-import paths at bundle-time even though the resulting
-        // code never runs on desktop. Materialize stubs for each.
+        // code never runs on the host. Materialize stubs for each.
         for sub in [
             "Libraries/NativeComponent/NativeComponentRegistry",
             "Libraries/NativeComponent/NativeComponentRegistry.js",
@@ -371,7 +359,7 @@ fn make_stub_module(root: &Utf8Path, name: &str) -> Utf8PathBuf {
     dir
 }
 
-/// Invoke the desktop Nitro test runner with the bundled JS + the per-
+/// Invoke the host Nitro test runner with the bundled JS + the per-
 /// fixture shared library that exports `registerNatives`.
 fn run_test_runner(bundle: &Utf8Path, so_file: &Utf8Path) {
     let runner = paths::nitro_test_runner_binary();

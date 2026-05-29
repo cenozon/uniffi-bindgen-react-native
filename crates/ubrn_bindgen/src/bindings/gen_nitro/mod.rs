@@ -26,7 +26,7 @@
 //!
 //! * `<cpp_dir>/Hybrid<Namespace>Api.{hpp,cpp}` — the C++ impl class for
 //!   the namespace API HybridObject. Each method body invokes the
-//!   corresponding uniffi C-ABI symbol via the `@ubrn/nitro-runtime`
+//!   corresponding uniffi C-ABI symbol via the nitro-uniffi
 //!   helpers (`lower_*` / `lift_*` / `check_status`).
 //!
 //! * `<cpp_dir>/Hybrid<Interface>.{hpp,cpp}` — one pair per uniffi
@@ -45,9 +45,9 @@
 //! returned from [`generate_all`] alongside the per-module
 //! [`ModuleMetadata`].
 
+mod cpp;
 mod model;
 mod ts;
-mod cpp;
 
 use std::collections::BTreeSet;
 
@@ -138,7 +138,7 @@ pub fn generate_all(
 
     let hybrid_objects: Vec<HybridObjectEntry> = hybrid_objects.into_iter().collect();
 
-    // Single project-level `register_natives.cpp` — the desktop Nitro
+    // Single project-level `register_natives.cpp` — the host Nitro
     // test runner `dlopen`s the cdylib and looks up
     // `extern "C" void registerNatives(jsi::Runtime&)`. Mobile builds
     // rely on Android `JNI_OnLoad` / iOS `+ load` autolinking instead,
@@ -155,6 +155,9 @@ pub fn generate_all(
 // Convenience accessor for callers that own a fully populated
 // `NitroEmission` and just need the autolinking entries as a sorted slice.
 impl NitroEmission {
+    // Part of the public emission surface; not yet exercised in-tree (the
+    // autolinking entries are consumed via the template render path today).
+    #[allow(dead_code)]
     pub fn hybrid_objects(&self) -> &[HybridObjectEntry] {
         &self.hybrid_objects
     }

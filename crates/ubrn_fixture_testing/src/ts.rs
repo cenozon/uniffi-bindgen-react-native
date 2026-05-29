@@ -52,14 +52,10 @@ pub fn run_test(test_script: &str, flavor: Flavor, target_tmpdir: &str) {
             }
             let _lock = crate::lock_fixture();
             let nitro_modules_pkg = paths::nitro_modules_pkg_dir();
-            let ubrn_nitro_runtime_pkg = paths::ubrn_nitro_runtime_pkg_dir();
-            let extras: &[(&str, &camino::Utf8Path)] = &[
-                ("react-native-nitro-modules", nitro_modules_pkg.as_path()),
-                ("@ubrn/nitro-runtime", ubrn_nitro_runtime_pkg.as_path()),
-            ];
-            let bundle = typescript::prepare_for_jsi_with_extras(
-                test_script, &out_dir, None, extras,
-            );
+            let extras: &[(&str, &camino::Utf8Path)] =
+                &[("react-native-nitro-modules", nitro_modules_pkg.as_path())];
+            let bundle =
+                typescript::prepare_for_jsi_with_extras(test_script, &out_dir, None, extras);
             run_test_runner_nitro_no_lib(&bundle);
         }
     }

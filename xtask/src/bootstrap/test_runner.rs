@@ -76,12 +76,21 @@ impl Bootstrap for TestRunnerCmd {
 
         run_cmd(&mut cmd)?;
 
+        // The shared CMakeLists defines both `test-runner` and (when the
+        // NITRO_* vars are set, which they aren't here) `test-runner-nitro`;
+        // build only the JSI target.
         if cfg!(target_os = "windows") {
             let mut cmd = Command::new("cmake");
-            run_cmd(cmd.current_dir(&dir).arg("--build").arg(&dir))?;
+            run_cmd(
+                cmd.current_dir(&dir)
+                    .arg("--build")
+                    .arg(&dir)
+                    .arg("--target")
+                    .arg("test-runner"),
+            )?;
         } else {
             let mut cmd = Command::new("ninja");
-            run_cmd(cmd.current_dir(&dir))?;
+            run_cmd(cmd.current_dir(&dir).arg("test-runner"))?;
         }
 
         Ok(())

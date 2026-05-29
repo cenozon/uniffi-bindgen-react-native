@@ -62,19 +62,21 @@ export class ResolveLibPathError extends Error {
   }
 }
 
+// The caller-supplied shape depends on the resolution mode:
+// - override mode: callerUrl is unused by the resolver, so it's optional —
+//   generated bindings that bake an absolute path in (e.g. via
+//   `--lib-absolute`) omit it entirely so the output stays valid under CJS,
+//   where `import.meta.url` would otherwise be a syntax error.
+// - npmPackageBase mode: callerUrl anchors `createRequire(callerUrl)`.
+// - colocated mode: callerUrl is the path the lib must sit next to.
+type ResolveLibPathSource =
+  | { override: string; npmPackageBase?: never; callerUrl?: string }
+  | { npmPackageBase: string; override?: never; callerUrl: string }
+  | { override?: never; npmPackageBase?: never; callerUrl: string };
+
 export type ResolveLibPathOptions = {
   crateName: string;
-} & (
-  // override mode: callerUrl is unused by the resolver, so it's optional —
-  // generated bindings that bake an absolute path in (e.g. via
-  // `--lib-absolute`) omit it entirely so the output stays valid under CJS,
-  // where `import.meta.url` would otherwise be a syntax error.
-  | { override: string; npmPackageBase?: never; callerUrl?: string }
-  // npmPackageBase mode: callerUrl anchors `createRequire(callerUrl)`.
-  | { npmPackageBase: string; override?: never; callerUrl: string }
-  // colocated mode: callerUrl is the path the lib must sit next to.
-  | { override?: never; npmPackageBase?: never; callerUrl: string }
-);
+} & ResolveLibPathSource;
 
 function callerDir(callerUrl: string): string {
   const path = callerUrl.startsWith("file://")

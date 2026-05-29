@@ -49,7 +49,7 @@ fn find_built_cdylib(crate_lib_name: &str) -> Option<Utf8PathBuf> {
     for c in candidates {
         let p = workspace_root.join(c);
         if p.exists() {
-            return Some(Utf8PathBuf::from_path_buf(p).ok()?);
+            return Utf8PathBuf::from_path_buf(p).ok();
         }
     }
     None
@@ -69,7 +69,7 @@ fn nitro_emit_against_coverall_cdylib() {
         .prefix("ubrn-nitro-coverall-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir")
-        .into_path();
+        .keep();
     let ts_dir = Utf8PathBuf::from_path_buf(out.join("ts")).unwrap();
     let cpp_dir = Utf8PathBuf::from_path_buf(out.join("cpp")).unwrap();
     std::fs::create_dir_all(&ts_dir).unwrap();

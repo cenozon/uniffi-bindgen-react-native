@@ -26,7 +26,7 @@ fn find_built_cdylib(crate_lib_name: &str) -> Option<Utf8PathBuf> {
     for c in candidates {
         let p = workspace_root.join(c);
         if p.exists() {
-            return Some(Utf8PathBuf::from_path_buf(p).ok()?);
+            return Utf8PathBuf::from_path_buf(p).ok();
         }
     }
     None
@@ -47,7 +47,7 @@ fn nitro_emit_against_arithmetic_cdylib() {
         .prefix("ubrn-nitro-emit-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir")
-        .into_path();
+        .keep();
     let ts_dir = Utf8PathBuf::from_path_buf(out.join("ts")).unwrap();
     let cpp_dir = Utf8PathBuf::from_path_buf(out.join("cpp")).unwrap();
     std::fs::create_dir_all(&ts_dir).unwrap();
@@ -62,7 +62,11 @@ fn nitro_emit_against_arithmetic_cdylib() {
     let args = BindingsArgs::new(switches, source, output);
 
     let outcome = args.run(None).expect("nitro emission");
-    assert_eq!(outcome.modules.len(), 1, "arithmetic has a single namespace");
+    assert_eq!(
+        outcome.modules.len(),
+        1,
+        "arithmetic has a single namespace"
+    );
     // The Nitro emission must surface its HybridObject list so the
     // project-level templates can populate `nitro.json#autolinking` and
     // the Android `CMakeLists.txt` source list. The `ArithmeticApi`
@@ -107,7 +111,7 @@ fn nitro_emit_against_arithmetic_cdylib() {
     assert!(cpp.contains("ubrn::nitro::make_status()"));
     assert!(cpp.contains("ubrn::nitro::check_status"));
 
-    // `register_natives.cpp` is the desktop-runner entry point. It must
+    // `register_natives.cpp` is the host-runner entry point. It must
     // exist, expose the `extern "C" registerNatives` symbol, and call
     // `registerHybridObjectConstructor` for the namespace API HybridObject
     // (and any per-interface impls — `ArithmeticApi` is the
@@ -126,7 +130,10 @@ fn nitro_emit_against_arithmetic_cdylib() {
     // Whitespace-insensitive match: the Askama template wraps the call
     // across multiple lines, so collapse all whitespace before the
     // substring check.
-    let normalized: String = register_natives.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized: String = register_natives
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         normalized.contains("registerHybridObjectConstructor( \"ArithmeticApi\""),
         "register_natives.cpp missing `registerHybridObjectConstructor(\"ArithmeticApi\", ...)` call:\n{register_natives}"

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 //
-// Desktop implementation of `margelo::nitro::ThreadUtils`. Nitro's core
+// Host implementation of `margelo::nitro::ThreadUtils`. Nitro's core
 // expects per-platform impls of this class (Android's lives in
 // `react-native-nitro-modules/android/.../platform/ThreadUtils.cpp`,
-// iOS's in `.../ios/platform/ThreadUtils.cpp`). For our desktop test
-// runner — used to drive emitted bindings under Hermes from cargo
+// iOS's in `.../ios/platform/ThreadUtils.cpp`). For our bare-Hermes test
+// runner — which runs on the host OS to drive emitted bindings from cargo
 // tests — we provide a minimal stub.
 //
 // The semantics are simplified: the **process-startup thread** is treated
@@ -33,17 +33,13 @@ namespace {
 const std::thread::id g_ui_thread_id = std::this_thread::get_id();
 
 /// Minimal `Dispatcher` that runs everything synchronously on the caller's
-/// thread. Sufficient for desktop test runs where the JS thread + the
+/// thread. Sufficient for host test runs where the JS thread + the
 /// "UI thread" are the same thread, and where we don't need to round-trip
 /// scheduling work through a real run loop.
 class InlineDispatcher final : public Dispatcher {
 public:
-  void runSync(std::function<void()>&& fn) override {
-    fn();
-  }
-  void runAsync(std::function<void()>&& fn) override {
-    fn();
-  }
+  void runSync(std::function<void()> &&fn) override { fn(); }
+  void runAsync(std::function<void()> &&fn) override { fn(); }
 };
 
 } // namespace
@@ -55,10 +51,10 @@ std::string ThreadUtils::getThreadName() {
     return std::string(buffer);
   }
 #endif
-  return std::string("desktop-thread");
+  return std::string("host-thread");
 }
 
-void ThreadUtils::setThreadName(const std::string& name) {
+void ThreadUtils::setThreadName(const std::string &name) {
 #if defined(__linux__)
   // Linux's pthread_setname_np caps at 15 bytes + NUL.
   pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());

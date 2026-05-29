@@ -75,7 +75,7 @@ impl BootstrapCmd {
 enum SubsystemCmd {
     /// Facebook's Javascript engine now used as default for React Native apps.
     ///
-    /// This command clones and compiles a copy for testing on the desktop.
+    /// This command clones and compiles a copy for testing on the host.
     Hermes(HermesCmd),
 
     /// The C++ test runner that takes Javascript and .so libraries and runs them against
@@ -87,7 +87,7 @@ enum SubsystemCmd {
     /// react-native-nitro-modules' C++ runtime.
     ///
     /// This command clones (or, by preference, symlinks an existing local
-    /// checkout of) nitro and builds a desktop-linkable `libNitroModules`
+    /// checkout of) nitro and builds a host-linkable `libNitroModules`
     /// against Hermes' JSI for use by the test-runner.
     Nitro(NitroCmd),
     /// The Nitro-aware counterpart to the JSI `TestRunner`. Builds a Hermes

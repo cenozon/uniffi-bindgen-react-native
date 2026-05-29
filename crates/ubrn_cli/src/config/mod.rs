@@ -29,8 +29,9 @@ pub(crate) enum Framework {
     /// Nitro Modules. ubrn emits one Nitro HybridObject per uniffi
     /// interface, one HybridObject per uniffi namespace for top-level
     /// functions, Nitro structs for records, Nitro enums for enums.
-    /// Methods call the uniffi C ABI directly via the `@ubrn/nitro-runtime`
-    /// C++ headers — there is no JSI host-object middle layer.
+    /// Methods call the uniffi C ABI directly via the in-tree nitro-uniffi
+    /// C++ headers (`<NitroUniffi.hpp>`) — there is no JSI host-object
+    /// middle layer.
     #[serde(alias = "nitroModules", alias = "nitromodules", alias = "nitro-native")]
     Nitro,
 }

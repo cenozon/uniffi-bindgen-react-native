@@ -26,8 +26,7 @@ pub fn prepare_for_jsi(
 
 /// Variant of [`prepare_for_jsi`] that registers additional Metro
 /// `extraNodeModules` entries so the bundled JS can resolve non-installed
-/// packages (e.g. `react-native-nitro-modules` and `@ubrn/nitro-runtime`
-/// for the Nitro flavor).
+/// packages (e.g. `react-native-nitro-modules` for the Nitro flavor).
 ///
 /// Each `(name, dir)` pair maps an import specifier to a package root.
 /// Entries pull double duty: they're written into both the tsconfig
@@ -58,7 +57,7 @@ pub fn prepare_for_jsi_with_extras(
 /// hint it can resolve to that file and the test would fail before
 /// it ever reaches native code. Passing `Some("ios")` makes Metro fall
 /// back to the bare `.js` (the variant that consults
-/// `global.NitroModulesProxy`, which the desktop runner installs).
+/// `global.NitroModulesProxy`, which the host runner installs).
 pub fn prepare_for_jsi_with_extras_and_platform(
     test_script: &Utf8Path,
     out_dir: &Utf8Path,
@@ -342,9 +341,7 @@ fn bundle_with_metro(
     for (name, dir) in extra_modules {
         let dir_fwd = dir.to_forward_slash();
         watch_folders.push(format!("path.resolve(\"{dir_fwd}\")"));
-        extra_node_modules.push_str(&format!(
-            "      \"{name}\": path.resolve(\"{dir_fwd}\"),\n"
-        ));
+        extra_node_modules.push_str(&format!("      \"{name}\": path.resolve(\"{dir_fwd}\"),\n"));
     }
     let watch_folders = watch_folders.join(", ");
 

@@ -14,7 +14,7 @@ pub mod ts;
 pub mod wasm;
 
 /// Test flavor: JSI (Hermes native), WASM (Node.js), Napi (Node.js N-API),
-/// or Nitro (Hermes + Nitro HybridObjects via the desktop test-runner-nitro).
+/// or Nitro (Hermes + Nitro HybridObjects via the host test-runner-nitro).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
     Jsi,
