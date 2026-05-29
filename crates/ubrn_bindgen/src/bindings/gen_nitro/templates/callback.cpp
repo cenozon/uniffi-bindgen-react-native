@@ -16,11 +16,22 @@
 // The vtable struct + ABI mirror uniffi 0.31's `UniFfiTraitVtable<Name>`
 // (uniffi_macros `export/callback_interface.rs`): repr(C) field order is
 // `uniffi_free`, `uniffi_clone`, then one fn-ptr per method in declaration
-// order. Each method fn is
-//   extern "C" void(uint64_t handle, <lowered args...>,
-//                   <Ret>* uniffi_out_return, RustCallStatus* uniffi_out_call_status)
-// i.e. the return value is written through an out-pointer and the fn itself
-// returns void (a void-returning method still takes a `&mut ()` out slot).
+// order. The per-method fn-ptr signature differs by sync/async:
+//
+//   SYNC: extern "C" void(uint64_t handle, <lowered args...>,
+//                         <Ret>* uniffi_out_return, RustCallStatus* uniffi_out_call_status)
+//     i.e. the return value is written through an out-pointer and the fn
+//     itself returns void (a void-returning method still takes a `&mut ()`
+//     out slot).
+//
+//   ASYNC: extern "C" void(uint64_t handle, <lowered args...>,
+//                          ForeignFutureCallback<RetFfiType> uniffi_callback,
+//                          uint64_t uniffi_callback_data,
+//                          ForeignFutureDroppedCallbackStruct* uniffi_out_dropped_callback)
+//     i.e. the fn returns void *immediately*; the result travels later via
+//     `uniffi_callback(uniffi_callback_data, ForeignFutureResult{...})` once
+//     the foreign (JS) future settles. This is uniffi's foreign-future ABI
+//     (see `cpp/includes/nitro-uniffi/foreign_future.hpp`).
 
 #include "{{ cb.cxx_class }}.hpp"
 #include "{{ module.codecs_header_filename() }}"
@@ -77,7 +88,7 @@ void {{ cb.cxx_class }}::loadHybridMethods() {
 }
 
 {% for method in cb.methods %}
-{{ method.return_kind.cxx_type() }} {{ cb.cxx_class }}::{{ method.cxx_name }}(
+{{ method.cxx_return_signature() }} {{ cb.cxx_class }}::{{ method.cxx_name }}(
 {%- for arg in method.args -%}
     {{ arg.ty.cxx_type() }} {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
@@ -160,11 +171,125 @@ namespace {
 using HandleMap = ubrn::nitro::CallbackHandleMap<{{ cb.cxx_class }}>;
 
 // Per-method trampolines. uniffi calls these through the vtable with the
-// handle + lowered args + an out-return pointer + a status out-param. We
-// look up the JS-side instance, lift each arg (freeing any RustBuffer arg
-// Rust handed us), invoke the method, and write the lowered result through
-// `uniffi_out_return`. JS-side exceptions surface as code=2 (unexpected).
+// handle + lowered args. For SYNC methods it also passes an out-return
+// pointer + a status out-param: we look up the JS-side instance, lift each
+// arg (freeing any RustBuffer arg Rust handed us), invoke the method, and
+// write the lowered result through `uniffi_out_return`. JS-side exceptions
+// surface as code=2 (unexpected). For ASYNC methods uniffi instead passes a
+// foreign-future callback (+ its data handle + a dropped-callback out-param):
+// we call the JS method to get a `Promise<T>`, register resolve/reject
+// continuations, and invoke `uniffi_callback(uniffi_callback_data, result)`
+// once the promise settles (the trampoline itself returns void immediately).
 {% for method in cb.methods %}
+{%- if method.is_async %}
+// Async trampoline for `{{ method.cxx_name }}` — uniffi's foreign-future ABI.
+extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
+    uint64_t self_handle
+{%- for arg in method.args %},
+    {{ arg.ty.c_type() }} {{ arg.ts_name }}_lowered
+{%- endfor %},
+    ::ubrn::nitro::ForeignFutureCallback<{{ method.return_kind.c_type() }}> uniffi_callback,
+    uint64_t uniffi_callback_data,
+    ::ubrn::nitro::ForeignFutureDroppedCallbackStruct* uniffi_out_dropped_callback
+) {
+    // We don't drive cancellation yet — hand Rust a no-op dropped callback.
+    // (uniffi's struct has a `Drop` that *calls* this fn-ptr, so it must be a
+    // real no-op function, never null.)
+    *uniffi_out_dropped_callback = ::ubrn::nitro::default_foreign_future_dropped_callback();
+    try {
+        auto self = HandleMap::instance().get(self_handle);
+{%- for arg in method.args %}
+        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
+{%- if arg.ty.is_rust_buffer() %}
+        // Rust handed us ownership of this arg buffer; the lift copied it
+        // out, so free it now (exactly once).
+        free_status_buffer({{ arg.ts_name }}_lowered);
+{%- endif %}
+{%- endfor %}
+        // Call the JS method — it returns `std::shared_ptr<Promise<T>>`. The
+        // listeners capture `self` + `promise` so both stay alive until the
+        // promise settles and we fire `uniffi_callback`.
+        auto promise = self->{{ method.cxx_name }}(
+{%- for arg in method.args -%}
+            {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
+{%- endfor -%}
+        );
+{%- match method.return_kind %}
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
+        promise->addOnResolvedListener(
+            [uniffi_callback, uniffi_callback_data, self]() {
+                // Void success: result is just `{ call_status{code=0} }`.
+                ::ubrn::nitro::ForeignFutureResult<void> result{};
+                result.call_status.code = 0;
+                result.call_status.error_buf = RustBuffer{};
+                uniffi_callback(uniffi_callback_data, result);
+            });
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
+        promise->addOnResolvedListener(
+            [uniffi_callback, uniffi_callback_data, self](const {{ ret_ty.cxx_type() }}& __out) {
+                ::ubrn::nitro::ForeignFutureResult<{{ ret_ty.c_type() }}> result{};
+                try {
+                    result.return_value = {{ ret_ty.lower_expr("__out", module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+                    result.call_status.code = 0;
+                    result.call_status.error_buf = RustBuffer{};
+                } catch (const std::exception& __e) {
+                    // Lowering the resolved value failed (e.g. alloc): report
+                    // as an unexpected error rather than handing Rust a
+                    // partially-built result.
+                    result.return_value = {{ ret_ty.c_type() }}{};
+                    result.call_status.code = 2;
+                    result.call_status.error_buf =
+                        ubrn::nitro::lower_string<&{{ module.rustbuffer_alloc }}>(__e.what());
+                }
+                uniffi_callback(uniffi_callback_data, result);
+            });
+{%- endmatch %}
+        promise->addOnRejectedListener(
+            [uniffi_callback, uniffi_callback_data, self](const std::exception_ptr& __error) {
+                // The JS method rejected. We only have the (message) string —
+                // Nitro flattens a thrown JS value to a `std::exception`'s
+                // `what()`. Report it as code=2 (unexpected); uniffi runs the
+                // method error type's `From<UnexpectedUniFFICallbackError>`
+                // conversion on the decoded message. (Routing a *typed* error
+                // back as code=1 would require recovering the original enum,
+                // which the Nitro error channel does not preserve.)
+                std::string __msg;
+                try {
+                    std::rethrow_exception(__error);
+                } catch (const std::exception& __e) {
+                    __msg = __e.what();
+                } catch (...) {
+                    __msg = "foreign async callback rejected";
+                }
+                ::ubrn::nitro::ForeignFutureResult<{{ method.return_kind.c_type() }}> result{};
+{%- match method.return_kind %}
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
+                result.return_value = {{ ret_ty.c_type() }}{};
+{%- endmatch %}
+                result.call_status.code = 2;
+                result.call_status.error_buf =
+                    ubrn::nitro::lower_string<&{{ module.rustbuffer_alloc }}>(__msg);
+                uniffi_callback(uniffi_callback_data, result);
+            });
+    } catch (const std::exception& e) {
+        // Synchronous failure before the promise was wired (e.g. an unknown
+        // handle, or the JS method threw synchronously). Report immediately
+        // via the foreign-future callback as an unexpected error.
+        ::ubrn::nitro::ForeignFutureResult<{{ method.return_kind.c_type() }}> result{};
+{%- match method.return_kind %}
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
+{%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
+        result.return_value = {{ ret_ty.c_type() }}{};
+{%- endmatch %}
+        result.call_status.code = 2;
+        result.call_status.error_buf =
+            ubrn::nitro::lower_string<&{{ module.rustbuffer_alloc }}>(e.what());
+        uniffi_callback(uniffi_callback_data, result);
+    }
+}
+{%- else %}
+// Sync trampoline for `{{ method.cxx_name }}` — uniffi's out-return ABI.
 extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     uint64_t self_handle
 {%- for arg in method.args %},
@@ -213,6 +338,7 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
         uniffi_out_call_status->error_buf = RustBuffer{};
     }
 }
+{%- endif %}
 {% endfor %}
 
 /// Clone trampoline (`uniffi_clone`): Rust wants another reference to the
@@ -232,17 +358,28 @@ extern "C" void {{ cb.ts_name }}_trampoline_free(uint64_t handle) {
 // repr(C) mirror of uniffi 0.31's `UniFfiTraitVtable{{ cb.ts_name }}`. Field
 // *names* are irrelevant to the C ABI (the struct is positional); only the
 // order (free, clone, then methods) and the per-field fn-ptr signatures
-// matter. Kept in lock-step with `export/callback_interface.rs`.
+// matter. Async methods use the foreign-future ABI signature
+// (`ForeignFutureCallback` + `ForeignFutureDroppedCallbackStruct*`, void
+// return); sync methods use the out-return ABI. Kept in lock-step with
+// `export/callback_interface.rs`.
 struct {{ cb.ts_name }}VTable {
   void (*uniffi_free)(uint64_t);
   uint64_t (*uniffi_clone)(uint64_t);
 {%- for method in cb.methods %}
+{%- if method.is_async %}
+  void (*{{ method.cxx_name }})(uint64_t
+{%- for arg in method.args %}, {{ arg.ty.c_type() }}{% endfor %},
+    ::ubrn::nitro::ForeignFutureCallback<{{ method.return_kind.c_type() }}>,
+    uint64_t,
+    ::ubrn::nitro::ForeignFutureDroppedCallbackStruct*);
+{%- else %}
   void (*{{ method.cxx_name }})(uint64_t
 {%- for arg in method.args %}, {{ arg.ty.c_type() }}{% endfor %},
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %} void*
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %} {{ ret_ty.c_type() }}*
 {%- endmatch %}, UniffiRustCallStatus*);
+{%- endif %}
 {%- endfor %}
 };
 

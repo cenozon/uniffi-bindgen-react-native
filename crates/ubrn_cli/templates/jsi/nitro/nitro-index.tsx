@@ -13,11 +13,20 @@
 {%- let bindings = self.config.project.bindings.ts_path(root) %}
 {%- let bindings = self.relative_to(root, bindings) %}
 
-// Re-export every emitted namespace module: the `<Namespace>Api` /
-// HybridObject types from the `.nitro.ts` spec plus the singleton
-// accessor function.
+// Re-export every emitted namespace module under its own TS namespace:
+// the `<Namespace>Api` / HybridObject types from the `.nitro.ts` spec, the
+// record / enum DTOs, the per-interface client factory functions, and the
+// singleton accessor function.
+//
+// Namespaced (`export * as <ns>`) rather than flat (`export *`) on purpose:
+// each RPC-service namespace independently defines same-named request /
+// result DTOs (`CreateRequestDto`, `GetAllResultDto`, …), so a flat
+// re-export would collide (TS2308 "already exported a member"). Namespacing
+// keeps every symbol reachable as `<ns>.<Symbol>` with zero collisions; the
+// hand-written consumer entrypoint flattens these into the shape its
+// client-factory helper expects.
 {%- for m in self.config.modules %}
-export * from './{{ bindings }}/{{ m.ts() }}';
+export * as {{ m.ts() }} from './{{ bindings }}/{{ m.ts() }}';
 {%- endfor %}
 
 // Parity with the index.web.ts variant. The native flow is sync; this is a

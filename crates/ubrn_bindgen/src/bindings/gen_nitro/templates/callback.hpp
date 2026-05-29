@@ -14,7 +14,9 @@
 #pragma once
 
 #include <NitroModules/HybridObject.hpp>
+#include <NitroModules/Promise.hpp>
 #include <NitroUniffi.hpp>
+#include <nitro-uniffi/foreign_future.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
 #include <nitro-uniffi/jsi_converter_map.hpp>
 
@@ -70,7 +72,7 @@ public:
 {%- endif %}
 
 {%- for method in cb.methods %}
-  virtual {{ method.return_kind.cxx_type() }} {{ method.cxx_name }}(
+  virtual {{ method.cxx_return_signature() }} {{ method.cxx_name }}(
 {%- for arg in method.args -%}
     {{ arg.ty.cxx_type() }} {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}

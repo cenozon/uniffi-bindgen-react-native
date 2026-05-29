@@ -541,6 +541,15 @@ mod tests {
         // the native path. JS just imports the HybridObjects directly.
         assert!(s.contains("export"));
         assert!(s.contains("alice"));
+        // Re-export must be NAMESPACED (`export * as <ns>`), not flat
+        // (`export *`): each RPC-service namespace independently defines
+        // same-named request / result DTOs, so a flat re-export collides
+        // (TS2308 "already exported a member"). Pin the namespaced form so a
+        // regression back to flat `export *` is caught.
+        assert!(
+            s.contains("export * as alice from"),
+            "nitro index.tsx must namespace each module re-export, got:\n{s}"
+        );
         // No TurboModuleRegistry leakage, no installer-style methods.
         assert!(!s.contains("TurboModuleRegistry"));
         assert!(!s.contains("installer.install"));

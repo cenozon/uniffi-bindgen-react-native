@@ -11,7 +11,7 @@
 //! `ubrn_<symbol>`.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Result};
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
@@ -294,6 +294,81 @@ impl NitroModule {
         namespaces
             .into_iter()
             .map(|ns| format!("{ns}_codecs.hpp"))
+            .collect()
+    }
+
+    /// Cross-namespace TS type imports the `.nitro.ts` spec must emit, one
+    /// entry per foreign namespace, each carrying the module path
+    /// (`./<ForeignNamespaceCamel>.nitro`) and the sorted set of type names
+    /// referenced from that module. Walks every surface that can name a
+    /// foreign type: record fields, enum / error variant fields, every
+    /// function / interface-method / callback-method arg + return, and the
+    /// namespace API methods (constructor factories).
+    ///
+    /// The TS spec has no `export *` re-export glue between sibling
+    /// `.nitro.ts` files, so each referenced foreign type must be imported
+    /// explicitly by its own module — mirroring how
+    /// [`Self::foreign_codec_headers`] collects the foreign C++ codec
+    /// `#include`s. Deduped + sorted (BTreeMap / BTreeSet) for stable
+    /// output.
+    pub fn foreign_ts_type_imports(&self) -> Vec<ForeignTsImport> {
+        let mut by_ns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let ns = self.namespace.as_str();
+
+        let mut collect = |ty: &NitroType| ty.foreign_ts_type_refs(ns, &mut by_ns);
+
+        for record in &self.records {
+            for field in &record.fields {
+                collect(&field.ty);
+            }
+        }
+        for en in &self.enums {
+            for field in en.variants.iter().flat_map(|v| v.fields.iter()) {
+                collect(&field.ty);
+            }
+        }
+        for err in &self.errors {
+            for field in err.variants.iter().flat_map(|v| v.fields.iter()) {
+                collect(&field.ty);
+            }
+        }
+        // Namespace API methods cover both top-level functions and the
+        // constructor factories (factories return / take foreign types too).
+        for func in self.api_methods() {
+            for arg in &func.args {
+                collect(&arg.ty);
+            }
+            if let ReturnKind::Value(t) = &func.return_kind {
+                collect(t);
+            }
+        }
+        for iface in &self.interfaces {
+            for m in iface.methods.iter() {
+                for arg in &m.args {
+                    collect(&arg.ty);
+                }
+                if let ReturnKind::Value(t) = &m.return_kind {
+                    collect(t);
+                }
+            }
+        }
+        for cb in &self.callback_interfaces {
+            for m in &cb.methods {
+                for arg in &m.args {
+                    collect(&arg.ty);
+                }
+                if let ReturnKind::Value(t) = &m.return_kind {
+                    collect(t);
+                }
+            }
+        }
+
+        by_ns
+            .into_iter()
+            .map(|(foreign_ns, names)| ForeignTsImport {
+                module_path: format!("./{}.nitro", foreign_ns.to_upper_camel_case()),
+                type_names: names.into_iter().collect(),
+            })
             .collect()
     }
 
@@ -835,6 +910,17 @@ pub struct InterfaceFwdDecl {
     pub cxx_class: String,
 }
 
+/// One `import type { … } from '<module_path>'` line the `.nitro.ts` spec
+/// emits for the cross-namespace types it references. See
+/// [`NitroModule::foreign_ts_type_imports`].
+pub struct ForeignTsImport {
+    /// Relative module path of the foreign namespace's spec, e.g.
+    /// `./CelestraShared.nitro`.
+    pub module_path: String,
+    /// Sorted, deduped TS type names imported from that module.
+    pub type_names: Vec<String>,
+}
+
 /// A foreign-implementable callback interface. Covers two uniffi shapes:
 ///
 /// * UDL `callback interface` / `#[uniffi::export(callback_interface)]`
@@ -891,6 +977,12 @@ pub struct NitroCallbackMethod {
     pub cxx_name: String,
     pub args: Vec<NitroArg>,
     pub return_kind: ReturnKind,
+    /// `true` when the foreign-trait method is an `async fn`. An async
+    /// foreign-trait method must surface in TS as `Promise<T>` so the JS
+    /// implementation can be `async` (the Nitro runtime awaits the
+    /// returned promise before handing the value back to Rust). Sync
+    /// methods stay the bare value type. Mirrors `NitroFunction::is_async`.
+    pub is_async: bool,
     /// `Some` for `with_foreign` traits' SYNC methods: the Rust-callable
     /// `uniffi_<crate>_fn_method_<trait>_<method>` symbol the proxy
     /// dispatches through. `None` for foreign-only callback interfaces
@@ -901,6 +993,40 @@ pub struct NitroCallbackMethod {
     /// Typed error this method may throw, if any. Drives the proxy's
     /// `lift_<Name>Error` decode + rethrow on a `RustCallStatus` error.
     pub throws: Option<NitroErrorRef>,
+}
+
+impl NitroCallbackMethod {
+    /// TS return type for the callback method. An async foreign-trait
+    /// method wraps in `Promise<T>` (a sync `void` stays `void`); a sync
+    /// method is the bare value type. Mirror of
+    /// [`NitroFunction::ts_return_signature`] — a callback method's TS
+    /// surface must follow the same async-wrapping rule as an interface
+    /// method, because both are foreign-trait methods whose JS impl
+    /// returns a value the runtime awaits.
+    pub fn ts_return_signature(&self) -> String {
+        let inner = self.return_kind.ts_type();
+        if self.is_async {
+            format!("Promise<{inner}>")
+        } else {
+            inner
+        }
+    }
+
+    /// The C++ return type as it appears in the `Hybrid<Name>` method
+    /// signature (both the `.hpp` virtual declaration and the `.cpp`
+    /// definition). A sync method is the bare lowered/lifted value type; an
+    /// async method returns `std::shared_ptr<Promise<T>>` — Nitro's contract
+    /// for `Promise`-returning HybridObject methods, which the async
+    /// trampoline awaits before driving uniffi's foreign-future callback.
+    /// Mirror of [`NitroFunction::cxx_return_signature`].
+    pub fn cxx_return_signature(&self) -> String {
+        let inner = self.return_kind.cxx_type();
+        if self.is_async {
+            format!("std::shared_ptr<::margelo::nitro::Promise<{inner}>>")
+        } else {
+            inner
+        }
+    }
 }
 
 impl NitroCallbackInterface {
@@ -925,6 +1051,7 @@ impl NitroCallbackInterface {
                     cxx_name,
                     args,
                     return_kind,
+                    is_async: method.is_async,
                     // A UDL callback interface has no Rust impl, so there is
                     // no `fn_method_*` symbol and no proxy dispatch.
                     uniffi_symbol: None,
@@ -994,6 +1121,7 @@ impl NitroCallbackInterface {
                     cxx_name,
                     args,
                     return_kind,
+                    is_async: method.is_async,
                     uniffi_symbol,
                     throws: throws_from(method.throws.as_ref()),
                 })
@@ -1099,7 +1227,7 @@ pub struct NitroArg {
 impl NitroArg {
     fn from_general(arg: &general::Argument) -> Result<Self> {
         Ok(Self {
-            ts_name: arg.name.to_lower_camel_case(),
+            ts_name: sanitize_ts_arg_ident(&arg.name.to_lower_camel_case()),
             ty: NitroType::from_type(&arg.ty.ty)?,
         })
     }
@@ -2065,6 +2193,45 @@ impl NitroType {
         }
     }
 
+    /// Collect the cross-namespace TS *type names* this type references,
+    /// keyed by the owning foreign namespace, into `out`. Drives the
+    /// `import type { … } from './<ForeignNamespaceCamel>.nitro'` block the
+    /// `.nitro.ts` spec must emit so a record / enum / interface / callback
+    /// from a sibling namespace resolves (the TS spec has no `export *`
+    /// glue — every referenced name must be imported by its own module).
+    ///
+    /// Records, enums, interfaces and callbacks all surface as a named TS
+    /// type whose spelling is `name.to_upper_camel_case()` (matching
+    /// [`Self::ts_type`]). Composites recurse into their element types. A
+    /// same-namespace type (`namespace == current_ns`) needs no import — it
+    /// is declared in the same file. Primitives carry no name.
+    fn foreign_ts_type_refs(
+        &self,
+        current_ns: &str,
+        out: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        match self {
+            Self::Optional(inner) | Self::Sequence(inner) => {
+                inner.foreign_ts_type_refs(current_ns, out)
+            }
+            Self::Map(k, v) => {
+                k.foreign_ts_type_refs(current_ns, out);
+                v.foreign_ts_type_refs(current_ns, out);
+            }
+            Self::Record { namespace, name }
+            | Self::Enum { namespace, name }
+            | Self::Interface { namespace, name }
+            | Self::CallbackInterface { namespace, name }
+                if !namespace.is_empty() && namespace != current_ns =>
+            {
+                out.entry(namespace.clone())
+                    .or_default()
+                    .insert(name.to_upper_camel_case());
+            }
+            _ => {}
+        }
+    }
+
     /// Statement that serializes `<base>.<field>` into the open
     /// writer `w`, field-by-field, inside a record / enum stream codec.
     /// Every type — primitive, composite, nested record/enum, interface —
@@ -2406,6 +2573,41 @@ fn sanitize_cxx_ident(name: &str) -> String {
     }
 }
 
+/// Make `name` safe to use as a TS *parameter* identifier by appending `_`
+/// when it collides with a reserved word that is illegal as a parameter
+/// name.
+///
+/// The load-bearing case is `this`: a function parameter literally named
+/// `this` is parsed by TS as the special *this-type annotation*, not a
+/// real parameter — so `fn(this: T, x: U)` is seen as a one-arg function,
+/// and the generated call site `fn(this, x)` then fails with `TS2554
+/// Expected 1 arguments, but got 2`. (A Rust free function with a value
+/// parameter literally named `this` — the `resolver_ext_*` "extension
+/// method" idiom — hits exactly this.) The other strict-mode reserved
+/// words are guarded defensively so any future uniffi arg name that lands
+/// on one degrades to `<name>_` rather than producing invalid TS.
+///
+/// Applied ONLY to the TS-facing `ts_name`; the FFI lowering is positional
+/// and never reads this identifier, so renaming it is purely cosmetic on
+/// the wire. The renamed local is forwarded at the call site, keeping
+/// arity correct.
+fn sanitize_ts_arg_ident(name: &str) -> String {
+    // `this` is the only one that silently changes a function's *arity*;
+    // the rest are strict-mode reserved words that are outright invalid as
+    // a binding identifier. Kept small + targeted — a uniffi arg name is
+    // already lowerCamelCase, so most JS keywords (e.g. `class`, `for`)
+    // can't appear, but the value-position reserved words below can.
+    const TS_RESERVED_ARG_IDENTS: &[&str] = &[
+        "this", "arguments", "eval", "default", "function", "in", "instanceof", "new", "return",
+        "typeof", "void", "delete", "yield", "await",
+    ];
+    if TS_RESERVED_ARG_IDENTS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Dedup + sort a header-name iterator, dropping `own` (a type never
 /// includes its own header — recursion is handled by forward declaration).
 fn dedup_headers(headers: impl Iterator<Item = String>, own: &str) -> Vec<String> {
@@ -2498,5 +2700,88 @@ impl NitroError {
             variants,
             flat: en.is_flat,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn this_arg_is_sanitized_to_avoid_ts_this_type_annotation() {
+        // A Rust free fn with a value parameter named `this` (the
+        // `resolver_ext_*` extension-method idiom) must NOT surface as a TS
+        // `this:` parameter — that's a this-type annotation, not a real
+        // arg, and would drop the function's arity by one.
+        assert_eq!(sanitize_ts_arg_ident("this"), "this_");
+    }
+
+    #[test]
+    fn ordinary_arg_names_pass_through_unchanged() {
+        assert_eq!(sanitize_ts_arg_ident("target"), "target");
+        assert_eq!(sanitize_ts_arg_ident("op"), "op");
+        assert_eq!(sanitize_ts_arg_ident("otherSource"), "otherSource");
+    }
+
+    #[test]
+    fn other_reserved_arg_words_are_guarded() {
+        // Strict-mode reserved words that are illegal as binding
+        // identifiers degrade to `<name>_` rather than emitting invalid TS.
+        for w in ["arguments", "eval", "default", "function", "yield", "await"] {
+            assert_eq!(sanitize_ts_arg_ident(w), format!("{w}_"));
+        }
+    }
+
+    fn callback_method(is_async: bool, return_kind: ReturnKind) -> NitroCallbackMethod {
+        NitroCallbackMethod {
+            ts_name: "onThing".into(),
+            cxx_name: "onThing".into(),
+            args: Vec::new(),
+            return_kind,
+            is_async,
+            uniffi_symbol: None,
+            throws: None,
+        }
+    }
+
+    #[test]
+    fn async_callback_method_return_wraps_in_promise() {
+        // An `async fn` foreign-trait method must surface as `Promise<T>`
+        // so the JS impl can be `async`; a sync method stays the bare type.
+        let m = callback_method(true, ReturnKind::Value(NitroType::Bool));
+        assert_eq!(m.ts_return_signature(), "Promise<boolean>");
+
+        let m = callback_method(true, ReturnKind::Void);
+        assert_eq!(m.ts_return_signature(), "Promise<void>");
+    }
+
+    #[test]
+    fn sync_callback_method_return_is_bare() {
+        let m = callback_method(false, ReturnKind::Value(NitroType::Bool));
+        assert_eq!(m.ts_return_signature(), "boolean");
+    }
+
+    #[test]
+    fn async_callback_method_cxx_return_wraps_in_promise() {
+        // The C++ HybridObject method for an async foreign-trait method must
+        // return `std::shared_ptr<Promise<T>>` so the trampoline can await it;
+        // a sync method stays the bare value/void type.
+        let m = callback_method(true, ReturnKind::Value(NitroType::I32));
+        assert_eq!(
+            m.cxx_return_signature(),
+            "std::shared_ptr<::margelo::nitro::Promise<int32_t>>"
+        );
+
+        let m = callback_method(true, ReturnKind::Void);
+        assert_eq!(
+            m.cxx_return_signature(),
+            "std::shared_ptr<::margelo::nitro::Promise<void>>"
+        );
+
+        let m = callback_method(false, ReturnKind::Value(NitroType::I32));
+        assert_eq!(m.cxx_return_signature(), "int32_t");
+
+        let m = callback_method(false, ReturnKind::Void);
+        assert_eq!(m.cxx_return_signature(), "void");
     }
 }
