@@ -27,9 +27,9 @@ fn regen_benchmark_nitro() {
         return;
     };
 
-    let out = std::env::var("UBRN_REGEN_OUT").map(PathBuf::from).unwrap_or_else(|_| {
-        root.join("fixtures/benchmark/generated/nitro")
-    });
+    let out = std::env::var("UBRN_REGEN_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("fixtures/benchmark/generated/nitro"));
     let ts_dir = Utf8PathBuf::from_path_buf(out.join("ts")).unwrap();
     let cpp_dir = Utf8PathBuf::from_path_buf(out.join("cpp")).unwrap();
     std::fs::create_dir_all(&ts_dir).unwrap();

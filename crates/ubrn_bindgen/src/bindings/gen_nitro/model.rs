@@ -669,8 +669,10 @@ impl NitroInterface {
                     continue;
                 }
             };
-            let is_primary =
-                !have_primary && parsed.args.is_empty() && !parsed.is_async && parsed.throws.is_none();
+            let is_primary = !have_primary
+                && parsed.args.is_empty()
+                && !parsed.is_async
+                && parsed.throws.is_none();
             if is_primary {
                 have_primary = true;
                 constructors.push(parsed);
@@ -721,17 +723,6 @@ impl NitroInterface {
         self.constructors
             .iter()
             .find(|c| c.args.is_empty() && !c.is_async && c.throws.is_none())
-    }
-
-    /// Per-type headers this interface's method declarations reference,
-    /// excluding its own (an interface method that returns / takes the
-    /// same interface resolves via this class's own declaration).
-    pub fn dependency_headers(&self) -> Vec<String> {
-        let own = format!("{}.hpp", self.cxx_class);
-        dedup_headers(
-            self.methods.iter().flat_map(|m| m.referenced_headers()),
-            &own,
-        )
     }
 
     /// Record / enum headers the `.hpp` must `#include` for complete types in
@@ -836,6 +827,9 @@ pub struct NitroCallbackProxy {
     /// `uniffi_<crate>_fn_clone_<trait>` — bumps the Rust-side strong
     /// count. The proxy clones before each dispatch (uniffi consumes the
     /// receiver handle), and once when re-vending the handle to Rust.
+    /// Consumed once the proxy's per-method Rust dispatch is emitted (the
+    /// handle + ctor scaffold are in place; see `callback.{hpp,cpp}`).
+    #[allow(dead_code)]
     pub clone_symbol: String,
     /// `uniffi_<crate>_fn_free_<trait>` — drops the Rust-side reference.
     /// Wired as the proxy handle's RAII free symbol.
@@ -853,9 +847,12 @@ pub struct NitroCallbackMethod {
     /// (no Rust impl exists to call) and for async methods (whose FFI
     /// symbol returns a future handle, not the value — the proxy can't
     /// drive that poll loop yet, so it falls back to the JS-impl path).
+    /// Consumed once the proxy's per-method Rust dispatch is emitted.
+    #[allow(dead_code)]
     pub uniffi_symbol: Option<String>,
     /// Typed error this method may throw, if any. Drives the proxy's
     /// `lift_<Name>Error` decode + rethrow on a `RustCallStatus` error.
+    #[allow(dead_code)]
     pub throws: Option<NitroErrorRef>,
 }
 
@@ -972,24 +969,6 @@ impl NitroCallbackInterface {
                 free_symbol: iface.ffi_func_free.0.clone(),
             }),
         })
-    }
-
-    /// Per-type headers this callback interface's proxy method bodies
-    /// reference (records / enums / other interfaces in arg or return
-    /// position), deduped and excluding its own header.
-    pub fn dependency_headers(&self) -> Vec<String> {
-        let own = format!("{}.hpp", self.cxx_class);
-        let headers = self.methods.iter().flat_map(|m| {
-            let mut out = Vec::new();
-            for arg in &m.args {
-                out.extend(arg.ty.referenced_headers());
-            }
-            if let ReturnKind::Value(t) = &m.return_kind {
-                out.extend(t.referenced_headers());
-            }
-            out
-        });
-        dedup_headers(headers, &own)
     }
 
     /// Record / enum headers the callback `.hpp` needs as *complete* types in
@@ -1543,7 +1522,10 @@ impl NitroType {
                 // traits — a foreign-only UDL callback interface has no Rust
                 // impl that could be returned. The proxy ctor takes ownership
                 // of the handle (uniffi already gave us our own reference).
-                format!("std::make_shared<Hybrid{cb}>(::ubrn::nitro::FromRustHandle{{{name}}})", cb = cb_name)
+                format!(
+                    "std::make_shared<Hybrid{cb}>(::ubrn::nitro::FromRustHandle{{{name}}})",
+                    cb = cb_name
+                )
             }
             // Records + enums delegate to the free functions in their owning
             // namespace's `<namespace>_codecs.hpp`; foreign types are
@@ -1922,16 +1904,17 @@ impl NitroType {
     /// Recurses through composites.
     pub fn referenced_interface_classes(&self) -> Vec<(String, String)> {
         match self {
-            Self::Optional(inner) | Self::Sequence(inner) => {
-                inner.referenced_interface_classes()
-            }
+            Self::Optional(inner) | Self::Sequence(inner) => inner.referenced_interface_classes(),
             Self::Map(k, v) => {
                 let mut out = k.referenced_interface_classes();
                 out.extend(v.referenced_interface_classes());
                 out
             }
             Self::Interface { namespace, name } => {
-                vec![(namespace.clone(), format!("Hybrid{}", name.to_upper_camel_case()))]
+                vec![(
+                    namespace.clone(),
+                    format!("Hybrid{}", name.to_upper_camel_case()),
+                )]
             }
             _ => Vec::new(),
         }
@@ -1952,10 +1935,10 @@ impl NitroType {
                 k.foreign_codec_namespaces(current_ns, out);
                 v.foreign_codec_namespaces(current_ns, out);
             }
-            Self::Record { namespace, .. } | Self::Enum { namespace, .. } => {
-                if namespace != current_ns {
-                    out.insert(namespace.clone());
-                }
+            Self::Record { namespace, .. } | Self::Enum { namespace, .. }
+                if namespace != current_ns =>
+            {
+                out.insert(namespace.clone());
             }
             _ => {}
         }
@@ -2020,9 +2003,7 @@ impl NitroType {
             | Self::Timestamp
             | Self::Duration => true,
             Self::Optional(inner) | Self::Sequence(inner) => inner.is_error_message_decodable(),
-            Self::Map(k, v) => {
-                k.is_error_message_decodable() && v.is_error_message_decodable()
-            }
+            Self::Map(k, v) => k.is_error_message_decodable() && v.is_error_message_decodable(),
             Self::Record { .. }
             | Self::Enum { .. }
             | Self::Interface { .. }
@@ -2102,7 +2083,10 @@ impl NitroRecord {
     /// records / enums / interfaces), deduped and excluding its own.
     pub fn dependency_headers(&self) -> Vec<String> {
         let own = format!("{}.hpp", self.ts_name);
-        dedup_headers(self.fields.iter().flat_map(|f| f.ty.referenced_headers()), &own)
+        dedup_headers(
+            self.fields.iter().flat_map(|f| f.ty.referenced_headers()),
+            &own,
+        )
     }
 }
 
