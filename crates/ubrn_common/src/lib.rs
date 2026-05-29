@@ -6,6 +6,7 @@
 mod commands;
 mod files;
 pub mod fmt;
+pub mod nitro;
 mod rust_crate;
 mod serde;
 mod testing;

@@ -6,7 +6,7 @@
 use heck::ToUpperCamelCase;
 use uniffi_bindgen::Component;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct ModuleMetadata {
     pub(crate) namespace: String,
 }

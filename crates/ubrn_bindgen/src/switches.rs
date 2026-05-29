@@ -31,6 +31,11 @@ impl SwitchArgs {
 pub enum AbiFlavor {
     Jsi,
     Napi,
+    /// Nitro Modules — one Nitro `HybridObject` per uniffi interface, no
+    /// globalThis JSI host object middle layer. Methods invoke the uniffi
+    /// C ABI directly via the in-tree nitro-uniffi headers
+    /// (`<NitroUniffi.hpp>`).
+    Nitro,
     #[cfg(feature = "wasm")]
     Wasm,
 }
@@ -40,6 +45,9 @@ impl AbiFlavor {
         match self {
             Self::Jsi => "Entrypoint.cpp",
             Self::Napi => "", // No native entrypoint needed
+            // Nitro's entrypoint is Nitrogen's auto-generated OnLoad.cpp —
+            // ubrn doesn't emit a project-wide entrypoint of its own.
+            Self::Nitro => "",
             #[cfg(feature = "wasm")]
             Self::Wasm => "src/lib.rs",
         }
@@ -47,6 +55,10 @@ impl AbiFlavor {
 
     pub fn is_jsi(&self) -> bool {
         matches!(self, Self::Jsi)
+    }
+
+    pub fn is_nitro(&self) -> bool {
+        matches!(self, Self::Nitro)
     }
 
     /// Whether the native module is found on globalThis (JSI installs it there).
@@ -61,9 +73,10 @@ impl AbiFlavor {
     }
 
     /// Whether FFI function names on the native module use the `ubrn_` prefix.
-    /// JSI and WASM both use this prefix; the Napi player uses raw symbol names.
+    /// JSI and WASM both use this prefix; the Napi player uses raw symbol names;
+    /// Nitro calls uniffi C ABI symbols directly with their unprefixed names.
     pub fn supports_ubrn_prefix(&self) -> bool {
-        !matches!(self, Self::Napi)
+        !matches!(self, Self::Napi | Self::Nitro)
     }
 
     /// Whether the runtime uses a plain `{ code: 0 }` object for RustCallStatus.
@@ -85,10 +98,10 @@ impl AbiFlavor {
 
     /// Whether this flavor initializes synchronously at module load.
     ///
-    /// Sync flavors (JSI, Napi) call `initialize()` from the index.ts top
-    /// level and treat `uniffiInitAsync` as a no-op for parity. Async
-    /// flavors (Wasm) defer all initialization into `uniffiInitAsync`.
+    /// Sync flavors (JSI, Napi, Nitro) initialize at module load and treat
+    /// `uniffiInitAsync` as a no-op for parity. Async flavors (Wasm) defer
+    /// all initialization into `uniffiInitAsync`.
     pub fn supports_sync_initialization(&self) -> bool {
-        matches!(self, Self::Jsi | Self::Napi)
+        matches!(self, Self::Jsi | Self::Napi | Self::Nitro)
     }
 }

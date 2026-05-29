@@ -9,6 +9,7 @@ mod codegen;
 pub(crate) mod crossplatform;
 mod generate;
 pub(crate) mod ios;
+pub(crate) mod nitro;
 
 pub(crate) use bindings::bindings;
 pub(crate) use codegen::get_files;

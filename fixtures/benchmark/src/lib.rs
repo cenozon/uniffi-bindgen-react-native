@@ -219,4 +219,33 @@ pub async fn take_string_array_async(strings: Vec<String>) {
     let _ = strings;
 }
 
+// ---------------------------------------------------------------------------
+// PROOF-OF-CONCEPT: zero-serialization raw byte FFI (the "own macros + cxx"
+// path). These bypass uniffi's per-element `Vec<u8>` Lower entirely: Rust
+// hands C++ a raw (ptr, len) of a leaked boxed slice; C++ wraps it zero-copy
+// as a Nitro ArrayBuffer and frees it on JS GC. No i32-len + per-byte
+// serialization, no intermediate RustBuffer.
+// ---------------------------------------------------------------------------
+
+/// Return `length` zero bytes as a leaked boxed slice; writes the length to
+/// `out_len` and returns the data pointer. Free with `ubrn_bench_free_bytes_raw`.
+#[no_mangle]
+pub extern "C" fn ubrn_bench_get_bytes_raw(length: u32, out_len: *mut usize) -> *mut u8 {
+    let boxed: Box<[u8]> = vec![0u8; length as usize].into_boxed_slice();
+    unsafe {
+        *out_len = boxed.len();
+    }
+    Box::into_raw(boxed) as *mut u8
+}
+
+/// Reclaim a boxed slice handed out by `ubrn_bench_get_bytes_raw`.
+///
+/// # Safety
+/// `ptr`/`len` must be exactly a pair previously returned by
+/// `ubrn_bench_get_bytes_raw` and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ubrn_bench_free_bytes_raw(ptr: *mut u8, len: usize) {
+    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
+}
+
 uniffi::setup_scaffolding!();

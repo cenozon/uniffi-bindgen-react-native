@@ -6,6 +6,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
+use ubrn_common::nitro;
 
 use crate::metadata;
 
@@ -60,6 +61,119 @@ pub(crate) fn assert_jsi_bootstrap() {
 
 pub(crate) fn assert_wasm_bootstrap() {
     assert_node_modules();
+}
+
+// === Nitro paths ===
+
+/// Nitro's C++ source root (`cpp/`) inside the resolved
+/// `react-native-nitro-modules` package — the include/compile root for the
+/// per-fixture glue. Resolved from `node_modules` (or the `UBRN_NITRO_LOCAL`
+/// override) via [`ubrn_common::nitro`], exactly like the `xtask` build steps.
+///
+/// Only called after [`assert_nitro_bootstrap`] has confirmed the package
+/// resolves, so the `expect` is unreachable in the test flow.
+pub(crate) fn nitro_cpp_src_dir() -> Utf8PathBuf {
+    nitro::cpp_dir(repo_root())
+        .expect("react-native-nitro-modules cpp/ (checked by assert_nitro_bootstrap)")
+}
+
+/// The `UBRN_NITRO_LOCAL` override package directory, if set.
+///
+/// When `None` (the common case), `react-native-nitro-modules` is installed
+/// in `node_modules` and Metro/tsc resolve it natively — no remapping needed.
+/// When `Some`, the package lives outside the module tree, so callers must
+/// register it as a Metro `extraNodeModules` + tsc `paths` entry. The path is
+/// already canonicalized by [`nitro::local_override`], so it
+/// never reintroduces a symlink for Metro to choke on.
+pub(crate) fn nitro_local_override() -> Option<Utf8PathBuf> {
+    nitro::local_override().ok().flatten()
+}
+
+/// Build directory hosting `libNitroModules.{so,dylib,dll}` — written
+/// by `xtask bootstrap nitro`.
+pub(crate) fn nitro_build_dir() -> Utf8PathBuf {
+    build_root().join("nitro-build")
+}
+
+/// Public include root the nitro bootstrap populates with a flat
+/// `NitroModules/` directory of every upstream `.hpp` (symlinks on Unix,
+/// copies on Windows). Consumer cmake projects add this so generated
+/// sources can resolve `<NitroModules/Foo.hpp>`-style includes.
+pub(crate) fn nitro_flat_include_dir() -> Utf8PathBuf {
+    nitro_build_dir().join("include")
+}
+
+/// Platform-specific path to the shared NitroModules library that the
+/// per-fixture cdylib (and the test-runner) dynamically loads.
+pub(crate) fn nitro_lib_path() -> Utf8PathBuf {
+    let dir = nitro_build_dir();
+    if cfg!(target_os = "windows") {
+        dir.join("Debug").join("NitroModules.dll")
+    } else if cfg!(target_os = "macos") {
+        dir.join("libNitroModules.dylib")
+    } else {
+        dir.join("libNitroModules.so")
+    }
+}
+
+/// The Hermes-aware host Nitro test-runner. Built by
+/// `xtask bootstrap nitro-test-runner` into `<build_root>/test-runner-nitro/`.
+pub(crate) fn nitro_test_runner_binary() -> Utf8PathBuf {
+    let dir = build_root().join("test-runner-nitro");
+    if cfg!(target_os = "windows") {
+        dir.join("Debug").join("test-runner-nitro.exe")
+    } else {
+        dir.join("test-runner-nitro")
+    }
+}
+
+/// Verify every bootstrap artifact needed to run a Nitro fixture test.
+///
+/// On missing pieces, returns a descriptive `Err` so callers can *skip*
+/// (rather than fail) the test. We deliberately don't `panic!` here —
+/// the Nitro runner is gated behind extra `xtask bootstrap` work that a
+/// fresh `cargo test --workspace` won't have run.
+pub(crate) fn assert_nitro_bootstrap() -> Result<(), String> {
+    let runner = nitro_test_runner_binary();
+    if !runner.exists() {
+        return Err(format!(
+            "Nitro test-runner not found at {runner}. \
+             Run `cargo xtask bootstrap nitro-test-runner` first."
+        ));
+    }
+    let lib = nitro_lib_path();
+    if !lib.exists() {
+        return Err(format!(
+            "NitroModules library not found at {lib}. \
+             Run `cargo xtask bootstrap nitro` first."
+        ));
+    }
+    // The Nitro package itself: installed under node_modules (run
+    // `yarn install`) or pointed at by `UBRN_NITRO_LOCAL`, and it must carry
+    // its `cpp/` source tree so the per-fixture glue can compile.
+    if let Err(e) = nitro::cpp_dir(repo_root()) {
+        return Err(e.to_string());
+    }
+    let nm = repo_root().join("node_modules");
+    if !nm.exists() {
+        return Err(format!(
+            "node_modules not found at {nm}. Run `cargo xtask bootstrap` first."
+        ));
+    }
+    Ok(())
+}
+
+/// On Windows, the dynamic loader needs the directory containing
+/// `NitroModules.dll` (and Hermes' DLLs) on `PATH` at runtime, just like
+/// the JSI flow's `add_hermes_dll_paths`. On Linux/macOS the `rpath` set
+/// by the per-fixture CMakeLists handles this.
+pub(crate) fn add_nitro_dll_paths(cmd: &mut Command) {
+    if cfg!(target_os = "windows") {
+        let nitro_dir = nitro_build_dir().join("Debug");
+        let hermes_dll_dir = hermes_build_dir().join("API/hermes/Debug");
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{};{};{}", nitro_dir, hermes_dll_dir, path));
+    }
 }
 
 /// On Windows, DLLs must be on PATH at runtime. This is not an issue on Linux/macOS as the

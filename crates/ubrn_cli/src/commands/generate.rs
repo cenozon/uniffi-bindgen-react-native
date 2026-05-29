@@ -5,18 +5,19 @@
  */
 
 use std::convert::TryFrom;
+use std::process::Command;
 
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use clap::{self, Args, Subcommand};
 
-use ubrn_bindgen::{AbiFlavor, BindingsArgs, ModuleMetadata, SwitchArgs};
+use ubrn_bindgen::{AbiFlavor, BindingsArgs, BindingsOutcome, SwitchArgs};
 
 #[cfg(feature = "wasm")]
 use crate::wasm;
 use crate::{
     codegen::{files, get_template_config, render_files},
-    config::ProjectConfig,
+    config::{Framework, ProjectConfig},
     jsi, napi, Platform,
 };
 
@@ -153,7 +154,14 @@ impl GenerateAllCommand {
     }
 
     fn switches(&self) -> SwitchArgs {
-        let flavor = self.platform.as_ref().map_or(AbiFlavor::Jsi, |p| p.into());
+        // Framework choice wins over platform: `framework: nitro` always
+        // selects `AbiFlavor::Nitro` regardless of Android/iOS target.
+        // Otherwise fall back to the legacy platform-derived flavor.
+        let flavor = if matches!(self.project_config.framework, Framework::Nitro) {
+            AbiFlavor::Nitro
+        } else {
+            self.platform.as_ref().map_or(AbiFlavor::Jsi, |p| p.into())
+        };
         SwitchArgs { flavor }
     }
 
@@ -163,15 +171,15 @@ impl GenerateAllCommand {
         let native_bindings = self.native_bindings;
 
         // Step 1: Generate bindings
-        let modules = self.generate_bindings(&lib_file)?;
+        let outcome = self.generate_bindings(&lib_file)?;
 
         // Step 2: Generate template files
-        self.generate_template_files(modules, native_bindings)?;
+        self.generate_template_files(outcome, native_bindings)?;
 
         Ok(())
     }
 
-    fn generate_bindings(&self, lib_file: &Utf8PathBuf) -> Result<Vec<ModuleMetadata>> {
+    fn generate_bindings(&self, lib_file: &Utf8PathBuf) -> Result<BindingsOutcome> {
         let project = &self.project_config;
         let switches = self.switches();
         let pwd = ubrn_common::pwd()?;
@@ -179,10 +187,10 @@ impl GenerateAllCommand {
 
         ubrn_common::cd(&project.crate_.crate_dir()?)?;
         let manifest_path = project.crate_.manifest_path()?;
-        let modules = bindings.run(Some(&manifest_path))?;
+        let outcome = bindings.run(Some(&manifest_path))?;
         ubrn_common::cd(&pwd)?;
 
-        Ok(modules)
+        Ok(outcome)
     }
 
     fn create_bindings_command(
@@ -200,20 +208,79 @@ impl GenerateAllCommand {
 
     fn generate_template_files(
         &self,
-        modules: Vec<ModuleMetadata>,
+        outcome: BindingsOutcome,
         native_bindings: bool,
     ) -> Result<()> {
         let project = &self.project_config;
         let rust_crate = project.crate_.metadata()?;
-        let config = get_template_config(project.clone(), rust_crate, modules, native_bindings);
+        let BindingsOutcome {
+            modules,
+            nitro_hybrid_objects,
+        } = outcome;
+        let config = get_template_config(
+            project.clone(),
+            rust_crate,
+            modules,
+            nitro_hybrid_objects,
+            native_bindings,
+        );
 
         let files = match &self.platform {
             Some(platform) => files::get_files_for(config.clone(), platform),
             None => files::get_files(config.clone()),
         };
 
-        render_files(config, files.into_iter())
+        render_files(config.clone(), files.into_iter())?;
+
+        if matches!(project.framework, Framework::Nitro) {
+            run_nitrogen(project)?;
+        }
+
+        Ok(())
     }
+}
+
+/// Drive Nitrogen as a subprocess immediately after ubrn emits its Nitro
+/// shell. Nitrogen consumes the `.nitro.ts` spec we just wrote and produces
+/// the autolinking glue (`HybridXxxSpec.hpp/.cpp`, `*OnLoad.cpp`,
+/// `+autolinking.{rb,gradle,cmake}`) that our gradle/cmake/podspec templates
+/// reference. If Nitrogen isn't installed in the project's node_modules we
+/// surface a clear message rather than failing silently — the user can then
+/// run `bun add -d nitrogen` and rerun.
+pub(crate) fn run_nitrogen(project: &ProjectConfig) -> Result<()> {
+    let project_root = project.project_root();
+    let nitrogen_entry = project_root.join("node_modules/nitrogen/lib/index.js");
+    if !nitrogen_entry.exists() {
+        eprintln!(
+            "warning: nitrogen not found at {nitrogen_entry}; \
+             install it (e.g. `bun add -d nitrogen react-native-nitro-modules`) \
+             and re-run to finish wiring up the Nitro autolinking outputs."
+        );
+        return Ok(());
+    }
+
+    // Prefer `bun` if available; fall back to `node`. The user has explicitly
+    // chosen Nitro, so they likely already have a JS runtime in $PATH.
+    let runtime = if Command::new("bun").arg("--version").output().is_ok() {
+        "bun"
+    } else {
+        "node"
+    };
+
+    let status = Command::new(runtime)
+        .arg(nitrogen_entry.as_str())
+        .current_dir(project_root)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn `{runtime} nitrogen`: {e}"))?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "nitrogen exited with status {status}; \
+             inspect the output above for details"
+        );
+    }
+
+    Ok(())
 }
 
 impl TryFrom<&GenerateAllArgs> for GenerateAllCommand {

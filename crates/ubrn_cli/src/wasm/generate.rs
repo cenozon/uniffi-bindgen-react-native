@@ -88,7 +88,10 @@ impl WasmCrateArgs {
             .map(|s| ModuleMetadata::new(s))
             .collect();
         let rust_crate = project.crate_.metadata()?;
-        let config = get_template_config(project, rust_crate, modules, false);
+        // Wasm flavor never produces a Nitro emission; the platform-glue
+        // templates that consume `nitro_hybrid_objects` are also not
+        // selected for Wasm targets, so an empty list is correct here.
+        let config = get_template_config(project, rust_crate, modules, Vec::new(), false);
         let files = wasm::get_files(config.clone());
         render_files(config.clone(), files.into_iter())?;
         Ok(())

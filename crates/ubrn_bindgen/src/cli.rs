@@ -17,10 +17,33 @@ use uniffi_bindgen::{
 #[cfg(feature = "wasm")]
 use super::{bindings::gen_rust, wasm::generate_rs};
 use super::{
-    bindings::{gen_cpp, gen_typescript, metadata::ModuleMetadata},
+    bindings::{
+        gen_cpp,
+        gen_nitro::{self, HybridObjectEntry},
+        gen_typescript,
+        metadata::ModuleMetadata,
+    },
     react_native::generate_cpp,
     switches::{AbiFlavor, SwitchArgs},
 };
+
+/// Aggregated result of a `BindingsArgs::run` invocation.
+///
+/// Carries the per-namespace [`ModuleMetadata`] every flavor produces,
+/// plus the Nitro-specific [`HybridObjectEntry`] list that the
+/// `gen_nitro` backend emits. Non-Nitro flavors leave
+/// `nitro_hybrid_objects` empty; the platform-glue layer in `ubrn_cli`
+/// uses it to populate `nitro.json#autolinking` and to enumerate the
+/// `Hybrid*.cpp` source list in the Android `CMakeLists.txt`.
+///
+/// The struct is intentionally non-exhaustive — adding future per-flavor
+/// metadata (wasm exports, napi entrypoints, …) should be a non-breaking
+/// change.
+#[derive(Default, Debug)]
+pub struct BindingsOutcome {
+    pub modules: Vec<ModuleMetadata>,
+    pub nitro_hybrid_objects: Vec<HybridObjectEntry>,
+}
 
 #[derive(Args, Debug)]
 pub struct BindingsArgs {
@@ -28,7 +51,9 @@ pub struct BindingsArgs {
     pub(crate) source: SourceArgs,
     #[command(flatten)]
     pub(crate) output: OutputArgs,
-    #[cfg(feature = "wasm")]
+    /// Flavor of bindings to emit. Used to dispatch between the legacy
+    /// JSI host-object backend, the napi player backend, the Nitro
+    /// HybridObject backend, and the wasm-bindgen backend.
     #[command(flatten)]
     switches: SwitchArgs,
 
@@ -38,10 +63,9 @@ pub struct BindingsArgs {
 }
 
 impl BindingsArgs {
-    pub fn new(_switches: SwitchArgs, source: SourceArgs, output: OutputArgs) -> Self {
+    pub fn new(switches: SwitchArgs, source: SourceArgs, output: OutputArgs) -> Self {
         Self {
-            #[cfg(feature = "wasm")]
-            switches: _switches,
+            switches,
             source,
             output,
             lib_resolution: None,
@@ -64,12 +88,6 @@ impl BindingsArgs {
         &self.output.cpp_dir
     }
 
-    #[cfg(not(feature = "wasm"))]
-    pub fn switches(&self) -> SwitchArgs {
-        Default::default()
-    }
-
-    #[cfg(feature = "wasm")]
     pub fn switches(&self) -> SwitchArgs {
         self.switches.clone()
     }
@@ -174,7 +192,7 @@ impl SourceArgs {
 }
 
 impl BindingsArgs {
-    pub fn run(&self, manifest_path: Option<&Utf8PathBuf>) -> Result<Vec<ModuleMetadata>> {
+    pub fn run(&self, manifest_path: Option<&Utf8PathBuf>) -> Result<BindingsOutcome> {
         let out = &self.output;
 
         mk_dir(&out.ts_dir)?;
@@ -198,6 +216,10 @@ impl BindingsArgs {
                 generate_cpp(&components, &abi_dir, !out.no_format)?;
             }
             AbiFlavor::Napi => { /* No C++ generation for Napi */ }
+            // Nitro emits its C++ exclusively via the pipeline-driven
+            // `gen_nitro::generate_all` below — no ComponentInterface
+            // path needed.
+            AbiFlavor::Nitro => { /* handled below */ }
             #[cfg(feature = "wasm")]
             AbiFlavor::Wasm => {
                 let metadata = loader.load_metadata(&source_path)?;
@@ -218,6 +240,20 @@ impl BindingsArgs {
         let metadata = pipeline_loader.load_metadata(&source_path)?;
         let initial_root = pipeline_loader.load_pipeline_initial_root(&source_path, metadata)?;
         let general_root = general::pipeline("react-native").execute(initial_root)?;
+
+        // Nitro is a fully separate codegen — both TS and C++ come from
+        // `gen_nitro` and we skip the legacy TS+JSI-cpp emission entirely.
+        // The returned `nitro_hybrid_objects` flows out through
+        // `BindingsOutcome` into the platform-glue layer, which uses it
+        // to populate `nitro.json#autolinking` and the Android
+        // `CMakeLists.txt` source list.
+        if switches.flavor == AbiFlavor::Nitro {
+            let emission = gen_nitro::generate_all(&general_root, &ts_dir, &abi_dir)?;
+            return Ok(BindingsOutcome {
+                modules: emission.modules,
+                nitro_hybrid_objects: emission.hybrid_objects,
+            });
+        }
 
         generate_ffi_from_pipeline(
             &general_root,
@@ -243,7 +279,10 @@ impl BindingsArgs {
         if !out.no_format {
             gen_typescript::format_directory(&ts_dir)?;
         }
-        Ok(modules)
+        Ok(BindingsOutcome {
+            modules,
+            nitro_hybrid_objects: Vec::new(),
+        })
     }
 
     fn create_loader(&self, manifest_path: Option<&Utf8PathBuf>) -> Result<BindgenLoader> {

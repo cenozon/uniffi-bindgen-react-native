@@ -141,7 +141,10 @@ fn compile_cpp(
     lib_name: &str,
     target_dir: &Utf8Path,
 ) -> Utf8PathBuf {
-    let build_dir = out_dir.join("cpp-build");
+    // Profile-qualified so a debug and a release run don't share one CMake
+    // cache (the cached `RUST_TARGET_DIR`/link path isn't re-evaluated on
+    // reconfigure — a shared dir would keep linking the first profile's lib).
+    let build_dir = out_dir.join(format!("cpp-build-{}", crate::fixture_profile_dir()));
     std::fs::create_dir_all(&build_dir).expect("failed to create cpp-build dir");
 
     let repo_root = paths::repo_root();
@@ -180,7 +183,11 @@ fn compile_cpp(
         .arg(format!("-DHERMES_BUILD_DIR={}", paths::hermes_build_dir()))
         .arg(format!("-DHERMES_EXTENSION_NAME=rn-{lib_name}"))
         .arg(format!("-DRUST_LIB_NAME={lib_name}"))
-        .arg(format!("-DRUST_TARGET_DIR={}/debug", target_dir))
+        .arg(format!(
+            "-DRUST_TARGET_DIR={}/{}",
+            target_dir,
+            crate::fixture_profile_dir()
+        ))
         .arg(format!("-DHERMES_EXTENSION_CPP={cpp_files_str}"))
         .arg(cmake_lists_dir.as_str())
         .current_dir(&build_dir);
