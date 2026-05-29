@@ -156,10 +156,10 @@ impl NitroArgs {
         files.extend(jsi::nitro::get_files_for_ios(config.clone()));
         render_files(config.clone(), files.into_iter())?;
 
-        // Drive Nitrogen so the autolinking outputs referenced by our gradle/
-        // cmake/podspec actually exist on disk by the time the user runs
-        // `pod install` or a gradle sync.
-        crate::commands::run_nitrogen(&project)?;
+        // We never invoke nitrogen: the emitted gradle/cmake/podspec are
+        // self-contained and compile our own C++ sources. HybridObject
+        // registration happens at library-load time via the static
+        // initializer in `register_natives.cpp`.
         Ok(())
     }
 }

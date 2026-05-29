@@ -2,20 +2,21 @@
 //
 // React Native autolinking instantiates this class as part of the host
 // app's package list. The `companion object { init { … } }` block fires
-// the first time the class is loaded, which triggers
-// `{{ self.config.project.module_cpp() }}OnLoad.initializeNative()` →
-// `System.loadLibrary("{{ self.config.project.module_cpp() }}")` →
-// `JNI_OnLoad` in `cpp-adapter.cpp` →
-// `margelo::nitro::{{ self.config.project.cpp_namespace() }}::registerAllNatives()` →
-// `HybridObjectRegistry::registerHybridObjectConstructor("{{ self.config.project.spec_name() }}Installer", …)`.
-// That chain is what makes `NitroModules.createHybridObject<{{ self.config.project.spec_name() }}Installer>(…)`
-// resolve at runtime.
+// the first time the class is loaded; it calls
+// `System.loadLibrary("{{ self.config.project.module_cpp() }}")`, which maps
+// the C++ shared library in. That triggers two things automatically:
+//   * `JNI_OnLoad` in `cpp-adapter.cpp` (initializes fbjni), and
+//   * the static initializer in `register_natives.cpp`, which populates
+//     `HybridObjectRegistry` with every HybridObject constructor.
+// That is what makes `NitroModules.createHybridObject<T>(…)` resolve at
+// runtime — no nitrogen OnLoad codegen is involved.
 //
 // Pattern matches `react-native-nitro-test`'s `NitroTestPackage`. We don't
-// expose any TurboModules or ViewManagers — the HybridObject lives in
+// expose any TurboModules or ViewManagers — the HybridObjects live in
 // Nitro's own registry, not React Native's.
 package com.margelo.nitro.{{ self.config.project.cpp_namespace() }}
 
+import android.util.Log
 import com.facebook.react.BaseReactPackage
 import com.facebook.react.bridge.NativeModule
 import com.facebook.react.bridge.ReactApplicationContext
@@ -36,8 +37,22 @@ class {{ self.config.project.module_cpp() }}Package : BaseReactPackage() {
   ): List<ViewManager<*, *>> = emptyList()
 
   companion object {
+    private const val TAG = "{{ self.config.project.module_cpp() }}Package"
+
     init {
-      {{ self.config.project.module_cpp() }}OnLoad.initializeNative()
+      try {
+        Log.i(TAG, "Loading {{ self.config.project.module_cpp() }} C++ library...")
+        System.loadLibrary("{{ self.config.project.module_cpp() }}")
+        Log.i(TAG, "Successfully loaded {{ self.config.project.module_cpp() }} C++ library!")
+      } catch (e: Error) {
+        Log.e(
+          TAG,
+          "Failed to load {{ self.config.project.module_cpp() }} C++ library! Is it properly installed and linked? " +
+            "Is the name correct? (see `CMakeLists.txt`, at `add_library(...)`)",
+          e,
+        )
+        throw e
+      }
     }
   }
 }

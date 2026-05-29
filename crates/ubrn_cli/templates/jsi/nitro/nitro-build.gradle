@@ -20,9 +20,8 @@ buildscript {
 apply plugin: "com.android.library"
 apply plugin: "kotlin-android"
 
-// Apply Nitrogen's autolinking — adds the generated Kotlin sources to
-// sourceSets.main.java.srcDirs and emits the friendly startup log line.
-apply from: "${project.projectDir}/../nitrogen/generated/android/{{ name }}+autolinking.gradle"
+// We emit our own Kotlin glue ({{ name }}Package.kt) and link the C++ runtime
+// from CMakeLists.txt, so there is no nitrogen-generated gradle to apply.
 
 def getExtOrDefault(name) {
   return rootProject.ext.has(name) ? rootProject.ext.get(name) : project.properties["{{ name }}_" + name]
@@ -108,7 +107,7 @@ dependencies {
   //noinspection GradleDynamicVersion
   implementation "com.facebook.react:react-native:+"
   implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
-  // Nitro Modules provides the HybridObject runtime + autolinking registry.
+  // Nitro Modules provides the HybridObject runtime + HybridObjectRegistry.
   implementation project(":react-native-nitro-modules")
   {%- if jna_required %}
   implementation "net.java.dev.jna:jna:5.17.0@aar"

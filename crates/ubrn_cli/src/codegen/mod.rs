@@ -553,12 +553,15 @@ mod tests {
         let config = nitro_template_config("react-native-acme", &["alice"])?;
         let file = nitro::codegen::NitroCppAdapter::new(config.clone());
         let s = file.dyn_render()?;
-        // JNI_OnLoad fires when System.loadLibrary completes. Without it
-        // every HybridObjectRegistry entry stays unregistered and
-        // `createHybridObject` throws at runtime.
+        // JNI_OnLoad fires when System.loadLibrary completes. It initializes
+        // fbjni and returns JNI_VERSION_1_6 so loadLibrary succeeds.
         assert!(s.contains("JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*)"));
         assert!(s.contains("facebook::jni::initialize(vm,"));
-        assert!(s.contains("margelo::nitro::acme::registerAllNatives()"));
+        // No nitrogen OnLoad / registerAllNatives — registration happens at
+        // library-load time via the static initializer in register_natives.cpp.
+        assert!(!s.contains("registerAllNatives"));
+        assert!(!s.contains("OnLoad.hpp"));
+        assert!(!s.contains("nitrogen/generated"));
         assert_eq!(
             file.path(&Utf8PathBuf::new()).as_str(),
             "android/cpp-adapter.cpp"
@@ -575,7 +578,11 @@ mod tests {
         assert!(s.contains("class AcmePackage : BaseReactPackage()"));
         assert!(s.contains("companion object {"));
         assert!(s.contains("init {"));
-        assert!(s.contains("AcmeOnLoad.initializeNative()"));
+        // System.loadLibrary maps the .so in, which fires the static
+        // initializer in register_natives.cpp. No nitrogen OnLoad indirection.
+        assert!(s.contains("System.loadLibrary(\"Acme\")"));
+        assert!(!s.contains("AcmeOnLoad.initializeNative()"));
+        assert!(!s.contains("nitrogen/generated"));
         assert_eq!(
             file.path(&Utf8PathBuf::new()).as_str(),
             "android/src/main/java/com/margelo/nitro/acme/AcmePackage.kt"
@@ -601,9 +608,12 @@ mod tests {
         let config = nitro_template_config("react-native-acme", &["alice"])?;
         let file = nitro::codegen::NitroBuildGradle::new(config.clone());
         let s = file.dyn_render()?;
-        assert!(s.contains(
-            "apply from: \"${project.projectDir}/../nitrogen/generated/android/Acme+autolinking.gradle\""
-        ));
+        // No nitrogen autolinking apply — the C++ runtime is linked from
+        // CMakeLists.txt and registration happens at library-load time.
+        assert!(!s.contains("nitrogen/generated"));
+        assert!(!s.contains("+autolinking.gradle"));
+        // The Nitro Modules runtime dependency stays.
+        assert!(s.contains("implementation project(\":react-native-nitro-modules\")"));
         // TurboModule codegen plumbing must not leak in.
         assert!(!s.contains("isNewArchitectureEnabled"));
         assert!(!s.contains("apply plugin: \"com.facebook.react\""));
@@ -616,10 +626,13 @@ mod tests {
         let config = nitro_template_config("react-native-acme", &["alice"])?;
         let file = nitro::codegen::NitroPodspec::new(config.clone());
         let s = file.dyn_render()?;
-        assert!(
-            s.contains(r#"load File.join(__dir__, "nitrogen/generated/ios/Acme+autolinking.rb")"#)
-        );
-        assert!(s.contains("add_nitrogen_files(s)"));
+        // No nitrogen autolinking load / add_nitrogen_files — we compile our
+        // own sources and register at library-load time.
+        assert!(!s.contains("nitrogen/generated"));
+        assert!(!s.contains("+autolinking.rb"));
+        assert!(!s.contains("add_nitrogen_files"));
+        // The Nitro Modules runtime pod dependency stays.
+        assert!(s.contains("s.dependency \"NitroModules\""));
         assert!(s.contains("vendored_frameworks ="));
         // TurboModule-era fallbacks must not bring in turbomodule/core.
         assert!(!s.contains("ReactCommon/turbomodule/core"));
@@ -762,8 +775,13 @@ mod tests {
         // cpp-adapter.cpp must still be in the add_library — it carries
         // JNI_OnLoad.
         assert!(s.contains("cpp-adapter.cpp"));
-        // Nitrogen autolinking include must still hook up at the end.
-        assert!(s.contains("nitrogen/generated/android/Acme+autolinking.cmake"));
+        // register_natives.cpp (the static-init registration) is compiled too.
+        assert!(s.contains("register_natives.cpp"));
+        // No nitrogen autolinking include — we link the runtime directly via
+        // find_package(react-native-nitro-modules) instead.
+        assert!(!s.contains("nitrogen/generated"));
+        assert!(!s.contains("+autolinking.cmake"));
+        assert!(s.contains("react-native-nitro-modules::NitroModules"));
         Ok(())
     }
 

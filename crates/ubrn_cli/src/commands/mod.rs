@@ -12,4 +12,4 @@ pub(crate) mod generate;
 pub(crate) use args::ConfigArgs;
 pub(crate) use building::BuildArgs;
 pub(crate) use checkout::CheckoutArgs;
-pub(crate) use generate::{run_nitrogen, GenerateArgs};
+pub(crate) use generate::GenerateArgs;

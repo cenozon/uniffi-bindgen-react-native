@@ -5,7 +5,6 @@
  */
 
 use std::convert::TryFrom;
-use std::process::Command;
 
 use anyhow::Result;
 use camino::Utf8PathBuf;
@@ -232,55 +231,12 @@ impl GenerateAllCommand {
 
         render_files(config.clone(), files.into_iter())?;
 
-        if matches!(project.framework, Framework::Nitro) {
-            run_nitrogen(project)?;
-        }
+        // We never invoke nitrogen: the Nitro platform glue we emit is
+        // self-contained. HybridObject registration happens at library-load
+        // time via the static initializer in `register_natives.cpp`.
 
         Ok(())
     }
-}
-
-/// Drive Nitrogen as a subprocess immediately after ubrn emits its Nitro
-/// shell. Nitrogen consumes the `.nitro.ts` spec we just wrote and produces
-/// the autolinking glue (`HybridXxxSpec.hpp/.cpp`, `*OnLoad.cpp`,
-/// `+autolinking.{rb,gradle,cmake}`) that our gradle/cmake/podspec templates
-/// reference. If Nitrogen isn't installed in the project's node_modules we
-/// surface a clear message rather than failing silently — the user can then
-/// run `bun add -d nitrogen` and rerun.
-pub(crate) fn run_nitrogen(project: &ProjectConfig) -> Result<()> {
-    let project_root = project.project_root();
-    let nitrogen_entry = project_root.join("node_modules/nitrogen/lib/index.js");
-    if !nitrogen_entry.exists() {
-        eprintln!(
-            "warning: nitrogen not found at {nitrogen_entry}; \
-             install it (e.g. `bun add -d nitrogen react-native-nitro-modules`) \
-             and re-run to finish wiring up the Nitro autolinking outputs."
-        );
-        return Ok(());
-    }
-
-    // Prefer `bun` if available; fall back to `node`. The user has explicitly
-    // chosen Nitro, so they likely already have a JS runtime in $PATH.
-    let runtime = if Command::new("bun").arg("--version").output().is_ok() {
-        "bun"
-    } else {
-        "node"
-    };
-
-    let status = Command::new(runtime)
-        .arg(nitrogen_entry.as_str())
-        .current_dir(project_root)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to spawn `{runtime} nitrogen`: {e}"))?;
-
-    if !status.success() {
-        anyhow::bail!(
-            "nitrogen exited with status {status}; \
-             inspect the output above for details"
-        );
-    }
-
-    Ok(())
 }
 
 impl TryFrom<&GenerateAllArgs> for GenerateAllCommand {

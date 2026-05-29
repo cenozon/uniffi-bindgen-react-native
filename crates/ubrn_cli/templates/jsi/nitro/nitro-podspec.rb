@@ -21,14 +21,29 @@ Pod::Spec.new do |s|
 {%- let dir = self.config.project.bindings.cpp_path(root) %}
 {%- let bindings = self.relative_to(root, dir) %}
 
-  # ubrn-emitted C++ sources (uniffi FFI glue + the Nitro HybridObject installer).
+  # ubrn-emitted C++ sources: the uniffi FFI glue ({{ tm }}), every Nitro
+  # HybridObject impl, and register_natives.cpp ({{ bindings }}). The static
+  # initializer in register_natives.cpp registers every HybridObject with the
+  # HybridObjectRegistry at library-load time, so there is no nitrogen-
+  # generated autolinking ruby to load and no nitrogen file helper to call.
   s.source_files = "{{ tm }}/**/*.{hpp,cpp,c,h}", "{{ bindings }}/**/*.{hpp,cpp,c,h}"
   s.vendored_frameworks = "{{ framework }}"
   s.dependency    "uniffi-bindgen-react-native", "{{ self.config.project.ubrn_version() }}"
 
-  # Pull in Nitrogen's generated specs + Swift/C++ bridges + Nitro autolinking.
-  load File.join(__dir__, "nitrogen/generated/ios/{{ self.config.project.module_cpp() }}+autolinking.rb")
-  add_nitrogen_files(s)
+  # The Nitro Modules runtime pod: HybridObject + Dispatcher +
+  # HybridObjectRegistry (and libc++_shared). This is the only Nitro
+  # dependency we keep.
+  s.dependency "NitroModules"
+
+  # C++20 + Swift/Obj-C++ interop settings the Nitro runtime needs. nitrogen's
+  # file helper set these; we set them inline since we no longer call it.
+  current_pod_target_xcconfig = s.attributes_hash["pod_target_xcconfig"] || {}
+  s.pod_target_xcconfig = current_pod_target_xcconfig.merge({
+    "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
+    "SWIFT_OBJC_INTEROP_MODE" => "objcxx",
+    "DEFINES_MODULE" => "YES",
+    "SWIFT_INSTALL_OBJC_HEADER" => "NO",
+  })
 
   # Use install_modules_dependencies helper if React Native >=0.71.0.
   if respond_to?(:install_modules_dependencies, true)

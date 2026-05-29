@@ -26,11 +26,12 @@ include_directories(
     ${UNIFFI_BINDGEN_PATH}/cpp/includes
 )
 
-# The single shared library `{{ name }}` is the one Nitrogen's autolinking
-# cmake will add target_sources / target_link_libraries to. `cpp-adapter.cpp`
-# carries `JNI_OnLoad` — without it, `System.loadLibrary("{{ name }}")` would
-# succeed but `registerAllNatives()` would never run and the HybridObject
-# constructor would never reach `HybridObjectRegistry`.
+# The single shared library `{{ name }}` compiles our self-emitted C++
+# sources directly: every HybridObject impl, `register_natives.cpp` (which
+# registers them with `HybridObjectRegistry` at library-load time via a
+# static initializer), and `cpp-adapter.cpp` (whose `JNI_OnLoad` just returns
+# `JNI_VERSION_1_6` so `System.loadLibrary("{{ name }}")` succeeds). We do NOT
+# include any nitrogen autolinking output — registration is self-contained.
 #
 # Sources are an explicit, lexically-sorted enumeration of every
 # HybridObject impl emitted by `ubrn_bindgen`'s `gen_nitro`; we avoid
@@ -71,13 +72,29 @@ set_target_properties(my_rust_lib PROPERTIES IMPORTED_LOCATION ${MY_RUST_LIB} IM
 
 find_library(LOGCAT log)
 
+# Link against the runtime packages directly (this replaces the nitrogen-
+# generated autolinking cmake): fbjni for the JNI bridge, ReactAndroid::jsi
+# for the JSI runtime, and react-native-nitro-modules for the HybridObject +
+# Dispatcher + HybridObjectRegistry. The react-native-nitro-modules npm
+# package ships the prefab CMake config the React Native gradle plugin
+# imports.
+find_package(fbjni REQUIRED CONFIG)
+find_package(ReactAndroid REQUIRED CONFIG)
+find_package(react-native-nitro-modules REQUIRED CONFIG)
+
 target_link_libraries(
   {{ name }}
   ${LOGCAT}
   my_rust_lib
+  fbjni::fbjni
+  ReactAndroid::jsi
+  react-native-nitro-modules::NitroModules
 )
 
-# Pull in Nitrogen's autolinking: registers `add_definitions`, additional
-# include_directories, target_sources, and target_link_libraries
-# (NitroModules, fbjni, ReactAndroid::jsi, ReactAndroid::reactnative).
-include(${CMAKE_SOURCE_DIR}/../nitrogen/generated/android/{{ name }}+autolinking.cmake)
+# Link react-native itself (the prefab target name changed between RN 0.75
+# and 0.76).
+if(ReactAndroid_VERSION_MINOR GREATER_EQUAL 76)
+  target_link_libraries({{ name }} ReactAndroid::reactnative)
+else()
+  target_link_libraries({{ name }} ReactAndroid::react_nativemodule_core)
+endif()
