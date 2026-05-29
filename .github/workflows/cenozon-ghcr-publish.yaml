@@ -65,8 +65,7 @@ jobs:
           BRANCH="${{ github.ref_name }}"
           SHA="${{ github.sha }}"
 
-          # Sanitise the branch: strip `dev/<user>/` prefix the same way
-          # indoraptor's packages-rs-sqlite3-publish.yaml does, then replace
+          # Sanitise the branch: strip the `dev/<user>/` prefix, then replace
           # any remaining non [A-Za-z0-9-] with `-` so the result is a
           # legal semver prerelease identifier.
           SANITISED="$(echo "$BRANCH" | sed -E 's#dev/[A-Za-z0-9_.-]+/##g' | sed -E 's#[^A-Za-z0-9-]+#-#g' | sed -E 's#^-+|-+$##g')"
