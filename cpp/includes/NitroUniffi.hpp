@@ -18,6 +18,7 @@
 #include "nitro-uniffi/callback.hpp"
 #include "nitro-uniffi/composites.hpp"
 #include "nitro-uniffi/converters.hpp"
+#include "nitro-uniffi/error_message.hpp"
 #include "nitro-uniffi/future.hpp"
 #include "nitro-uniffi/handle.hpp"
 #include "nitro-uniffi/status.hpp"

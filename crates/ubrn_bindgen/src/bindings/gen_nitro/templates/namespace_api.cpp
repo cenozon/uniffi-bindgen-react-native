@@ -14,7 +14,7 @@ RustBuffer {{ module.rustbuffer_alloc }}(uint64_t size, UniffiRustCallStatus* st
 void {{ module.rustbuffer_free }}(RustBuffer buf, UniffiRustCallStatus* status);
 RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiRustCallStatus* status);
 
-{%- for func in module.functions %}
+{%- for func in module.api_methods() %}
 {%- if func.is_async %}
 // Async scaffolding for `{{ func.cxx_name }}` — `_fn_func_*` returns a
 // uint64 RustFuture handle; the value-FFI return is produced by the
@@ -56,13 +56,13 @@ inline void free_status_buffer(RustBuffer buf) noexcept {
 void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
   HybridObject::loadHybridMethods();
   registerHybrids(this, [](Prototype& prototype) {
-{%- for func in module.functions %}
+{%- for func in module.api_methods() %}
     prototype.registerHybridMethod("{{ func.ts_name }}", &{{ module.namespace_api_cxx_class() }}::{{ func.cxx_name }});
 {%- endfor %}
   });
 }
 
-{%- for func in module.functions %}
+{%- for func in module.api_methods() %}
 {{ func.cxx_return_signature() }} {{ module.namespace_api_cxx_class() }}::{{ func.cxx_name }}(
 {%- for arg in func.args -%}
     {{ arg.ty.cxx_type() }} {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
@@ -71,7 +71,7 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- if func.is_async %}
 {%- if let Some(ad) = func.async_data %}
 {%- for arg in func.args %}
-  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endfor %}
   // Kick off the future eagerly: lowered-arg ownership transfers to
   // Rust at this call, which means the args don't need to be captured
@@ -121,13 +121,13 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- endif %}
 {%- if func.return_kind.returns_owned_rustbuffer() %}
 {%- if ret_ty.lift_consumes_buffer() %}
-        return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+        return {{ ret_ty.lift_owning_expr("__raw", module.namespace, module.rustbuffer_free) }};
 {%- else %}
         ::ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
-        return {{ ret_ty.lift_expr("__raw") }};
+        return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- else %}
-        return {{ ret_ty.lift_expr("__raw") }};
+        return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- endmatch %}
       });
@@ -135,7 +135,7 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- else %}
   auto __status = ubrn::nitro::make_status();
 {%- for arg in func.args %}
-  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endfor %}
 {%- match func.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
@@ -179,15 +179,15 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
   // Zero-copy: hand the Rust-owned buffer's payload straight to JS as the
   // ArrayBuffer backing store; it's freed via the namespace free hook when
   // JS garbage-collects the ArrayBuffer.
-  return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+  return {{ ret_ty.lift_owning_expr("__raw", module.namespace, module.rustbuffer_free) }};
 {%- else %}
   // RAII: free the Rust-owned return buffer on scope exit, so a throwing
   // lift (malformed payload / OOM) can't leak it.
   ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
-  return {{ ret_ty.lift_expr("__raw") }};
+  return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- else %}
-  return {{ ret_ty.lift_expr("__raw") }};
+  return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- endmatch %}
 {%- endif %}

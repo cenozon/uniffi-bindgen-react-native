@@ -6,6 +6,7 @@
 #include <NitroModules/Promise.hpp>
 #include <NitroUniffi.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
+#include <nitro-uniffi/jsi_converter_map.hpp>
 
 #include <memory>
 #include <optional>
@@ -27,7 +28,7 @@ public:
   static constexpr auto TAG = "{{ module.namespace_api_ts_name() }}";
 
   {{ module.namespace_api_cxx_class() }}() : HybridObject(TAG) {}
-{%- for func in module.functions %}
+{%- for func in module.api_methods() %}
   {{ func.cxx_return_signature() }} {{ func.cxx_name }}(
 {%- for arg in func.args -%}
     {{ arg.ty.cxx_type() }} {{ arg.ts_name }}{% if !loop.last %}, {% endif %}

@@ -96,6 +96,21 @@ using Writer = RustBufferWriter<Alloc, Reserve>;
   }                                                                            \
   inline T read_##suffix(RustBufferReader &r) { return r.read_##suffix(); }
 
+// Writer-type-generic primitive write thunks. Keyed on the writer type `W`
+// (any `RustBufferWriter<A, R>` instantiation) rather than on the
+// `Alloc`/`Reserve` symbol pair. The per-type record / enum stream codecs in
+// `<namespace>_codecs.hpp` are themselves templated on the writer type so a
+// record from namespace A can be serialized straight into namespace B's
+// outer buffer (a cross-namespace field); these thunks let those codec
+// bodies spell their primitive field writers as `write_<suffix><W>(w, v)`
+// without pinning the foreign namespace's allocator symbols. Named
+// `write_<suffix>_w` to coexist unambiguously with the symbol-keyed thunks
+// above (which the top-level `lower_*` path still uses).
+#define UBRN_NITRO_PRIM_THUNK_W(T, suffix)                                     \
+  template <typename W> inline void write_##suffix##_w(W &w, const T &v) {     \
+    w.write_##suffix(v);                                                       \
+  }
+
 UBRN_NITRO_PRIM_THUNK(uint8_t, u8)
 UBRN_NITRO_PRIM_THUNK(uint16_t, u16)
 UBRN_NITRO_PRIM_THUNK(uint32_t, u32)
@@ -108,7 +123,20 @@ UBRN_NITRO_PRIM_THUNK(float, f32)
 UBRN_NITRO_PRIM_THUNK(double, f64)
 UBRN_NITRO_PRIM_THUNK(bool, bool)
 
+UBRN_NITRO_PRIM_THUNK_W(uint8_t, u8)
+UBRN_NITRO_PRIM_THUNK_W(uint16_t, u16)
+UBRN_NITRO_PRIM_THUNK_W(uint32_t, u32)
+UBRN_NITRO_PRIM_THUNK_W(uint64_t, u64)
+UBRN_NITRO_PRIM_THUNK_W(int8_t, i8)
+UBRN_NITRO_PRIM_THUNK_W(int16_t, i16)
+UBRN_NITRO_PRIM_THUNK_W(int32_t, i32)
+UBRN_NITRO_PRIM_THUNK_W(int64_t, i64)
+UBRN_NITRO_PRIM_THUNK_W(float, f32)
+UBRN_NITRO_PRIM_THUNK_W(double, f64)
+UBRN_NITRO_PRIM_THUNK_W(bool, bool)
+
 #undef UBRN_NITRO_PRIM_THUNK
+#undef UBRN_NITRO_PRIM_THUNK_W
 
 // std::string thunks — wire-encoded as i32 length + utf-8 bytes.
 template <RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
@@ -119,11 +147,23 @@ inline void write_string(Writer<A, R> &w, const std::string &s) {
 
 inline std::string read_string(RustBufferReader &r) { return r.read_string(); }
 
+// Writer-type-generic string/date/duration thunks (see the `_w` primitive
+// note above): used inside the writer-templated record / enum stream codecs.
+template <typename W> inline void write_string_w(W &w, const std::string &s) {
+  w.write_string(s);
+}
+
 // Timestamp / SystemTime thunks — wire-encoded as i64 seconds + u32 nanos.
 template <RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline void write_timestamp(Writer<A, R> &w,
                             const std::chrono::system_clock::time_point &tp) {
+  w.write_timestamp(tp);
+}
+
+template <typename W>
+inline void write_timestamp_w(W &w,
+                              const std::chrono::system_clock::time_point &tp) {
   w.write_timestamp(tp);
 }
 
@@ -137,6 +177,10 @@ read_timestamp(RustBufferReader &r) {
 template <RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline void write_duration(Writer<A, R> &w, const double &ms) {
+  w.write_duration(ms);
+}
+
+template <typename W> inline void write_duration_w(W &w, const double &ms) {
   w.write_duration(ms);
 }
 
@@ -162,6 +206,13 @@ template <typename HybridT, RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline void write_interface_handle(Writer<A, R> &w,
                                    const std::shared_ptr<HybridT> &v) {
+  w.write_u64(v->clone_handle());
+}
+
+// Writer-type-generic interface-handle write thunk for the writer-templated
+// record / enum stream codecs.
+template <typename HybridT, typename W>
+inline void write_interface_handle_w(W &w, const std::shared_ptr<HybridT> &v) {
   w.write_u64(v->clone_handle());
 }
 
@@ -202,6 +253,21 @@ template <typename T, RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *),
           void (*WriteInner)(Writer<A, R> &, const T &)>
 inline void write_optional(Writer<A, R> &w, const std::optional<T> &v) {
+  if (v.has_value()) {
+    w.write_u8(1);
+    WriteInner(w, *v);
+  } else {
+    w.write_u8(0);
+  }
+}
+
+// Writer-type-generic `Option<T>` writer. Keyed on the writer type `W` (so a
+// record / enum codec — itself templated on `W` — can hold optional fields
+// of any element type, including a cross-namespace record/enum whose `_w`
+// element thunk is also `W`-keyed) instead of the `Alloc`/`Reserve` symbol
+// pair. Used only inside `<namespace>_codecs.hpp` stream codecs.
+template <typename T, typename W, void (*WriteInner)(W &, const T &)>
+inline void write_optional_w(W &w, const std::optional<T> &v) {
   if (v.has_value()) {
     w.write_u8(1);
     WriteInner(w, *v);
@@ -252,6 +318,15 @@ inline void write_sequence(Writer<A, R> &w, const std::vector<T> &v) {
   }
 }
 
+// Writer-type-generic `Vec<T>` writer (see `write_optional_w`).
+template <typename T, typename W, void (*WriteInner)(W &, const T &)>
+inline void write_sequence_w(W &w, const std::vector<T> &v) {
+  w.write_i32(static_cast<int32_t>(v.size()));
+  for (const auto &item : v) {
+    WriteInner(w, item);
+  }
+}
+
 template <typename T, T (*ReadInner)(RustBufferReader &)>
 inline std::vector<T> read_sequence(RustBufferReader &r) {
   int32_t len = r.read_i32();
@@ -290,6 +365,17 @@ template <typename K, typename V,
           void (*WriteK)(Writer<A, R> &, const K &),
           void (*WriteV)(Writer<A, R> &, const V &)>
 inline void write_map(Writer<A, R> &w, const std::unordered_map<K, V> &m) {
+  w.write_i32(static_cast<int32_t>(m.size()));
+  for (const auto &kv : m) {
+    WriteK(w, kv.first);
+    WriteV(w, kv.second);
+  }
+}
+
+// Writer-type-generic `HashMap<K, V>` writer (see `write_optional_w`).
+template <typename K, typename V, typename W,
+          void (*WriteK)(W &, const K &), void (*WriteV)(W &, const V &)>
+inline void write_map_w(W &w, const std::unordered_map<K, V> &m) {
   w.write_i32(static_cast<int32_t>(m.size()));
   for (const auto &kv : m) {
     WriteK(w, kv.first);
@@ -350,6 +436,15 @@ using BytesT = std::shared_ptr<::margelo::nitro::ArrayBuffer>;
 template <RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *)>
 inline void write_bytes(Writer<A, R> &w, const BytesT &v) {
+  size_t n = (v == nullptr) ? 0 : v->size();
+  w.write_i32(static_cast<int32_t>(n));
+  if (n > 0) {
+    w.write_raw_bytes(v->data(), n);
+  }
+}
+
+// Writer-type-generic `Vec<u8>` writer for the writer-templated stream codecs.
+template <typename W> inline void write_bytes_w(W &w, const BytesT &v) {
   size_t n = (v == nullptr) ? 0 : v->size();
   w.write_i32(static_cast<int32_t>(n));
   if (n > 0) {

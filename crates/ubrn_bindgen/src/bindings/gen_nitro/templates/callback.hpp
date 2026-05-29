@@ -15,6 +15,26 @@
 
 #include <NitroModules/HybridObject.hpp>
 #include <NitroUniffi.hpp>
+#include <nitro-uniffi/jsi_converter_ints.hpp>
+#include <nitro-uniffi/jsi_converter_map.hpp>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// Record / enum headers needed as complete types in method signatures.
+{%- for header in cb.value_dependency_headers() %}
+#include "{{ header }}"
+{%- endfor %}
+
+// Interface parameters/returns appear only behind `std::shared_ptr`, so a
+// forward declaration suffices (and avoids circular includes); the full
+// header is included in the `.cpp`.
+{%- for fd in cb.interface_forward_decls() %}
+namespace margelo::nitro::{{ fd.namespace }} { class {{ fd.cxx_class }}; }
+{%- endfor %}
 
 namespace margelo::nitro::{{ module.namespace }} {
 

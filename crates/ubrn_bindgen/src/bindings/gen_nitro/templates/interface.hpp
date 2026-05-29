@@ -7,6 +7,7 @@
 #include <NitroModules/Promise.hpp>
 #include <NitroUniffi.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
+#include <nitro-uniffi/jsi_converter_map.hpp>
 
 #include <memory>
 #include <optional>
@@ -14,10 +15,17 @@
 #include <unordered_map>
 #include <vector>
 
-// Per-type headers for every record / enum / interface this interface's
-// methods take or return.
-{%- for header in iface.dependency_headers() %}
+// Record / enum headers needed as complete types in method signatures.
+{%- for header in iface.value_dependency_headers() %}
 #include "{{ header }}"
+{%- endfor %}
+
+// Interface parameters/returns appear only behind `std::shared_ptr` here, so
+// a forward declaration suffices — and it avoids the circular include two
+// mutually-referential interfaces would otherwise deadlock on. The full
+// header is included in the `.cpp` (which constructs / calls them).
+{%- for fd in iface.interface_forward_decls() %}
+namespace margelo::nitro::{{ fd.namespace }} { class {{ fd.cxx_class }}; }
 {%- endfor %}
 
 extern "C" {

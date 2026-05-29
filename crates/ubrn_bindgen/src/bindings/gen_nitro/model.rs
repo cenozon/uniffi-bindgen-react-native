@@ -10,7 +10,9 @@
 //! HybridObject method, not a host-object property keyed by
 //! `ubrn_<symbol>`.
 
-use anyhow::Result;
+use std::collections::BTreeSet;
+
+use anyhow::{anyhow, Result};
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 
 use uniffi_bindgen::pipeline::general;
@@ -107,7 +109,25 @@ impl NitroModule {
         for td in &namespace.type_definitions {
             match td {
                 general::TypeDefinition::Interface(iface) => {
-                    interfaces.push(NitroInterface::from_general(iface)?);
+                    // A `#[uniffi::export(with_foreign)]` trait arrives here as
+                    // an `Interface` whose `imp` is `CallbackTrait` and which
+                    // carries a `vtable` — it is foreign-implementable. uniffi
+                    // ALSO emits Rust-callable method FFI symbols + clone/free
+                    // for it (it's a real `Metadata::Object`), so such a trait
+                    // is BOTH a callback (vtable trampolines, so JS impls can be
+                    // handed to Rust) AND an interface-style proxy (so an
+                    // `Arc<dyn Trait>` Rust returns can be wrapped and dispatched
+                    // back into Rust). Emit the callback vtable from here; the
+                    // proxy `Hybrid<Name>` surface is folded into the same
+                    // callback class (see `NitroCallbackInterface`). A plain
+                    // `interface` / trait object (`Struct` / `Trait` impl) stays
+                    // an ordinary interface.
+                    if matches!(iface.imp, general::ObjectImpl::CallbackTrait) {
+                        callback_interfaces
+                            .push(NitroCallbackInterface::from_foreign_trait(iface)?);
+                    } else {
+                        interfaces.push(NitroInterface::from_general(iface)?);
+                    }
                 }
                 general::TypeDefinition::CallbackInterface(cb) => {
                     callback_interfaces.push(NitroCallbackInterface::from_general(cb)?);
@@ -171,11 +191,88 @@ impl NitroModule {
         format!("{}_codecs.hpp", self.namespace)
     }
 
+    /// The `<foreign_ns>_codecs.hpp` headers this namespace's emission must
+    /// `#include` so that cross-namespace record / enum codec calls
+    /// (`::margelo::nitro::<foreign_ns>::lower_/lift_/write_/read_<Name>`)
+    /// resolve. Walks every type the module references — record / enum
+    /// fields, function + method + callback args and returns — and collects
+    /// each foreign namespace exactly once. Cross-namespace generation lays
+    /// all namespaces' files into one output directory (see
+    /// [`super::generate_all`]), so the foreign header is a plain
+    /// same-directory include.
+    ///
+    /// Emitted into `codecs.hpp`; the impl files (`interface.cpp`,
+    /// `namespace_api.cpp`, `callback.cpp`) already include this namespace's
+    /// `codecs.hpp`, so they inherit the foreign codecs transitively.
+    pub fn foreign_codec_headers(&self) -> Vec<String> {
+        let mut namespaces: BTreeSet<String> = BTreeSet::new();
+        let ns = self.namespace.as_str();
+
+        for record in &self.records {
+            for field in &record.fields {
+                field.ty.foreign_codec_namespaces(ns, &mut namespaces);
+            }
+        }
+        for en in &self.enums {
+            for field in en.variants.iter().flat_map(|v| v.fields.iter()) {
+                field.ty.foreign_codec_namespaces(ns, &mut namespaces);
+            }
+        }
+        for err in &self.errors {
+            for field in err.variants.iter().flat_map(|v| v.fields.iter()) {
+                field.ty.foreign_codec_namespaces(ns, &mut namespaces);
+            }
+        }
+        for func in &self.functions {
+            func.collect_foreign_codec_namespaces(ns, &mut namespaces);
+        }
+        for iface in &self.interfaces {
+            for m in iface.constructors.iter().chain(iface.methods.iter()) {
+                m.collect_foreign_codec_namespaces(ns, &mut namespaces);
+            }
+        }
+        for cb in &self.callback_interfaces {
+            for m in &cb.methods {
+                for arg in &m.args {
+                    arg.ty.foreign_codec_namespaces(ns, &mut namespaces);
+                }
+                if let ReturnKind::Value(t) = &m.return_kind {
+                    t.foreign_codec_namespaces(ns, &mut namespaces);
+                }
+            }
+        }
+
+        namespaces
+            .into_iter()
+            .map(|ns| format!("{ns}_codecs.hpp"))
+            .collect()
+    }
+
+    /// Every method the namespace API HybridObject exposes: the namespace's
+    /// top-level functions, followed by one factory per non-primary
+    /// interface constructor. A constructor factory is just a function whose
+    /// return is the interface handle, so it shares the namespace-API method
+    /// emission (lowering / async / fallible / lift) wholesale — the
+    /// templates iterate this single list rather than `functions` so the
+    /// bodies aren't duplicated.
+    pub fn api_methods(&self) -> Vec<&NitroFunction> {
+        let mut out: Vec<&NitroFunction> = self.functions.iter().collect();
+        for iface in &self.interfaces {
+            out.extend(iface.factories.iter());
+        }
+        out
+    }
+
     /// Per-type headers the namespace API's method declarations reference.
-    /// Deduped + sorted so the emitted `#include` block is stable.
+    /// Deduped + sorted so the emitted `#include` block is stable. Covers
+    /// top-level functions *and* constructor factories — the latter return
+    /// (and may take) interface / record / enum types whose headers the API
+    /// impl must see.
     pub fn api_dependency_headers(&self) -> Vec<String> {
         dedup_headers(
-            self.functions.iter().flat_map(|f| f.referenced_headers()),
+            self.api_methods()
+                .iter()
+                .flat_map(|f| f.referenced_headers()),
             "",
         )
     }
@@ -285,7 +382,7 @@ impl NitroAsyncData {
 impl NitroFunction {
     fn from_function(func: &general::Function) -> Result<Self> {
         let ts_name = func.name.to_lower_camel_case();
-        let cxx_name = ts_name.clone();
+        let cxx_name = sanitize_cxx_ident(&ts_name);
         let uniffi_symbol = func.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &func.inputs {
@@ -310,15 +407,18 @@ impl NitroFunction {
 
     fn from_constructor(ctor: &general::Constructor) -> Result<Self> {
         let ts_name = ctor.name.to_lower_camel_case();
-        let cxx_name = ts_name.clone();
+        let cxx_name = sanitize_cxx_ident(&ts_name);
         let uniffi_symbol = ctor.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &ctor.inputs {
             args.push(NitroArg::from_general(arg)?);
         }
-        // Constructors return a handle to the new object. Surface as void
-        // for now (V1 surface skips interface construction); follow-up
-        // wires this through to the HybridObject factory.
+        // The argless/sync/infallible "primary" constructor is wired into
+        // the HybridObject default constructor (see
+        // `NitroInterface::primary_constructor`), so it reports `Void` here —
+        // the default-ctor path reads only the symbol + args, never a return
+        // type. Non-primary constructors are surfaced as factory methods via
+        // `from_constructor_factory`, which sets the interface as the return.
         Ok(Self {
             ts_name,
             cxx_name,
@@ -335,9 +435,58 @@ impl NitroFunction {
         })
     }
 
+    /// Build a *factory* `NitroFunction` for a non-primary constructor. The
+    /// surface is `create<Interface>[<CtorName>](<args>) -> <Interface>`:
+    /// a method on the namespace API HybridObject whose body lowers the
+    /// args, calls the uniffi constructor symbol (which returns an owned
+    /// `uint64_t` Arc handle), and wraps it in `std::make_shared<Hybrid<Name>>`.
+    ///
+    /// `ret` is the interface's own [`NitroType::Interface`] — reusing the
+    /// generic `ReturnKind::Value(Interface)` lift means the async / fallible
+    /// paths in `namespace_api.cpp` need no special-casing: a constructor is
+    /// just a function whose return is the interface handle. The returned
+    /// handle is owned (uniffi `Arc::into_raw`), so the lift wraps it
+    /// directly with no extra clone.
+    fn from_constructor_factory(
+        ctor: &general::Constructor,
+        iface_ts_name: &str,
+        ret: NitroType,
+    ) -> Result<Self> {
+        let ctor_name = ctor.name.to_upper_camel_case();
+        // `new` is the conventional sole/primary constructor name — drop it
+        // from the factory name so the common shape reads `create<Interface>`.
+        // Any other named constructor disambiguates with its own suffix.
+        let factory_base = if ctor_name == "New" {
+            format!("create{iface_ts_name}")
+        } else {
+            format!("create{iface_ts_name}{ctor_name}")
+        };
+        let ts_name = factory_base.to_lower_camel_case();
+        let cxx_name = ts_name.clone();
+        let uniffi_symbol = ctor.callable.ffi_func.0.clone();
+        let mut args = Vec::new();
+        for arg in &ctor.inputs {
+            args.push(NitroArg::from_general(arg)?);
+        }
+        Ok(Self {
+            ts_name,
+            cxx_name,
+            uniffi_symbol,
+            args,
+            return_kind: ReturnKind::Value(ret),
+            is_async: ctor.is_async,
+            throws: throws_from(ctor.throws.as_ref()),
+            async_data: ctor
+                .callable
+                .async_data
+                .as_ref()
+                .map(NitroAsyncData::from_general),
+        })
+    }
+
     fn from_method(method: &general::Method) -> Result<Self> {
         let ts_name = method.name.to_lower_camel_case();
-        let cxx_name = ts_name.clone();
+        let cxx_name = sanitize_cxx_ident(&ts_name);
         let uniffi_symbol = method.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &method.inputs {
@@ -415,6 +564,45 @@ impl NitroFunction {
         }
         out
     }
+
+    /// Record / enum headers this function's args + return need as complete
+    /// types (interfaces excluded — they're forward-declared, see
+    /// [`Self::interface_classes`]).
+    fn value_headers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for arg in &self.args {
+            out.extend(arg.ty.referenced_value_headers());
+        }
+        if let ReturnKind::Value(t) = &self.return_kind {
+            out.extend(t.referenced_value_headers());
+        }
+        out
+    }
+
+    /// `(namespace, Hybrid<Name>)` for every interface this function's args +
+    /// return reference (for forward declaration in headers).
+    fn interface_classes(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for arg in &self.args {
+            out.extend(arg.ty.referenced_interface_classes());
+        }
+        if let ReturnKind::Value(t) = &self.return_kind {
+            out.extend(t.referenced_interface_classes());
+        }
+        out
+    }
+
+    /// Collect the foreign namespaces whose record / enum codecs this
+    /// function's args + return reach into (so the impl file can include
+    /// their `<ns>_codecs.hpp`). See [`NitroType::foreign_codec_namespaces`].
+    fn collect_foreign_codec_namespaces(&self, current_ns: &str, out: &mut BTreeSet<String>) {
+        for arg in &self.args {
+            arg.ty.foreign_codec_namespaces(current_ns, out);
+        }
+        if let ReturnKind::Value(t) = &self.return_kind {
+            t.foreign_codec_namespaces(current_ns, out);
+        }
+    }
 }
 
 pub struct NitroInterface {
@@ -427,11 +615,18 @@ pub struct NitroInterface {
     /// method receiver, and the object passed as an argument) must clone
     /// first, because uniffi *consumes* the handle it's given.
     pub clone_symbol: String,
-    /// Parsed from uniffi metadata. The argless primary constructor (if
-    /// any) is wired into the C++ default constructor so
+    /// The argless / sync / infallible "primary" constructor, if the
+    /// interface has one. Holds at most one element (the rest are reshaped
+    /// into `factories`). It's wired into the C++ default constructor so
     /// `NitroModules.createHybridObject('<Name>')` yields a live Rust
     /// object; see [`Self::primary_constructor`].
     pub constructors: Vec<NitroFunction>,
+    /// Non-primary constructors (argument-taking / async / fallible),
+    /// reshaped as factory functions returning this interface. They're
+    /// emitted as methods on the namespace API HybridObject because Nitro's
+    /// argless `createHybridObject` path can only drive the default
+    /// constructor.
+    pub factories: Vec<NitroFunction>,
     pub methods: Vec<NitroFunction>,
 }
 
@@ -440,16 +635,49 @@ impl NitroInterface {
         let ts_name = iface.name.to_upper_camel_case();
         let cxx_class = format!("Hybrid{}", ts_name);
 
+        // The interface's own type — used as the return of every factory.
+        // Resolving via `from_type` yields the correct namespace + name, so
+        // the factory's `lift_expr` wraps the owned handle in the right
+        // fully-qualified `Hybrid<Name>`.
+        let self_ty = NitroType::from_type(&iface.self_type.ty)?;
+
+        // One pass over the constructors: the first argless/sync/infallible
+        // one becomes the `primary` (wired into the C++ default constructor,
+        // kept in `constructors`); every other constructor becomes a factory
+        // method on the namespace API (Nitro's argless `createHybridObject`
+        // can't drive an argument-taking / async / fallible constructor).
         let mut constructors = Vec::new();
+        let mut factories = Vec::new();
+        let mut have_primary = false;
         for ctor in &iface.constructors {
-            match NitroFunction::from_constructor(ctor) {
-                Ok(f) => constructors.push(f),
-                Err(e) => eprintln!(
-                    "nitro: skipping constructor `{}.{}`: {e}",
-                    iface.name, ctor.name
-                ),
+            let parsed = match NitroFunction::from_constructor(ctor) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "nitro: skipping constructor `{}.{}`: {e}",
+                        iface.name, ctor.name
+                    );
+                    continue;
+                }
+            };
+            let is_primary =
+                !have_primary && parsed.args.is_empty() && !parsed.is_async && parsed.throws.is_none();
+            if is_primary {
+                have_primary = true;
+                constructors.push(parsed);
+            } else {
+                // Re-derive as a factory (return type = the interface). The
+                // plain parse above already succeeded, so this one will too.
+                match NitroFunction::from_constructor_factory(ctor, &ts_name, self_ty.clone()) {
+                    Ok(f) => factories.push(f),
+                    Err(e) => eprintln!(
+                        "nitro: skipping constructor factory `{}.{}`: {e}",
+                        iface.name, ctor.name
+                    ),
+                }
             }
         }
+
         let mut methods = Vec::new();
         for method in &iface.methods {
             match NitroFunction::from_method(method) {
@@ -467,6 +695,7 @@ impl NitroInterface {
             free_symbol: iface.ffi_func_free.0.clone(),
             clone_symbol: iface.ffi_func_clone.0.clone(),
             constructors,
+            factories,
             methods,
         })
     }
@@ -495,12 +724,84 @@ impl NitroInterface {
             &own,
         )
     }
+
+    /// Record / enum headers the `.hpp` must `#include` for complete types in
+    /// method signatures (interfaces are forward-declared instead — see
+    /// [`Self::interface_forward_decls`] — so they never force a circular
+    /// include between two interfaces that reference each other).
+    pub fn value_dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.cxx_class);
+        dedup_headers(self.methods.iter().flat_map(|m| m.value_headers()), &own)
+    }
+
+    /// Interface `Hybrid<Name>.hpp` headers the `.cpp` must `#include` for the
+    /// complete type (it constructs `make_shared<Hybrid<Name>>` and calls
+    /// methods). Excludes self.
+    pub fn interface_dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.cxx_class);
+        dedup_headers(
+            self.methods.iter().flat_map(|m| {
+                m.interface_classes()
+                    .into_iter()
+                    .map(|(_, cls)| format!("{cls}.hpp"))
+            }),
+            &own,
+        )
+    }
+
+    /// Forward declarations (`namespace … { class Hybrid<Name>; }`) the `.hpp`
+    /// emits for interface types appearing in method signatures, deduped and
+    /// excluding self. Behind a `shared_ptr` a forward declaration is enough,
+    /// and it sidesteps circular includes for mutually-referential interfaces.
+    pub fn interface_forward_decls(&self) -> Vec<InterfaceFwdDecl> {
+        let own = self.cxx_class.clone();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for m in &self.methods {
+            for (namespace, cxx_class) in m.interface_classes() {
+                if cxx_class == own {
+                    continue;
+                }
+                if seen.insert((namespace.clone(), cxx_class.clone())) {
+                    out.push(InterfaceFwdDecl {
+                        namespace,
+                        cxx_class,
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
-/// A uniffi `callback interface`. JS-side implements the methods; the
-/// generated C++ trampoline file (`HybridFooCallback.{hpp,cpp}`)
-/// registers a vtable with Rust on first use so Rust can dispatch into
-/// the JS impl.
+/// A forward declaration the interface `.hpp` emits for an interface type it
+/// references behind a `shared_ptr` (`namespace margelo::nitro::<namespace> {
+/// class <cxx_class>; }`).
+pub struct InterfaceFwdDecl {
+    pub namespace: String,
+    pub cxx_class: String,
+}
+
+/// A foreign-implementable callback interface. Covers two uniffi shapes:
+///
+/// * UDL `callback interface` / `#[uniffi::export(callback_interface)]`
+///   (`general::CallbackInterface`): foreign-ONLY. uniffi emits a vtable
+///   `init_fn` but no Rust-callable `fn_method_*` / clone / free symbols.
+///   `proxy` is `None`.
+///
+/// * `#[uniffi::export(with_foreign)]` trait (`general::Interface` with
+///   `imp == CallbackTrait`): foreign-implementable AND Rust-callable.
+///   uniffi emits the vtable `init_fn` AND per-method `fn_method_*`
+///   symbols + `fn_clone_*` / `fn_free_*`, so an `Arc<dyn Trait>` Rust
+///   hands back can be wrapped in a proxy `Hybrid<Name>` that dispatches
+///   each call back into Rust. `proxy` is `Some`.
+///
+/// In both cases the JS side implements the methods via a `Hybrid<Name>`
+/// subclass; the generated trampoline file (`Hybrid<Name>.{hpp,cpp}`)
+/// registers a vtable with Rust on first hand-off so Rust can dispatch
+/// into the JS impl. For the `with_foreign` case the SAME class doubles as
+/// the Rust-backed proxy: a handle-bearing instance whose (non-overridden)
+/// methods call the `fn_method_*` symbols.
 pub struct NitroCallbackInterface {
     /// TS spec name, e.g. `ForeignGetters`.
     pub ts_name: String,
@@ -513,6 +814,23 @@ pub struct NitroCallbackInterface {
     /// `(method_ptr, method_ptr, ..., clone_ptr, free_ptr)` — we emit
     /// trampolines for the methods + the clone/free entries.
     pub methods: Vec<NitroCallbackMethod>,
+    /// `Some` for `with_foreign` traits: the Rust-callable surface that
+    /// lets a returned `Arc<dyn Trait>` be wrapped in a proxy and lets the
+    /// proxy clone/free its handle. `None` for foreign-only UDL callback
+    /// interfaces.
+    pub proxy: Option<NitroCallbackProxy>,
+}
+
+/// Rust-callable surface of a `with_foreign` trait, used to build the
+/// Rust-backed proxy half of the generated `Hybrid<Name>` class.
+pub struct NitroCallbackProxy {
+    /// `uniffi_<crate>_fn_clone_<trait>` — bumps the Rust-side strong
+    /// count. The proxy clones before each dispatch (uniffi consumes the
+    /// receiver handle), and once when re-vending the handle to Rust.
+    pub clone_symbol: String,
+    /// `uniffi_<crate>_fn_free_<trait>` — drops the Rust-side reference.
+    /// Wired as the proxy handle's RAII free symbol.
+    pub free_symbol: String,
 }
 
 pub struct NitroCallbackMethod {
@@ -520,9 +838,20 @@ pub struct NitroCallbackMethod {
     pub cxx_name: String,
     pub args: Vec<NitroArg>,
     pub return_kind: ReturnKind,
+    /// `Some` for `with_foreign` traits' SYNC methods: the Rust-callable
+    /// `uniffi_<crate>_fn_method_<trait>_<method>` symbol the proxy
+    /// dispatches through. `None` for foreign-only callback interfaces
+    /// (no Rust impl exists to call) and for async methods (whose FFI
+    /// symbol returns a future handle, not the value — the proxy can't
+    /// drive that poll loop yet, so it falls back to the JS-impl path).
+    pub uniffi_symbol: Option<String>,
+    /// Typed error this method may throw, if any. Drives the proxy's
+    /// `lift_<Name>Error` decode + rethrow on a `RustCallStatus` error.
+    pub throws: Option<NitroErrorRef>,
 }
 
 impl NitroCallbackInterface {
+    /// Build the foreign-only shape from a UDL `callback interface`.
     fn from_general(cb: &general::CallbackInterface) -> Result<Self> {
         let ts_name = cb.name.to_upper_camel_case();
         let cxx_class = format!("Hybrid{}", ts_name);
@@ -532,7 +861,7 @@ impl NitroCallbackInterface {
         for method in &cb.methods {
             let res = (|| -> Result<NitroCallbackMethod> {
                 let ts_name = method.name.to_lower_camel_case();
-                let cxx_name = ts_name.clone();
+                let cxx_name = sanitize_cxx_ident(&ts_name);
                 let mut args = Vec::new();
                 for arg in &method.inputs {
                     args.push(NitroArg::from_general(arg)?);
@@ -543,6 +872,10 @@ impl NitroCallbackInterface {
                     cxx_name,
                     args,
                     return_kind,
+                    // A UDL callback interface has no Rust impl, so there is
+                    // no `fn_method_*` symbol and no proxy dispatch.
+                    uniffi_symbol: None,
+                    throws: throws_from(method.throws.as_ref()),
                 })
             })();
             match res {
@@ -558,7 +891,168 @@ impl NitroCallbackInterface {
             cxx_class,
             vtable_init_symbol,
             methods,
+            proxy: None,
         })
+    }
+
+    /// Build the dual (foreign-implementable + Rust-callable proxy) shape
+    /// from a `#[uniffi::export(with_foreign)]` trait, which the pipeline
+    /// represents as an `Interface` with `imp == CallbackTrait` and a
+    /// `vtable`.
+    fn from_foreign_trait(iface: &general::Interface) -> Result<Self> {
+        let ts_name = iface.name.to_upper_camel_case();
+        let cxx_class = format!("Hybrid{}", ts_name);
+        // A `CallbackTrait` Interface always carries a vtable (that's what
+        // makes it foreign-implementable); fail loudly rather than guessing
+        // the init symbol if uniffi's invariant ever changes.
+        let vtable = iface.vtable.as_ref().ok_or_else(|| {
+            anyhow!(
+                "nitro: with_foreign trait `{}` has no vtable in uniffi metadata",
+                iface.name
+            )
+        })?;
+        let vtable_init_symbol = vtable.init_fn.0.clone();
+
+        let mut methods = Vec::new();
+        for method in &iface.methods {
+            let res = (|| -> Result<NitroCallbackMethod> {
+                let ts_name = method.name.to_lower_camel_case();
+                let cxx_name = sanitize_cxx_ident(&ts_name);
+                let mut args = Vec::new();
+                for arg in &method.inputs {
+                    args.push(NitroArg::from_general(arg)?);
+                }
+                let return_kind = ReturnKind::from_general(method.return_type.as_ref())?;
+                // Only sync methods get a proxy dispatch symbol. An async
+                // trait method's `fn_method_*` returns a future handle, not
+                // the value; driving that poll loop from inside a synchronous
+                // HybridObject method body isn't possible, so we leave the
+                // proxy half unimplemented (it falls back to the JS-impl
+                // throw) and route async callbacks through the foreign-impl
+                // path only — matching the rest of the callback template,
+                // which is sync-only.
+                let uniffi_symbol = if method.is_async {
+                    None
+                } else {
+                    Some(method.callable.ffi_func.0.clone())
+                };
+                Ok(NitroCallbackMethod {
+                    ts_name,
+                    cxx_name,
+                    args,
+                    return_kind,
+                    uniffi_symbol,
+                    throws: throws_from(method.throws.as_ref()),
+                })
+            })();
+            match res {
+                Ok(m) => methods.push(m),
+                Err(e) => eprintln!(
+                    "nitro: skipping callback method `{}.{}`: {e}",
+                    iface.name, method.name
+                ),
+            }
+        }
+        Ok(Self {
+            ts_name,
+            cxx_class,
+            vtable_init_symbol,
+            methods,
+            proxy: Some(NitroCallbackProxy {
+                clone_symbol: iface.ffi_func_clone.0.clone(),
+                free_symbol: iface.ffi_func_free.0.clone(),
+            }),
+        })
+    }
+
+    /// Per-type headers this callback interface's proxy method bodies
+    /// reference (records / enums / other interfaces in arg or return
+    /// position), deduped and excluding its own header.
+    pub fn dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.cxx_class);
+        let headers = self.methods.iter().flat_map(|m| {
+            let mut out = Vec::new();
+            for arg in &m.args {
+                out.extend(arg.ty.referenced_headers());
+            }
+            if let ReturnKind::Value(t) = &m.return_kind {
+                out.extend(t.referenced_headers());
+            }
+            out
+        });
+        dedup_headers(headers, &own)
+    }
+
+    /// Record / enum headers the callback `.hpp` needs as *complete* types in
+    /// method signatures (interfaces are forward-declared instead).
+    pub fn value_dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.cxx_class);
+        let headers = self.methods.iter().flat_map(|m| {
+            let mut out = Vec::new();
+            for arg in &m.args {
+                out.extend(arg.ty.referenced_value_headers());
+            }
+            if let ReturnKind::Value(t) = &m.return_kind {
+                out.extend(t.referenced_value_headers());
+            }
+            out
+        });
+        dedup_headers(headers, &own)
+    }
+
+    /// Interface `Hybrid<Name>.hpp` headers the callback `.cpp` includes for
+    /// complete types (the proxy / trampoline constructs + calls them).
+    pub fn interface_dependency_headers(&self) -> Vec<String> {
+        let own = format!("{}.hpp", self.cxx_class);
+        let headers = self.methods.iter().flat_map(|m| {
+            let mut out: Vec<String> = Vec::new();
+            for arg in &m.args {
+                out.extend(
+                    arg.ty
+                        .referenced_interface_classes()
+                        .into_iter()
+                        .map(|(_, c)| format!("{c}.hpp")),
+                );
+            }
+            if let ReturnKind::Value(t) = &m.return_kind {
+                out.extend(
+                    t.referenced_interface_classes()
+                        .into_iter()
+                        .map(|(_, c)| format!("{c}.hpp")),
+                );
+            }
+            out
+        });
+        dedup_headers(headers, &own)
+    }
+
+    /// Forward declarations for interface types in callback method signatures
+    /// (behind `shared_ptr`, so a declaration suffices; avoids circular
+    /// includes). Excludes self.
+    pub fn interface_forward_decls(&self) -> Vec<InterfaceFwdDecl> {
+        let own = self.cxx_class.clone();
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for m in &self.methods {
+            let mut tys: Vec<&NitroType> = m.args.iter().map(|a| &a.ty).collect();
+            if let ReturnKind::Value(t) = &m.return_kind {
+                tys.push(t);
+            }
+            for ty in tys {
+                for (namespace, cxx_class) in ty.referenced_interface_classes() {
+                    if cxx_class == own {
+                        continue;
+                    }
+                    if seen.insert((namespace.clone(), cxx_class.clone())) {
+                        out.push(InterfaceFwdDecl {
+                            namespace,
+                            cxx_class,
+                        });
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -579,10 +1073,12 @@ impl NitroArg {
     /// from its `<ts_name>_lowered` (C-ABI) form to the C++ value.
     /// Used inside the per-callback-method `extern "C"` trampoline,
     /// which receives the Rust-lowered shape and needs to call into
-    /// the foreign HybridObject method with C++ types.
-    pub fn lifted_from_lowered_expr(&self) -> String {
+    /// the foreign HybridObject method with C++ types. `current_ns` is the
+    /// namespace whose codecs header the trampoline includes, so a record /
+    /// enum from another namespace gets foreign-qualified.
+    pub fn lifted_from_lowered_expr(&self, current_ns: &str) -> String {
         let lowered_name = format!("{}_lowered", self.ts_name);
-        self.ty.lift_expr(&lowered_name)
+        self.ty.lift_expr(&lowered_name, current_ns)
     }
 }
 
@@ -863,12 +1359,40 @@ impl NitroType {
         self.c_type() == "RustBuffer"
     }
 
+    /// Qualifier prefix for a record / enum codec free-function
+    /// (`write_/read_/lower_/lift_<Name>`) defined in `type_ns`, as seen
+    /// from a codec / impl file emitted for `current_ns`.
+    ///
+    /// Same-namespace types stay *unqualified* — the call site sits inside
+    /// `namespace margelo::nitro::<current_ns>` (codecs) or includes that
+    /// namespace's codecs header (impl files), so unqualified resolves and
+    /// keeps the common case terse + churn-free. A foreign type's codec
+    /// lives in the *foreign* namespace's `<foreign_ns>_codecs.hpp`, so it
+    /// must be fully qualified with `::margelo::nitro::<foreign_ns>::` —
+    /// mirroring how [`Self::cxx_type`] / the `Interface` arms always
+    /// qualify `Hybrid<Name>` with its owning namespace.
+    fn codec_ns_prefix(type_ns: &str, current_ns: &str) -> String {
+        if type_ns == current_ns {
+            String::new()
+        } else {
+            format!("::margelo::nitro::{type_ns}::")
+        }
+    }
+
     /// Expression that lowers a `cxx_type`-typed value named `<name>` to
-    /// the `c_type` for an FFI call. `alloc_symbol` / `reserve_symbol`
-    /// are the namespace's `ffi_<crate>_rustbuffer_alloc` /
-    /// `ffi_<crate>_rustbuffer_reserve` symbols — both needed by the
+    /// the `c_type` for an FFI call. `current_ns` is the namespace of the
+    /// file this expression is emitted into (so a record / enum codec call
+    /// to a foreign namespace's type gets fully qualified). `alloc_symbol`
+    /// / `reserve_symbol` are the namespace's `ffi_<crate>_rustbuffer_alloc`
+    /// / `ffi_<crate>_rustbuffer_reserve` symbols — both needed by the
     /// `RustBufferWriter` template.
-    pub fn lower_expr(&self, name: &str, alloc_symbol: &str, reserve_symbol: &str) -> String {
+    pub fn lower_expr(
+        &self,
+        name: &str,
+        current_ns: &str,
+        alloc_symbol: &str,
+        reserve_symbol: &str,
+    ) -> String {
         match self {
             Self::Bool => format!("ubrn::nitro::lower_bool({name})"),
             Self::String => format!("ubrn::nitro::lower_string<&{alloc_symbol}>({name})"),
@@ -883,7 +1407,8 @@ impl NitroType {
             }
             Self::Optional(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_writer = inner.write_fn_template_arg(alloc_symbol, reserve_symbol);
+                let inner_writer =
+                    inner.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
                 format!(
                     "ubrn::nitro::lower_optional<{ty}, &{alloc}, &{reserve}, {writer}>({name})",
                     ty = inner_cxx,
@@ -894,7 +1419,8 @@ impl NitroType {
             }
             Self::Sequence(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_writer = inner.write_fn_template_arg(alloc_symbol, reserve_symbol);
+                let inner_writer =
+                    inner.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
                 format!(
                     "ubrn::nitro::lower_sequence<{ty}, &{alloc}, &{reserve}, {writer}>({name})",
                     ty = inner_cxx,
@@ -906,8 +1432,8 @@ impl NitroType {
             Self::Map(k, v) => {
                 let k_cxx = k.cxx_type();
                 let v_cxx = v.cxx_type();
-                let k_writer = k.write_fn_template_arg(alloc_symbol, reserve_symbol);
-                let v_writer = v.write_fn_template_arg(alloc_symbol, reserve_symbol);
+                let k_writer = k.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
+                let v_writer = v.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
                 format!(
                     "ubrn::nitro::lower_map<{kt}, {vt}, &{alloc}, &{reserve}, {kw}, {vw}>({name})",
                     kt = k_cxx,
@@ -928,15 +1454,23 @@ impl NitroType {
                     cb = cb_name,
                 )
             }
-            // Records + enums delegate to the free functions in
-            // `<namespace>_codecs.hpp`; they're unqualified because the
-            // generated impl file is inside that same namespace.
+            // Records + enums delegate to the free functions in their owning
+            // namespace's `<namespace>_codecs.hpp`. A same-namespace type is
+            // unqualified (the impl file includes this namespace's codecs);
+            // a foreign type is qualified with `::margelo::nitro::<ns>::` so
+            // it resolves against the foreign codecs header.
             Self::Record {
-                name: type_name, ..
+                namespace,
+                name: type_name,
             }
             | Self::Enum {
-                name: type_name, ..
-            } => format!("lower_{}({name})", type_name.to_upper_camel_case()),
+                namespace,
+                name: type_name,
+            } => format!(
+                "{prefix}lower_{ty}({name})",
+                prefix = Self::codec_ns_prefix(namespace, current_ns),
+                ty = type_name.to_upper_camel_case(),
+            ),
             // Passing an interface as an argument hands its handle to Rust,
             // which *consumes* one Arc reference. Clone first so the JS-side
             // wrapper keeps its own live reference.
@@ -950,8 +1484,10 @@ impl NitroType {
 
     /// Expression that lifts a `c_type`-typed value to the `cxx_type`.
     /// For RustBuffer-bearing types the caller is responsible for
-    /// freeing the buffer after the lift.
-    pub fn lift_expr(&self, name: &str) -> String {
+    /// freeing the buffer after the lift. `current_ns` is the namespace of
+    /// the file this expression is emitted into, used to decide whether a
+    /// record / enum codec call needs foreign-namespace qualification.
+    pub fn lift_expr(&self, name: &str, current_ns: &str) -> String {
         match self {
             Self::Bool => format!("ubrn::nitro::lift_bool({name})"),
             Self::String => format!("ubrn::nitro::lift_string({name})"),
@@ -960,7 +1496,7 @@ impl NitroType {
             Self::Duration => format!("ubrn::nitro::lift_duration({name})"),
             Self::Optional(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_reader = inner.read_fn_template_arg();
+                let inner_reader = inner.read_fn_template_arg(current_ns);
                 format!(
                     "ubrn::nitro::lift_optional<{ty}, {reader}>({name})",
                     ty = inner_cxx,
@@ -969,7 +1505,7 @@ impl NitroType {
             }
             Self::Sequence(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_reader = inner.read_fn_template_arg();
+                let inner_reader = inner.read_fn_template_arg(current_ns);
                 format!(
                     "ubrn::nitro::lift_sequence<{ty}, {reader}>({name})",
                     ty = inner_cxx,
@@ -979,8 +1515,8 @@ impl NitroType {
             Self::Map(k, v) => {
                 let k_cxx = k.cxx_type();
                 let v_cxx = v.cxx_type();
-                let k_reader = k.read_fn_template_arg();
-                let v_reader = v.read_fn_template_arg();
+                let k_reader = k.read_fn_template_arg(current_ns);
+                let v_reader = v.read_fn_template_arg(current_ns);
                 format!(
                     "ubrn::nitro::lift_map<{kt}, {vt}, {kr}, {vr}>({name})",
                     kt = k_cxx,
@@ -989,23 +1525,32 @@ impl NitroType {
                     vr = v_reader,
                 )
             }
-            Self::CallbackInterface(_) => {
-                // Callback interfaces returned from Rust would mean Rust
-                // owns a Box<dyn Trait> — not yet supported in the
-                // Nitro backend (would need a Rust-side trampoline
-                // HybridObject impl).
-                format!(
-                    "throw std::runtime_error(\"Nitro: lifting CallbackInterface from Rust not yet supported (got handle {name})\")"
-                )
+            Self::CallbackInterface(cb_name) => {
+                // Rust handed back an `Arc<dyn Trait>` as a u64 handle. Wrap
+                // it in a Rust-backed PROXY: a handle-bearing `Hybrid<Name>`
+                // whose (non-overridden) methods dispatch into Rust via the
+                // trait's `fn_method_*` symbols (see the with_foreign branch
+                // of `callback.{hpp,cpp}`). This only arises for `with_foreign`
+                // traits — a foreign-only UDL callback interface has no Rust
+                // impl that could be returned. The proxy ctor takes ownership
+                // of the handle (uniffi already gave us our own reference).
+                format!("std::make_shared<Hybrid{cb}>(::ubrn::nitro::FromRustHandle{{{name}}})", cb = cb_name)
             }
-            // Records + enums delegate to the free functions in
-            // `<namespace>_codecs.hpp`.
+            // Records + enums delegate to the free functions in their owning
+            // namespace's `<namespace>_codecs.hpp`; foreign types are
+            // qualified so they resolve against the foreign codecs header.
             Self::Record {
-                name: type_name, ..
+                namespace,
+                name: type_name,
             }
             | Self::Enum {
-                name: type_name, ..
-            } => format!("lift_{}({name})", type_name.to_upper_camel_case()),
+                namespace,
+                name: type_name,
+            } => format!(
+                "{prefix}lift_{ty}({name})",
+                prefix = Self::codec_ns_prefix(namespace, current_ns),
+                ty = type_name.to_upper_camel_case(),
+            ),
             Self::Interface {
                 namespace,
                 name: type_name,
@@ -1031,22 +1576,28 @@ impl NitroType {
     /// Zero-copy top-level lift that consumes the `RustBuffer` (see
     /// [`Self::lift_consumes_buffer`]). `free_symbol` is the namespace
     /// `ffi_<crate>_rustbuffer_free`, wired as the ArrayBuffer's finalizer.
-    pub fn lift_owning_expr(&self, name: &str, free_symbol: &str) -> String {
+    pub fn lift_owning_expr(&self, name: &str, current_ns: &str, free_symbol: &str) -> String {
         match self {
             Self::Bytes => {
                 format!("ubrn::nitro::lift_bytes_owning<&{free_symbol}>({name})")
             }
             // Only `Bytes` sets `lift_consumes_buffer`, so this is unreachable
             // for other types; fall back to the copying lift to stay total.
-            _ => self.lift_expr(name),
+            _ => self.lift_expr(name, current_ns),
         }
     }
 
     /// Template argument used as the per-element `write_` thunk when
     /// this type appears inside a composite. Composites nest via
     /// function pointers, so the inner write/read are spelled as
-    /// template arg expressions, not function calls.
-    fn write_fn_template_arg(&self, alloc_symbol: &str, reserve_symbol: &str) -> String {
+    /// template arg expressions, not function calls. `current_ns` decides
+    /// whether a nested record / enum thunk needs foreign qualification.
+    fn write_fn_template_arg(
+        &self,
+        current_ns: &str,
+        alloc_symbol: &str,
+        reserve_symbol: &str,
+    ) -> String {
         match self {
             Self::Bool => format!("&ubrn::nitro::write_bool<&{alloc_symbol}, &{reserve_symbol}>"),
             Self::String => {
@@ -1054,7 +1605,8 @@ impl NitroType {
             }
             Self::Optional(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_writer = inner.write_fn_template_arg(alloc_symbol, reserve_symbol);
+                let inner_writer =
+                    inner.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
                 format!(
                     "&ubrn::nitro::write_optional<{ty}, &{alloc}, &{reserve}, {writer}>",
                     ty = inner_cxx,
@@ -1065,7 +1617,8 @@ impl NitroType {
             }
             Self::Sequence(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_writer = inner.write_fn_template_arg(alloc_symbol, reserve_symbol);
+                let inner_writer =
+                    inner.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
                 format!(
                     "&ubrn::nitro::write_sequence<{ty}, &{alloc}, &{reserve}, {writer}>",
                     ty = inner_cxx,
@@ -1077,8 +1630,8 @@ impl NitroType {
             Self::Map(k, v) => {
                 let k_cxx = k.cxx_type();
                 let v_cxx = v.cxx_type();
-                let k_writer = k.write_fn_template_arg(alloc_symbol, reserve_symbol);
-                let v_writer = v.write_fn_template_arg(alloc_symbol, reserve_symbol);
+                let k_writer = k.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
+                let v_writer = v.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol);
                 format!(
                     "&ubrn::nitro::write_map<{kt}, {vt}, &{alloc}, &{reserve}, {kw}, {vw}>",
                     kt = k_cxx,
@@ -1106,16 +1659,28 @@ impl NitroType {
             }
             // Nested record / enum inside a composite delegate to the
             // per-type `write_<Name>` stream thunk emitted in
-            // `<namespace>_codecs.hpp`. Those have the exact
-            // `(RustBufferWriter<Alloc, Reserve>&, const T&)` signature the
-            // composite thunks expect, so they nest as function-pointer
-            // template args without any wrapper.
+            // `<namespace>_codecs.hpp`. Those are *templated on the writer
+            // type* (`template <class W> void write_<Name>(W&, const T&)`)
+            // so a nested record from any namespace serializes straight into
+            // the *outer* buffer's writer. We leave the writer template arg
+            // implicit: the composite's `WriteInner` parameter has a fixed
+            // `void (*)(Writer&, const T&)` type, so taking the function
+            // template's address deduces the matching instantiation for
+            // whatever writer the enclosing composite was instantiated with.
+            // A foreign type's thunk is qualified with its owning namespace
+            // so the symbol resolves against the foreign codecs header.
             Self::Record {
-                name: type_name, ..
+                namespace,
+                name: type_name,
             }
             | Self::Enum {
-                name: type_name, ..
-            } => format!("&write_{}", type_name.to_upper_camel_case()),
+                namespace,
+                name: type_name,
+            } => format!(
+                "&{prefix}write_{ty}",
+                prefix = Self::codec_ns_prefix(namespace, current_ns),
+                ty = type_name.to_upper_camel_case(),
+            ),
             // An interface inside a composite crosses as its u64 handle.
             // `write_interface_handle` reads `raw_handle()` off the
             // shared_ptr and writes the bare u64; lowering ownership stays
@@ -1134,7 +1699,79 @@ impl NitroType {
         }
     }
 
-    fn read_fn_template_arg(&self) -> String {
+    /// Per-element `write_` thunk for a field inside a *record / enum stream
+    /// codec*, which is templated on the writer type `W` (see `codecs.hpp`).
+    /// Unlike [`Self::write_fn_template_arg`] (used by the top-level `lower_*`
+    /// path, which owns a concrete `Writer<Alloc, Reserve>`), these thunks
+    /// are keyed on `W` — the `*_w` overloads in `composites.hpp` — so a
+    /// nested record / enum from any namespace serializes straight into the
+    /// outer buffer's writer regardless of which namespace's allocator
+    /// symbols that writer was built from. The literal `W` token refers to
+    /// the enclosing codec template's writer parameter.
+    fn codec_write_thunk_arg(&self, current_ns: &str) -> String {
+        match self {
+            Self::Bool => "&ubrn::nitro::write_bool_w".into(),
+            Self::String => "&ubrn::nitro::write_string_w".into(),
+            Self::Bytes => "&ubrn::nitro::write_bytes_w".into(),
+            Self::Timestamp => "&ubrn::nitro::write_timestamp_w".into(),
+            Self::Duration => "&ubrn::nitro::write_duration_w".into(),
+            Self::Optional(inner) => {
+                let inner_cxx = inner.cxx_type();
+                let inner_writer = inner.codec_write_thunk_arg(current_ns);
+                format!(
+                    "&ubrn::nitro::write_optional_w<{ty}, W, {writer}>",
+                    ty = inner_cxx,
+                    writer = inner_writer,
+                )
+            }
+            Self::Sequence(inner) => {
+                let inner_cxx = inner.cxx_type();
+                let inner_writer = inner.codec_write_thunk_arg(current_ns);
+                format!(
+                    "&ubrn::nitro::write_sequence_w<{ty}, W, {writer}>",
+                    ty = inner_cxx,
+                    writer = inner_writer,
+                )
+            }
+            Self::Map(k, v) => {
+                let k_cxx = k.cxx_type();
+                let v_cxx = v.cxx_type();
+                let k_writer = k.codec_write_thunk_arg(current_ns);
+                let v_writer = v.codec_write_thunk_arg(current_ns);
+                format!(
+                    "&ubrn::nitro::write_map_w<{kt}, {vt}, W, {kw}, {vw}>",
+                    kt = k_cxx,
+                    vt = v_cxx,
+                    kw = k_writer,
+                    vw = v_writer,
+                )
+            }
+            Self::CallbackInterface(_) => {
+                "&ubrn::nitro::unsupported_callback_inside_composite".into()
+            }
+            Self::Record {
+                namespace,
+                name: type_name,
+            }
+            | Self::Enum {
+                namespace,
+                name: type_name,
+            } => format!(
+                "&{prefix}write_{ty}",
+                prefix = Self::codec_ns_prefix(namespace, current_ns),
+                ty = type_name.to_upper_camel_case(),
+            ),
+            Self::Interface { namespace, name } => format!(
+                "&ubrn::nitro::write_interface_handle_w<::margelo::nitro::{}::Hybrid{}>",
+                namespace,
+                name.to_upper_camel_case()
+            ),
+            Self::Stub => "&ubrn::nitro::unsupported_compound_inside_composite".into(),
+            _ => format!("&ubrn::nitro::write_{}_w", self.lower_suffix()),
+        }
+    }
+
+    fn read_fn_template_arg(&self, current_ns: &str) -> String {
         match self {
             Self::Bool => "&ubrn::nitro::read_bool".into(),
             Self::String => "&ubrn::nitro::read_string".into(),
@@ -1143,7 +1780,7 @@ impl NitroType {
             Self::Duration => "&ubrn::nitro::read_duration".into(),
             Self::Optional(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_reader = inner.read_fn_template_arg();
+                let inner_reader = inner.read_fn_template_arg(current_ns);
                 format!(
                     "&ubrn::nitro::read_optional<{ty}, {reader}>",
                     ty = inner_cxx,
@@ -1152,7 +1789,7 @@ impl NitroType {
             }
             Self::Sequence(inner) => {
                 let inner_cxx = inner.cxx_type();
-                let inner_reader = inner.read_fn_template_arg();
+                let inner_reader = inner.read_fn_template_arg(current_ns);
                 format!(
                     "&ubrn::nitro::read_sequence<{ty}, {reader}>",
                     ty = inner_cxx,
@@ -1162,8 +1799,8 @@ impl NitroType {
             Self::Map(k, v) => {
                 let k_cxx = k.cxx_type();
                 let v_cxx = v.cxx_type();
-                let k_reader = k.read_fn_template_arg();
-                let v_reader = v.read_fn_template_arg();
+                let k_reader = k.read_fn_template_arg(current_ns);
+                let v_reader = v.read_fn_template_arg(current_ns);
                 format!(
                     "&ubrn::nitro::read_map<{kt}, {vt}, {kr}, {vr}>",
                     kt = k_cxx,
@@ -1175,12 +1812,22 @@ impl NitroType {
             Self::CallbackInterface(_) => {
                 "&ubrn::nitro::unsupported_callback_inside_composite".into()
             }
+            // The read stream codec signature (`<Name>(RustBufferReader&)`)
+            // is namespace-independent, so a foreign type's `read_<Name>`
+            // nests just by fully qualifying the symbol — no writer pinning
+            // needed (unlike the write side).
             Self::Record {
-                name: type_name, ..
+                namespace,
+                name: type_name,
             }
             | Self::Enum {
-                name: type_name, ..
-            } => format!("&read_{}", type_name.to_upper_camel_case()),
+                namespace,
+                name: type_name,
+            } => format!(
+                "&{prefix}read_{ty}",
+                prefix = Self::codec_ns_prefix(namespace, current_ns),
+                ty = type_name.to_upper_camel_case(),
+            ),
             Self::Interface { namespace, name } => format!(
                 "&ubrn::nitro::read_interface_handle<::margelo::nitro::{}::Hybrid{}>",
                 namespace,
@@ -1224,38 +1871,155 @@ impl NitroType {
             Self::Record { name, .. } | Self::Enum { name, .. } => {
                 vec![format!("{}.hpp", name.to_upper_camel_case())]
             }
-            Self::Interface { name, .. } => {
+            Self::Interface { name, .. } | Self::CallbackInterface(name) => {
                 vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
             }
             _ => Vec::new(),
         }
     }
 
+    /// Headers for types this type references that must be a *complete* type
+    /// at the point of use — records / enums (passed/held by value). Interface
+    /// types are excluded: they always cross as `std::shared_ptr<Hybrid…>`,
+    /// for which a forward declaration suffices in a header (see
+    /// [`Self::referenced_interface_classes`]). Recurses through composites.
+    pub fn referenced_value_headers(&self) -> Vec<String> {
+        match self {
+            Self::Optional(inner) | Self::Sequence(inner) => inner.referenced_value_headers(),
+            Self::Map(k, v) => {
+                let mut out = k.referenced_value_headers();
+                out.extend(v.referenced_value_headers());
+                out
+            }
+            Self::Record { name, .. } | Self::Enum { name, .. } => {
+                vec![format!("{}.hpp", name.to_upper_camel_case())]
+            }
+            // Callback interfaces need the complete `Hybrid<Name>` type at the
+            // use site (the lowering calls `ensure_<Name>_vtable_init()` +
+            // `CallbackHandleMap<Hybrid<Name>>`), so include the full header
+            // rather than forward-declaring.
+            Self::CallbackInterface(name) => {
+                vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `(namespace, Hybrid<Name>)` for every interface this type references.
+    /// Used to emit forward declarations in headers (an interface only ever
+    /// appears behind a `shared_ptr` in a signature, so the header needs the
+    /// class *declared*, not defined — and mutually-referential interfaces
+    /// would deadlock on includes). The full header is included in the `.cpp`.
+    /// Recurses through composites.
+    pub fn referenced_interface_classes(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Optional(inner) | Self::Sequence(inner) => {
+                inner.referenced_interface_classes()
+            }
+            Self::Map(k, v) => {
+                let mut out = k.referenced_interface_classes();
+                out.extend(v.referenced_interface_classes());
+                out
+            }
+            Self::Interface { namespace, name } => {
+                vec![(namespace.clone(), format!("Hybrid{}", name.to_upper_camel_case()))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Namespaces (other than `current_ns`) whose record / enum *codecs*
+    /// this type's serialization reaches into. Recurses through composites.
+    /// Drives the foreign `<ns>_codecs.hpp` include set so the qualified
+    /// `write_/read_/lower_/lift_<Name>` calls resolve. Interfaces are
+    /// excluded — their wire form is a bare u64 handle written by the
+    /// header-only `write_interface_handle`, no foreign codec needed.
+    pub fn foreign_codec_namespaces(&self, current_ns: &str, out: &mut BTreeSet<String>) {
+        match self {
+            Self::Optional(inner) | Self::Sequence(inner) => {
+                inner.foreign_codec_namespaces(current_ns, out)
+            }
+            Self::Map(k, v) => {
+                k.foreign_codec_namespaces(current_ns, out);
+                v.foreign_codec_namespaces(current_ns, out);
+            }
+            Self::Record { namespace, .. } | Self::Enum { namespace, .. } => {
+                if namespace != current_ns {
+                    out.insert(namespace.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Statement that serializes `<base>.<field>` into the open
-    /// `RustBufferWriter` named `w`, field-by-field, inside a record /
-    /// enum stream codec. Every type — primitive, composite, nested
-    /// record/enum, interface — funnels through the same `(writer, value)`
-    /// thunk shape, so the record codec body is a uniform field walk.
-    pub fn stream_write_stmt(
-        &self,
-        base: &str,
-        field: &str,
-        alloc_symbol: &str,
-        reserve_symbol: &str,
-    ) -> String {
+    /// writer `w`, field-by-field, inside a record / enum stream codec.
+    /// Every type — primitive, composite, nested record/enum, interface —
+    /// funnels through the same `(writer, value)` thunk shape, so the record
+    /// codec body is a uniform field walk. The stream codec is templated on
+    /// the writer type `W` (so a foreign record can nest into this
+    /// namespace's outer buffer), hence the writer-generic `*_w` thunks
+    /// rather than the allocator-symbol-keyed ones. `current_ns` qualifies a
+    /// nested foreign record / enum codec correctly.
+    pub fn stream_write_stmt(&self, base: &str, field: &str, current_ns: &str) -> String {
         // The composite / nested thunks are spelled as function-pointer
         // template args (`&fn<...>`); strip the leading `&` to call them.
-        let thunk = self.write_fn_template_arg(alloc_symbol, reserve_symbol);
+        let thunk = self.codec_write_thunk_arg(current_ns);
         let callee = thunk.strip_prefix('&').unwrap_or(&thunk);
         format!("{callee}(w, {base}.{field});")
     }
 
     /// Expression that deserializes one field of this type from the open
     /// `RustBufferReader` named `r`. Mirror of [`Self::stream_write_stmt`].
-    pub fn stream_read_expr(&self) -> String {
-        let thunk = self.read_fn_template_arg();
+    pub fn stream_read_expr(&self, current_ns: &str) -> String {
+        let thunk = self.read_fn_template_arg(current_ns);
         let callee = thunk.strip_prefix('&').unwrap_or(&thunk);
         format!("{callee}(r)")
+    }
+
+    /// Whether a value of this type can be both decoded *and* rendered into
+    /// a human-readable error-message fragment via
+    /// `ubrn::nitro::error_field_to_string`. Error variant payloads are
+    /// surfaced to JS through the C++ exception's `what()` string (the only
+    /// channel Nitro hands to `jsi::JSError`), so the field has to stringify.
+    ///
+    /// Scalars / bool / string / bytes / date / duration have direct
+    /// `error_field_to_string` overloads. Composites of those round-trip too
+    /// (their decoders exist and `error_field_to_string` recurses through the
+    /// `std::optional` / `std::vector` / `std::unordered_map` overloads).
+    /// Records, enums, interfaces, callbacks and stubs are *not* surfaced:
+    /// a record / data-enum reader exists but has no `to_string`, and — more
+    /// importantly — an error enum used as another error's field has *no*
+    /// reader emitted at all (errors become exception classes, not value
+    /// types), so reading it would reference a non-existent `read_<Name>`.
+    /// Such variants fall back to the tag-only message, exactly as before.
+    pub fn is_error_message_decodable(&self) -> bool {
+        match self {
+            Self::Bool
+            | Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::U64
+            | Self::I8
+            | Self::I16
+            | Self::I32
+            | Self::I64
+            | Self::F32
+            | Self::F64
+            | Self::String
+            | Self::Bytes
+            | Self::Timestamp
+            | Self::Duration => true,
+            Self::Optional(inner) | Self::Sequence(inner) => inner.is_error_message_decodable(),
+            Self::Map(k, v) => {
+                k.is_error_message_decodable() && v.is_error_message_decodable()
+            }
+            Self::Record { .. }
+            | Self::Enum { .. }
+            | Self::Interface { .. }
+            | Self::CallbackInterface(_)
+            | Self::Stub => false,
+        }
     }
 }
 
@@ -1392,10 +2156,133 @@ impl NitroEnum {
     }
 }
 
+/// Make `name` safe to use as a C++ identifier by appending `_` when it
+/// collides with a reserved keyword (C++20 keywords + alternative tokens +
+/// `override`/`final` which are context-sensitive but reserved here because
+/// the generated method bodies use them as virtual-override declarations).
+///
+/// Applied ONLY to the C++-facing identifier (`cxx_name`); the JS-facing
+/// `ts_name` — and the string passed to `registerHybridMethod` — keep the
+/// original spelling so the JS surface is unchanged. A uniffi method named
+/// `delete` thus emits `Hybrid::delete_(...)` while staying registered as
+/// `"delete"`.
+fn sanitize_cxx_ident(name: &str) -> String {
+    // C++20 keyword set (incl. alternative-token operator keywords and the
+    // context-sensitive identifiers we treat as reserved). Kept exhaustive so
+    // any uniffi name that happens to be a C++ keyword degrades to `<name>_`
+    // rather than failing to compile.
+    const CXX_KEYWORDS: &[&str] = &[
+        "alignas",
+        "alignof",
+        "and",
+        "and_eq",
+        "asm",
+        "atomic_cancel",
+        "atomic_commit",
+        "atomic_noexcept",
+        "auto",
+        "bitand",
+        "bitor",
+        "bool",
+        "break",
+        "case",
+        "catch",
+        "char",
+        "char8_t",
+        "char16_t",
+        "char32_t",
+        "class",
+        "compl",
+        "concept",
+        "const",
+        "consteval",
+        "constexpr",
+        "constinit",
+        "const_cast",
+        "continue",
+        "co_await",
+        "co_return",
+        "co_yield",
+        "decltype",
+        "default",
+        "delete",
+        "do",
+        "double",
+        "dynamic_cast",
+        "else",
+        "enum",
+        "explicit",
+        "export",
+        "extern",
+        "false",
+        "final",
+        "float",
+        "for",
+        "friend",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "mutable",
+        "namespace",
+        "new",
+        "noexcept",
+        "not",
+        "not_eq",
+        "nullptr",
+        "operator",
+        "or",
+        "or_eq",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "reflexpr",
+        "register",
+        "reinterpret_cast",
+        "requires",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "static_assert",
+        "static_cast",
+        "struct",
+        "switch",
+        "synchronized",
+        "template",
+        "this",
+        "thread_local",
+        "throw",
+        "true",
+        "try",
+        "typedef",
+        "typeid",
+        "typename",
+        "union",
+        "unsigned",
+        "using",
+        "virtual",
+        "void",
+        "volatile",
+        "wchar_t",
+        "while",
+        "xor",
+        "xor_eq",
+    ];
+    if CXX_KEYWORDS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Dedup + sort a header-name iterator, dropping `own` (a type never
 /// includes its own header — recursion is handled by forward declaration).
 fn dedup_headers(headers: impl Iterator<Item = String>, own: &str) -> Vec<String> {
-    let mut set: std::collections::BTreeSet<String> = headers.collect();
+    let mut set: BTreeSet<String> = headers.collect();
     set.remove(own);
     set.into_iter().collect()
 }
@@ -1417,6 +2304,19 @@ impl NitroEnumVariant {
     /// `std::variant` over these. Unit variants get an empty struct.
     pub fn cxx_struct_name(&self, enum_name: &str) -> String {
         format!("{}_{}", enum_name.to_upper_camel_case(), self.ts_name)
+    }
+
+    /// True when, as an *error* variant, this variant carries fields that we
+    /// can decode off the wire and render into the exception message that
+    /// reaches JS via `error.message`. Requires at least one field and every
+    /// field to be [`NitroType::is_error_message_decodable`] — see that
+    /// method for why complex / error-enum fields fall back to tag-only.
+    pub fn error_fields_surfaced(&self) -> bool {
+        !self.fields.is_empty()
+            && self
+                .fields
+                .iter()
+                .all(|f| f.ty.is_error_message_decodable())
     }
 }
 

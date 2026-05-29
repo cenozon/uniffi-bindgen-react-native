@@ -16,6 +16,7 @@
 
 #include <NitroUniffi.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
+#include <nitro-uniffi/jsi_converter_map.hpp>
 
 #include <optional>
 #include <string>
@@ -87,7 +88,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
     std::string unionValue = JSIConverter<std::string>::fromJSI(runtime, arg);
     switch (hashString(unionValue.c_str(), unionValue.size())) {
 {%- for variant in en.variants %}
-      case hashString("{{ variant.tag }}"): return margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}::{{ variant.ts_name }};
+      case hashString("{{ variant.ts_name }}"): return margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}::{{ variant.ts_name }};
 {%- endfor %}
       default: [[unlikely]]
         throw std::invalid_argument("Cannot convert \"" + unionValue + "\" to enum {{ en.ts_name }} - invalid value!");
@@ -97,7 +98,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
   toJSI(jsi::Runtime& runtime, margelo::nitro::{{ module.namespace }}::{{ en.ts_name }} arg) {
     switch (arg) {
 {%- for variant in en.variants %}
-      case margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}::{{ variant.ts_name }}: return JSIConverter<std::string>::toJSI(runtime, "{{ variant.tag }}");
+      case margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}::{{ variant.ts_name }}: return JSIConverter<std::string>::toJSI(runtime, "{{ variant.ts_name }}");
 {%- endfor %}
       default: [[unlikely]]
         throw std::invalid_argument("Cannot convert {{ en.ts_name }} to JS - invalid value: " + std::to_string(static_cast<int>(arg)) + "!");
@@ -110,7 +111,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
     std::string unionValue = JSIConverter<std::string>::fromJSI(runtime, value);
     switch (hashString(unionValue.c_str(), unionValue.size())) {
 {%- for variant in en.variants %}
-      case hashString("{{ variant.tag }}"):
+      case hashString("{{ variant.ts_name }}"):
 {%- endfor %}
         return true;
       default:

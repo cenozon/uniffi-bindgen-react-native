@@ -17,6 +17,7 @@
 
 #include <NitroUniffi.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
+#include <nitro-uniffi/jsi_converter_map.hpp>
 
 #include <optional>
 #include <string>
@@ -40,16 +41,17 @@ public:
 
 public:
   {{ record.ts_name }}() = default;
+{%- if !record.fields.is_empty() %}
   explicit {{ record.ts_name }}(
 {%- for field in record.fields -%}
     {{ field.ty.cxx_type() }} {{ field.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
-  )
-{%- if !record.fields.is_empty() %}:
+  ):
 {%- for field in record.fields -%}
     {{ field.ts_name }}(std::move({{ field.ts_name }})){% if !loop.last %}, {% endif %}
 {%- endfor -%}
-{%- endif %} {}
+   {}
+{%- endif %}
 
 public:
   friend bool operator==(const {{ record.ts_name }}& lhs, const {{ record.ts_name }}& rhs) = default;

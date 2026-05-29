@@ -23,6 +23,12 @@
 // returns void (a void-returning method still takes a `&mut ()` out slot).
 
 #include "{{ cb.cxx_class }}.hpp"
+#include "{{ module.codecs_header_filename() }}"
+// Full definitions of interface types this callback's proxy / trampolines
+// construct or call (forward-declared in the .hpp).
+{%- for header in cb.interface_dependency_headers() %}
+#include "{{ header }}"
+{%- endfor %}
 
 #include <atomic>
 #include <stdexcept>
@@ -92,7 +98,7 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     try {
         auto self = HandleMap::instance().get(self_handle);
 {%- for arg in method.args %}
-        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr() }};
+        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- if arg.ty.is_rust_buffer() %}
         // Rust handed us ownership of this arg buffer; the lift copied it
         // out, so free it now (exactly once).
@@ -112,7 +118,7 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
             {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
         );
-        *uniffi_out_return = {{ ret_ty.lower_expr("__out", module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+        *uniffi_out_return = {{ ret_ty.lower_expr("__out", module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endmatch %}
         uniffi_out_call_status->code = 0;
     } catch (const std::exception& e) {

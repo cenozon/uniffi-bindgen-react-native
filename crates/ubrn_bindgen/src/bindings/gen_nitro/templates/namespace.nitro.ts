@@ -20,7 +20,7 @@ export interface {{ record.ts_name }} {
  * Uniffi enum `{{ en.ts_name }}`.
  */
 {%- if en.flat %}
-export type {{ en.ts_name }} = {% for variant in en.variants %}'{{ variant.tag }}'{% if !loop.last %} | {% endif %}{% endfor %}
+export type {{ en.ts_name }} = {% for variant in en.variants %}'{{ variant.ts_name }}'{% if !loop.last %} | {% endif %}{% endfor %}
 {%- else %}
 // Discriminated union keyed on `type` — matches the `JSIConverter` ubrn
 // emits in `{{ en.ts_name }}.hpp`.
@@ -37,6 +37,10 @@ export type {{ en.ts_name }} =
  * methods) with a JS Error whose `kind` matches one of the variant tags
  * below. The C++ side throws a `{{ err.ts_name }}Error` instance; Nitro's
  * `HybridFunction::callMethod` translates that into a `jsi::JSError`.
+ *
+ * For data-carrying variants the decoded fields are rendered into the JS
+ * `error.message` as `{{ err.ts_name }}::<Variant>(field=value, ...)`, so
+ * the payload uniffi serialized after the variant tag is not lost.
  */
 {%- if err.flat %}
 export type {{ err.ts_name }}Variant = {% for variant in err.variants %}'{{ variant.ts_name }}'{% if !loop.last %} | {% endif %}{% endfor %}
@@ -54,7 +58,7 @@ export interface {{ module.namespace_api_ts_name() }} extends HybridObject<{
   ios: 'c++'
   android: 'c++'
 }> {
-{%- for func in module.functions %}
+{%- for func in module.api_methods() %}
   {{ func.ts_name }}(
 {%- for arg in func.args -%}
     {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}

@@ -53,6 +53,7 @@ export function {{ module.namespace }}(): {{ module.namespace_api_ts_name() }} {
 }
 
 {%- for iface in module.interfaces %}
+{%- if iface.primary_constructor().is_some() %}
 
 /**
  * Runtime surface for the uniffi interface `{{ iface.ts_name }}`. Each
@@ -67,12 +68,30 @@ export const {{ iface.ts_name }} = class {
   }
 } as unknown as { new (): {{ iface.ts_name }}Spec }
 export type {{ iface.ts_name }} = {{ iface.ts_name }}Spec
+{%- else %}
+
+/**
+ * The uniffi interface `{{ iface.ts_name }}` has no argless/sync/infallible
+ * constructor, so there is no `new {{ iface.ts_name }}()` — Nitro's argless
+ * `createHybridObject` path can only drive a default constructor.
+{%- if !iface.factories.is_empty() %}
+ * Construct instances via the `create{{ iface.ts_name }}*` factory
+ * function(s) below (or receive them from method / function returns).
+{%- else %}
+ * Instances are obtained from method / function returns.
+{%- endif %}
+ */
+export type {{ iface.ts_name }} = {{ iface.ts_name }}Spec
+{%- endif %}
 {%- endfor %}
 
 // Top-level pass-through exports — match the surface the other backends
 // (jsi/napi/wasm) ship so consumer code can import individual functions
-// instead of having to dereference the namespace API singleton.
-{%- for func in module.functions %}
+// instead of having to dereference the namespace API singleton. Includes
+// the `create<Interface>` constructor factories for interfaces whose
+// construction takes arguments / is async / is fallible (Nitro's argless
+// `new <Interface>()` shim can't drive those).
+{%- for func in module.api_methods() %}
 export function {{ func.ts_name }}(
 {%- for arg in func.args -%}
 {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}

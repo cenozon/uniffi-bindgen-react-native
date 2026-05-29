@@ -37,6 +37,14 @@
 {%- for en in module.enums %}
 #include "{{ en.ts_name }}.hpp"
 {%- endfor %}
+{#- Foreign namespaces' codecs. A field / arg / return typed as a record or
+    enum from another uniffi namespace calls that namespace's
+    `::margelo::nitro::<foreign_ns>::{write,read,lower,lift}_<Name>`, which is
+    declared in its own `<foreign_ns>_codecs.hpp`. Cross-namespace generation
+    emits every namespace into this same directory, so it's a plain include. #}
+{%- for header in module.foreign_codec_headers() %}
+#include "{{ header }}"
+{%- endfor %}
 
 extern "C" {
 RustBuffer {{ module.rustbuffer_alloc }}(uint64_t size, UniffiRustCallStatus* status);
@@ -45,31 +53,40 @@ RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiR
 
 namespace margelo::nitro::{{ module.namespace }} {
 
-// Namespace-local writer type: every codec in this file allocates through
-// this namespace's `rustbuffer_alloc` / `rustbuffer_reserve` symbols, so a
-// single alias keeps the stream-codec signatures terse and makes the
-// `&write_<Name>` function pointers concrete (matching the composite
-// thunks' `void (*)(Writer&, const T&)` parameter type exactly).
+// Namespace-local writer type: this namespace's top-level `lower_<Name>`
+// wrappers allocate through its own `rustbuffer_alloc` / `rustbuffer_reserve`
+// symbols.
 using Writer =
     ::ubrn::nitro::RustBufferWriter<&{{ module.rustbuffer_alloc }}, &{{ module.rustbuffer_reserve }}>;
 using ::ubrn::nitro::RustBufferReader;
 
+// The per-type `write_<Name>` stream codec is *templated on the writer type
+// `W`* (any `RustBufferWriter<Alloc, Reserve>` instantiation). This is what
+// makes a record / enum from this namespace serialize straight into another
+// namespace's outer buffer when it appears as a cross-namespace field: that
+// foreign codec calls `::margelo::nitro::<this_ns>::write_<Name>(foreign_w, …)`
+// and `W` is deduced as the *foreign* writer. The field walk therefore uses
+// the writer-generic `*_w` composite thunks (see `nitro-uniffi/composites.hpp`)
+// rather than ones pinned to this namespace's allocator symbols. `read_<Name>`
+// needs no such treatment — `RustBufferReader` is namespace-independent.
+
 // ---- Forward declarations (mutual recursion) ----
 {%- for record in module.records %}
-inline void write_{{ record.ts_name }}(Writer& w, const {{ record.ts_name }}& value);
+template <class W> inline void write_{{ record.ts_name }}(W& w, const {{ record.ts_name }}& value);
 inline {{ record.ts_name }} read_{{ record.ts_name }}(RustBufferReader& r);
 {%- endfor %}
 {%- for en in module.enums %}
-inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value);
+template <class W> inline void write_{{ en.ts_name }}(W& w, const {{ en.ts_name }}& value);
 inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r);
 {%- endfor %}
 
 {%- for record in module.records %}
 
 // ---- Record `{{ record.ts_name }}` ----
-inline void write_{{ record.ts_name }}(Writer& w, const {{ record.ts_name }}& value) {
+template <class W>
+inline void write_{{ record.ts_name }}(W& w, const {{ record.ts_name }}& value) {
 {%- for field in record.fields %}
-  {{ field.ty.stream_write_stmt("value", field.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
+  {{ field.ty.stream_write_stmt("value", field.ts_name, module.namespace) }}
 {%- endfor %}
   (void)w;
   (void)value;
@@ -78,7 +95,7 @@ inline void write_{{ record.ts_name }}(Writer& w, const {{ record.ts_name }}& va
 inline {{ record.ts_name }} read_{{ record.ts_name }}(RustBufferReader& r) {
   {{ record.ts_name }} __out{};
 {%- for field in record.fields %}
-  __out.{{ field.ts_name }} = {{ field.ty.stream_read_expr() }};
+  __out.{{ field.ts_name }} = {{ field.ty.stream_read_expr(module.namespace) }};
 {%- endfor %}
   (void)r;
   return __out;
@@ -100,7 +117,8 @@ inline {{ record.ts_name }} lift_{{ record.ts_name }}(RustBuffer buf) {
 
 // ---- Enum `{{ en.ts_name }}` ----
 {%- if en.flat %}
-inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value) {
+template <class W>
+inline void write_{{ en.ts_name }}(W& w, const {{ en.ts_name }}& value) {
   int32_t __ordinal = 0;
   switch (value) {
 {%- for variant in en.variants %}
@@ -121,7 +139,8 @@ inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r) {
   }
 }
 {%- else %}
-inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value) {
+template <class W>
+inline void write_{{ en.ts_name }}(W& w, const {{ en.ts_name }}& value) {
   // Wire format: i32 tag (1-based, in declaration order) then the variant's
   // fields in order. `value.variant` is a `std::variant` over the per-
   // variant payload structs; the index lines up with the tag.
@@ -132,7 +151,7 @@ inline void write_{{ en.ts_name }}(Writer& w, const {{ en.ts_name }}& value) {
 {%- if !variant.fields.is_empty() %}
       const auto& __v = std::get<{{ loop.index0 }}>(value.variant);
 {%- for field in variant.fields %}
-      {{ field.ty.stream_write_stmt("__v", field.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
+      {{ field.ty.stream_write_stmt("__v", field.ts_name, module.namespace) }}
 {%- endfor %}
 {%- endif %}
       break;
@@ -150,7 +169,7 @@ inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r) {
     case {{ loop.index }}: {
       {{ variant.cxx_struct_name(en.ts_name) }} __v{};
 {%- for field in variant.fields %}
-      __v.{{ field.ts_name }} = {{ field.ty.stream_read_expr() }};
+      __v.{{ field.ts_name }} = {{ field.ty.stream_read_expr(module.namespace) }};
 {%- endfor %}
       return {{ en.ts_name }}{ {{ en.ts_name }}::Variant{std::move(__v)} };
     }
@@ -183,6 +202,17 @@ inline {{ en.ts_name }} lift_{{ en.ts_name }}(RustBuffer buf) {
 // `{{ err.lift_fn() }}` and rethrow as `{{ err.cxx_class() }}`; Nitro's
 // HybridFunction::callMethod then translates the C++ throw into a
 // `jsi::JSError` on the JS side.
+//
+// Non-flat error variants carry data: uniffi serializes them as an i32 tag
+// (1-based, declaration order) followed by the variant's fields in order —
+// the exact tagged data-enum wire format (uniffi_macros
+// `rich_error_ffi_converter_impl`). `{{ err.lift_fn() }}` reads those fields
+// back off the wire and folds their rendered values into both the exception
+// `payload` member (for native C++ consumers) and the `what()` message
+// (which is the *only* channel Nitro hands to `jsi::JSError`, so JS sees the
+// payload via `error.message`). Fields whose type can't be rendered (records,
+// data enums, interface handles, or — notably — another error enum used as a
+// field, which has no value reader) fall back to the tag-only message.
 enum class {{ err.cxx_class() }}Kind : int32_t {
 {%- for variant in err.variants %}
   {{ variant.ts_name }} = {{ loop.index }},
@@ -193,21 +223,46 @@ class {{ err.cxx_class() }} : public std::runtime_error {
 public:
   explicit {{ err.cxx_class() }}({{ err.cxx_class() }}Kind kind, const std::string& message)
       : std::runtime_error(message), kind(kind) {}
+  explicit {{ err.cxx_class() }}({{ err.cxx_class() }}Kind kind, const std::string& message,
+                                 std::string payload)
+      : std::runtime_error(message), kind(kind), payload(std::move(payload)) {}
   {{ err.cxx_class() }}Kind kind;
+  // Rendered associated-data fragment for data-carrying variants (empty for
+  // unit variants and for variants whose fields aren't renderable). Mirrors
+  // the trailing `(...)` already folded into `what()`.
+  std::string payload;
 };
 
 inline {{ err.cxx_class() }} {{ err.lift_fn() }}(RustBuffer buf) {
-  // Decode only the variant tag — the associated fields (if any) are
-  // currently dropped. That's fine for the unit-variant errors uniffi
-  // emits when `#[derive(uniffi::Error)]` is the only attribute on the
-  // Rust enum (which is the common case); enums whose variants carry
-  // data lose that data on the JS side until the tagged-variant codec
-  // lands.
+  // Wire format: i32 variant tag (1-based) followed by the variant's fields
+  // in declaration order — identical to a tagged data-enum.
   ::ubrn::nitro::RustBufferReader __reader(buf);
   int32_t __ordinal = __reader.read_i32();
   switch (__ordinal) {
 {%- for variant in err.variants %}
+{%- if variant.error_fields_surfaced() %}
+    case {{ loop.index }}: {
+      ::ubrn::nitro::RustBufferReader& r = __reader;
+      std::string __payload;
+{%- for field in variant.fields %}
+      {
+        auto __f = {{ field.ty.stream_read_expr(module.namespace) }};
+        if (!__payload.empty()) {
+          __payload += ", ";
+        }
+{%- if !field.ts_name.is_empty() %}
+        __payload += "{{ field.ts_name }}=";
+{%- endif %}
+        __payload += ::ubrn::nitro::error_field_to_string(__f);
+      }
+{%- endfor %}
+      return {{ err.cxx_class() }}({{ err.cxx_class() }}Kind::{{ variant.ts_name }},
+                                   "{{ err.ts_name }}::{{ variant.ts_name }}(" + __payload + ")",
+                                   __payload);
+    }
+{%- else %}
     case {{ loop.index }}: return {{ err.cxx_class() }}({{ err.cxx_class() }}Kind::{{ variant.ts_name }}, "{{ err.ts_name }}::{{ variant.ts_name }}");
+{%- endif %}
 {%- endfor %}
     default:
       throw std::runtime_error("{{ err.lift_fn() }}: unknown variant ordinal");

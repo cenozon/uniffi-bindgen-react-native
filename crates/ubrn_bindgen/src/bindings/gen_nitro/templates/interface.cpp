@@ -3,6 +3,12 @@
 // `{{ module.crate_name }}`.
 #include "{{ iface.cxx_class }}.hpp"
 #include "{{ module.codecs_header_filename() }}"
+// Full definitions of interface types this interface constructs / calls
+// (forward-declared in the .hpp, included here where the complete type is
+// needed for `make_shared` and method dispatch).
+{%- for header in iface.interface_dependency_headers() %}
+#include "{{ header }}"
+{%- endfor %}
 
 #include <NitroModules/Promise.hpp>
 
@@ -92,7 +98,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- if method.is_async %}
 {%- if let Some(ad) = method.async_data %}
 {%- for arg in method.args %}
-  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endfor %}
   uint64_t __handle = {{ method.uniffi_symbol }}(clone_handle(){% if !method.args.is_empty() %},{% endif %}
 {%- for arg in method.args -%}
@@ -139,13 +145,13 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- endif %}
 {%- if method.return_kind.returns_owned_rustbuffer() %}
 {%- if ret_ty.lift_consumes_buffer() %}
-        return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+        return {{ ret_ty.lift_owning_expr("__raw", module.namespace, module.rustbuffer_free) }};
 {%- else %}
         ::ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
-        return {{ ret_ty.lift_expr("__raw") }};
+        return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- else %}
-        return {{ ret_ty.lift_expr("__raw") }};
+        return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- endmatch %}
       });
@@ -153,7 +159,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- else %}
   auto __status = ubrn::nitro::make_status();
 {%- for arg in method.args %}
-  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
 {%- endfor %}
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
@@ -196,15 +202,15 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- if ret_ty.lift_consumes_buffer() %}
   // Zero-copy: hand the Rust-owned buffer's payload straight to JS as the
   // ArrayBuffer backing store; freed via the namespace hook on JS GC.
-  return {{ ret_ty.lift_owning_expr("__raw", module.rustbuffer_free) }};
+  return {{ ret_ty.lift_owning_expr("__raw", module.namespace, module.rustbuffer_free) }};
 {%- else %}
   // RAII: free the Rust-owned return buffer on scope exit, so a throwing
   // lift (malformed payload / OOM) can't leak it.
   ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
-  return {{ ret_ty.lift_expr("__raw") }};
+  return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- else %}
-  return {{ ret_ty.lift_expr("__raw") }};
+  return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
 {%- endmatch %}
 {%- endif %}
