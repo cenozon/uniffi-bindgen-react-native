@@ -2,10 +2,12 @@
 //
 // `JNI_OnLoad` is the C++ entrypoint Android calls the *first* time
 // `System.loadLibrary("{{ self.config.project.module_cpp() }}")` runs.
-// Nitrogen requires us to invoke `registerAllNatives()` here — it's where
-// every Hybrid Object's JNI bridge gets registered with `fbjni` and where
-// `HybridObjectRegistry::registerHybridObjectConstructor("{{ self.config.project.spec_name() }}Installer", …)`
-// is finally called.
+//
+// We do NOT register HybridObjects here: that happens automatically at
+// library-load time via the static initializer in `register_natives.cpp`
+// (which runs the moment this .so is mapped in, before any JS executes).
+// `JNI_OnLoad` only needs to initialize fbjni and return `JNI_VERSION_1_6`
+// so that `System.loadLibrary` succeeds. No nitrogen OnLoad is involved.
 //
 // The kotlin `{{ self.config.project.module_cpp() }}Package` class loads this
 // .so from its `companion object { init { … } }` block (see
@@ -16,10 +18,9 @@
 #include <fbjni/fbjni.h>
 #include <jni.h>
 
-#include "{{ self.config.project.module_cpp() }}OnLoad.hpp"
-
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
   return facebook::jni::initialize(vm, []() {
-    margelo::nitro::{{ self.config.project.cpp_namespace() }}::registerAllNatives();
+    // HybridObjects were already registered by the static initializer in
+    // register_natives.cpp when this .so was loaded. Nothing to do here.
   });
 }

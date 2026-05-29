@@ -75,10 +75,14 @@ pub(super) fn write_codecs(cpp_dir: &Utf8Path, module: &NitroModule) -> Result<(
     Ok(())
 }
 
-/// Emit the project-level `register_natives.cpp` glue file. Single
-/// `extern "C" void registerNatives(jsi::Runtime&)` that walks the
+/// Emit the project-level `register_natives.cpp` glue file. Walks the
 /// collected [`HybridObjectEntry`] list and registers every constructor
-/// with Nitro's process-global `HybridObjectRegistry`.
+/// with Nitro's process-global `HybridObjectRegistry`. Registration runs
+/// automatically at library-load time via a static initializer (mobile +
+/// desktop), and an idempotent `extern "C" void registerNatives(jsi::Runtime&)`
+/// is also exposed for the desktop test runner. A `std::once_flag` ensures
+/// registration happens exactly once across both entry points. This replaces
+/// nitrogen's `OnLoad`/autolinking — nitrogen is never invoked.
 ///
 /// Always emits a file — an empty `hybrid_objects` slice produces a
 /// well-formed but no-op function so downstream `add_library` source
