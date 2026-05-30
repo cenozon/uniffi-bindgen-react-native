@@ -217,7 +217,10 @@ using HandleMap = ubrn::nitro::CallbackHandleMap<{{ cb.cxx_class }}>;
 // pointer + a status out-param: we look up the JS-side instance, lift each
 // arg (freeing any RustBuffer arg Rust handed us), invoke the method, and
 // write the lowered result through `uniffi_out_return`. JS-side exceptions
-// surface as code=2 (unexpected). For ASYNC methods uniffi instead passes a
+// surface as code=2 (unexpected): uniffi lifts the buffer as a String and, for
+// a fallible method, runs `From<UnexpectedUniFFICallbackError>`; an infallible
+// method panics by design (no typed-error *lower* path exists to send code=1).
+// For ASYNC methods uniffi instead passes a
 // foreign-future callback (+ its data handle + a dropped-callback out-param):
 // we call the JS method to get a `Promise<T>`, register resolve/reject
 // continuations, and invoke `uniffi_callback(uniffi_callback_data, result)`
@@ -281,8 +284,11 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
                     result.call_status.error_buf = RustBuffer{};
                 } catch (const std::exception& __e) {
                     // Lowering the resolved value failed (e.g. alloc): report
-                    // as an unexpected error rather than handing Rust a
-                    // partially-built result.
+                    // as code=2 with a String message rather than handing Rust
+                    // a partially-built result. For a fallible method uniffi
+                    // routes this through `From<UnexpectedUniFFICallbackError>`;
+                    // for an infallible method it panics (by design — see the
+                    // reject listener below).
                     result.return_value = {{ ret_ty.c_type() }}{};
                     result.call_status.code = 2;
                     result.call_status.error_buf =
@@ -295,11 +301,28 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
             [uniffi_callback, uniffi_callback_data, self](const std::exception_ptr& __error) {
                 // The JS method rejected. We only have the (message) string —
                 // Nitro flattens a thrown JS value to a `std::exception`'s
-                // `what()`. Report it as code=2 (unexpected); uniffi runs the
-                // method error type's `From<UnexpectedUniFFICallbackError>`
-                // conversion on the decoded message. (Routing a *typed* error
-                // back as code=1 would require recovering the original enum,
-                // which the Nitro error channel does not preserve.)
+                // `what()`, so we cannot recover the typed Rust error enum.
+                //
+                // We report code=2 (the ForeignFutureResult "unexpected"
+                // channel). uniffi_core 0.31 `LiftReturn::lift_foreign_return`
+                // treats the codes as:
+                //   * code=1: decode error_buf as the *typed error enum* via
+                //     `lift_error` — needs the rich-error wire bytes, which we
+                //     do not have (Nitro keeps no typed error, and gen_nitro
+                //     emits only `lift_<Name>Error`, never an error *lower*).
+                //   * code=2: lift error_buf as a *String*, then:
+                //       - fallible method (`Result<_, E>`): run the author's
+                //         `From<UnexpectedUniFFICallbackError> for E` — the
+                //         intended, non-panicking fallback. CORRECT here.
+                //       - infallible method: the default
+                //         `handle_callback_unexpected_error` PANICS across the
+                //         FFI boundary. This is uniffi-by-design: an infallible
+                //         async trait method has no slot for a foreign failure.
+                //         We must NOT fabricate a code=0 success with a default
+                //         return value to dodge it — that feeds Rust a bogus
+                //         value (ABI corruption, worse than a panic).
+                // The buffer must be a String either way, so code=2 is the only
+                // correct code for a message-string reject.
                 std::string __msg;
                 try {
                     std::rethrow_exception(__error);
@@ -322,7 +345,10 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     } catch (const std::exception& e) {
         // Synchronous failure before the promise was wired (e.g. an unknown
         // handle, or the JS method threw synchronously). Report immediately
-        // via the foreign-future callback as an unexpected error.
+        // via the foreign-future callback as code=2 with a String message —
+        // same typed-vs-unexpected reasoning as the reject listener: a fallible
+        // method runs `From<UnexpectedUniFFICallbackError>`, an infallible
+        // method panics by design. We have no typed error to send as code=1.
         ::ubrn::nitro::ForeignFutureResult<{{ method.return_kind.c_type() }}> result{};
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}

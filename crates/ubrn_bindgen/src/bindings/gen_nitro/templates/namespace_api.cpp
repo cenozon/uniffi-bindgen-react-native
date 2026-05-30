@@ -70,8 +70,18 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 ) {
 {%- if func.is_async %}
 {%- if let Some(ad) = func.async_data %}
+  // Exception-safe lowering: owning RustBuffer args are parked in move-only
+  // guards and `.take()`-d into the kick-off only after every lowering has
+  // succeeded, so a throw mid-prologue frees the already-built buffers instead
+  // of leaking them. Free functions have no receiver handle to guard.
 {%- for arg in func.args %}
+{%- if arg.ty.is_rust_buffer() %}
+  ubrn::nitro::RustBufferGuard {{ arg.ts_name }}_guard{
+      {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }},
+      &free_status_buffer};
+{%- else %}
   auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+{%- endif %}
 {%- endfor %}
   // Kick off the future eagerly: lowered-arg ownership transfers to Rust at
   // this call. We then arm the uniffi continuation and resolve the Promise
@@ -79,7 +89,7 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
   // `drive_rust_future_async`.
   uint64_t __handle = {{ func.uniffi_symbol }}(
 {%- for arg in func.args -%}
-    {{ arg.ts_name }}_lowered{% if !loop.last %}, {% endif %}
+    {% if arg.ty.is_rust_buffer() %}{{ arg.ts_name }}_guard.take(){% else %}{{ arg.ts_name }}_lowered{% endif %}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   );
 {%- match func.return_kind %}
@@ -129,14 +139,24 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- endif %}
 {%- else %}
   auto __status = ubrn::nitro::make_status();
+  // Exception-safe lowering: owning RustBuffer args are parked in move-only
+  // guards and `.take()`-d into the FFI call only once every lowering has
+  // succeeded, so a throw mid-prologue frees the already-built buffers instead
+  // of leaking them. Free functions have no receiver handle to guard.
 {%- for arg in func.args %}
+{%- if arg.ty.is_rust_buffer() %}
+  ubrn::nitro::RustBufferGuard {{ arg.ts_name }}_guard{
+      {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }},
+      &free_status_buffer};
+{%- else %}
   auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+{%- endif %}
 {%- endfor %}
 {%- match func.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
   {{ func.uniffi_symbol }}(
 {%- for arg in func.args -%}
-    {{ arg.ts_name }}_lowered,
+    {% if arg.ty.is_rust_buffer() %}{{ arg.ts_name }}_guard.take(){% else %}{{ arg.ts_name }}_lowered{% endif %},
 {%- endfor -%}
     &__status);
 {%- if let Some(throws) = func.throws %}
@@ -154,7 +174,7 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
   auto __raw = {{ func.uniffi_symbol }}(
 {%- for arg in func.args -%}
-    {{ arg.ts_name }}_lowered,
+    {% if arg.ty.is_rust_buffer() %}{{ arg.ts_name }}_guard.take(){% else %}{{ arg.ts_name }}_lowered{% endif %},
 {%- endfor -%}
     &__status);
 {%- if let Some(throws) = func.throws %}

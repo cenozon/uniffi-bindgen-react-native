@@ -108,14 +108,16 @@ fn nitro_emit_against_callbacks_cdylib() {
     );
 
     // Composite types come through with the expected TS spellings.
-    //   `string?` → `(string) | null`
+    //   `string?` → `(string) | undefined`
     //   `sequence<i32>` → `(number)[]`
-    //   `sequence<f64?>?` → `((number) | null)[] | null`
-    //   The exact `(x) | null` parenthesization matters for the recursive
-    //   composer; assert on both the inner and outer markers separately.
+    //   `sequence<f64?>?` → `((number) | undefined)[] | undefined`
+    //   Optionals spell `| undefined` (not `| null`) because Nitro's
+    //   `JSIConverter<std::optional<T>>` maps `nullopt` to/from JS `undefined`
+    //   only; the exact `(x) | undefined` parenthesization matters for the
+    //   recursive composer.
     assert!(
-        spec.contains("| null"),
-        "spec should mention nullable type:\n{spec}"
+        spec.contains("| undefined"),
+        "spec should mention optional type:\n{spec}"
     );
     assert!(
         spec.contains(")[]"),

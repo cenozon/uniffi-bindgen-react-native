@@ -88,9 +88,32 @@ class RustBufferGuard {
 public:
   RustBufferGuard(RustBuffer buf, void (*free_fn)(RustBuffer) noexcept) noexcept
       : buf_(buf), free_fn_(free_fn) {}
-  ~RustBufferGuard() { free_fn_(buf_); }
+  ~RustBufferGuard() {
+    // After `take()` the buffer is zeroed and ownership has moved to Rust;
+    // skip the free so we never double-free.
+    if (buf_.data != nullptr || buf_.len != 0 || buf_.capacity != 0) {
+      free_fn_(buf_);
+    }
+  }
   RustBufferGuard(const RustBufferGuard &) = delete;
   RustBufferGuard &operator=(const RustBufferGuard &) = delete;
+  // Move-only: lets a lowered-arg guard live in a local and be handed off.
+  RustBufferGuard(RustBufferGuard &&other) noexcept
+      : buf_(other.buf_), free_fn_(other.free_fn_) {
+    other.buf_ = RustBuffer{};
+  }
+  RustBufferGuard &operator=(RustBufferGuard &&) = delete;
+
+  /// Release the buffer without freeing — hands ownership to Rust at the FFI
+  /// call, but only after every argument lowering has succeeded. Until then
+  /// the destructor frees the buffer, so a throw mid-prologue (e.g. a later
+  /// arg's allocation failing) unwinds the already-built buffers instead of
+  /// leaking them.
+  RustBuffer take() noexcept {
+    RustBuffer out = buf_;
+    buf_ = RustBuffer{};
+    return out;
+  }
 
 private:
   RustBuffer buf_;

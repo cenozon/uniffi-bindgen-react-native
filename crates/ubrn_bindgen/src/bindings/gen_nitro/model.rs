@@ -1600,7 +1600,16 @@ impl NitroType {
             Self::Bytes => "ArrayBuffer".into(),
             Self::Timestamp => "Date".into(),
             Self::Duration => "number".into(),
-            Self::Optional(inner) => format!("({}) | null", inner.ts_type()),
+            // `| undefined`, not `| null`: at the HybridObject boundary
+            // optionals are converted by Nitro core's
+            // `JSIConverter<std::optional<T>>`, which maps `nullopt` to/from
+            // JS `undefined` only (a literal `null` fails `canConvert`). ubrn
+            // ships no override (and couldn't without an ODR clash against
+            // Nitro's `final` specialization), so the generated type must
+            // spell the only achievable runtime semantics — `T | undefined` —
+            // matching how Nitro itself models optionals and the idiomatic
+            // `field?:` / `obj?.x` usage.
+            Self::Optional(inner) => format!("({}) | undefined", inner.ts_type()),
             Self::Sequence(inner) => format!("({})[]", inner.ts_type()),
             Self::Map(k, v) => {
                 // TS `Record<K, V>` requires `K` extend `string | number | symbol`.
@@ -2759,13 +2768,27 @@ impl NitroEnum {
 /// Make `name` safe to use as a C++ identifier by appending `_` when it
 /// collides with a reserved keyword (C++20 keywords + alternative tokens +
 /// `override`/`final` which are context-sensitive but reserved here because
-/// the generated method bodies use them as virtual-override declarations).
+/// the generated method bodies use them as virtual-override declarations) OR
+/// with a `margelo::nitro::HybridObject` base-class virtual method name.
 ///
 /// Applied ONLY to the C++-facing identifier (`cxx_name`); the JS-facing
 /// `ts_name` — and the string passed to `registerHybridMethod` — keep the
 /// original spelling so the JS surface is unchanged. A uniffi method named
 /// `delete` thus emits `Hybrid::delete_(...)` while staying registered as
 /// `"delete"`.
+///
+/// The `HybridObject` reservation prevents a uniffi method whose name maps to
+/// a base virtual (e.g. Rust `to_string` -> `toString`, or `equals`/`dispose`)
+/// from silently re-declaring that virtual on the generated subclass. Without
+/// the suffix, a same-signature collision (`toString`) becomes a true vtable
+/// override — hijacking the framework's own C++ `hybrid->toString()` debug
+/// path so it dispatches into a Rust FFI call that can throw — and a
+/// different-signature collision (`equals`/`dispose`) becomes a hidden
+/// `-Woverloaded-virtual` overload. Suffixing the C++ name (`toString_`) keeps
+/// the base virtuals intact for Nitro's internal use while the uniffi method
+/// is still reachable from JS under its original name via the derived
+/// prototype (Nitro keys prototypes by the derived type, so the JS-level
+/// shadow of the same-named base method is intentional and unaffected).
 fn sanitize_cxx_ident(name: &str) -> String {
     // C++20 keyword set (incl. alternative-token operator keywords and the
     // context-sensitive identifiers we treat as reserved). Kept exhaustive so
@@ -2872,7 +2895,19 @@ fn sanitize_cxx_ident(name: &str) -> String {
         "xor",
         "xor_eq",
     ];
-    if CXX_KEYWORDS.contains(&name) {
+    // Virtual (or JS-registered) methods declared by `margelo::nitro::
+    // HybridObject` that a generated subclass must not re-declare. Names are
+    // the C++/JS method spellings (lowerCamelCase, post-`to_lower_camel_case`)
+    // — `toString`/`equals`/`dispose` are `virtual`, `getName` backs the
+    // registered `name` getter. Sourced from
+    // `react-native-nitro-modules` `cpp/core/HybridObject.{hpp,cpp}`.
+    const NITRO_HYBRIDOBJECT_METHODS: &[&str] = &[
+        "toString",
+        "equals",
+        "dispose",
+        "getName",
+    ];
+    if CXX_KEYWORDS.contains(&name) || NITRO_HYBRIDOBJECT_METHODS.contains(&name) {
         format!("{name}_")
     } else {
         name.to_string()
@@ -3141,6 +3176,37 @@ mod tests {
         // identifiers degrade to `<name>_` rather than emitting invalid TS.
         for w in ["arguments", "eval", "default", "function", "yield", "await"] {
             assert_eq!(sanitize_ts_arg_ident(w), format!("{w}_"));
+        }
+    }
+
+    #[test]
+    fn cxx_keywords_are_suffixed() {
+        // A uniffi method/field whose name is a C++ keyword degrades to
+        // `<name>_` so the emitted C++ stays valid.
+        assert_eq!(sanitize_cxx_ident("delete"), "delete_");
+        assert_eq!(sanitize_cxx_ident("union"), "union_");
+        assert_eq!(sanitize_cxx_ident("else"), "else_");
+    }
+
+    #[test]
+    fn nitro_hybridobject_base_methods_are_suffixed() {
+        // A uniffi method whose camelCased name collides with a Nitro
+        // `HybridObject` base virtual must be suffixed on the C++ side so it
+        // does not silently override (`toString`) or overload
+        // (`equals`/`dispose`) the framework method. The JS registration name
+        // (`ts_name`) is unaffected — only `cxx_name` flows through here.
+        for m in ["toString", "equals", "dispose", "getName"] {
+            assert_eq!(sanitize_cxx_ident(m), format!("{m}_"));
+        }
+    }
+
+    #[test]
+    fn ordinary_method_names_pass_through_cxx_unchanged() {
+        // Names that collide with neither a C++ keyword nor a Nitro base
+        // method are emitted verbatim — including `toStr`, which is distinct
+        // from the reserved `toString`.
+        for m in ["toStr", "isNode", "timestampMs", "asBytes", "connect"] {
+            assert_eq!(sanitize_cxx_ident(m), m);
         }
     }
 
