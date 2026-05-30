@@ -34,8 +34,16 @@
 #pragma once
 
 #include <NitroModules/Promise.hpp>
-#include <UniffiRustCallStatus.h>
-#include <nitro-uniffi/js_dispatcher.hpp>
+// Quote-relative (not <angled>) so these resolve against this header's own
+// location regardless of the consumer's HEADER_SEARCH_PATHS. The iOS pod
+// is consumed via `:path` (node_modules), so every header is physically
+// present next to this file, but only the top-level `cpp/includes` dir is
+// reliably on the angle-include search path — an `<nitro-uniffi/...>` angle
+// include of a sibling fails under CocoaPods' framework-module build (this
+// is exactly clang's "use quotes instead" diagnostic). Matches the
+// quote-relative convention `NitroUniffi.hpp` already uses for these splits.
+#include "../UniffiRustCallStatus.h"
+#include "js_dispatcher.hpp"
 
 #include <cstdint>
 #include <exception>
