@@ -627,6 +627,12 @@ mod tests {
         assert!(!s.contains("isNewArchitectureEnabled"));
         assert!(!s.contains("apply plugin: \"com.facebook.react\""));
         assert!(!s.contains("libraryName"));
+        // proguard-rules.pro is gated on native_bindings (JNA keep-rules) — it
+        // is NOT emitted for this config (native_bindings=false), so the
+        // `consumerProguardFiles` reference must also be absent. Referencing a
+        // file that wasn't shipped makes Gradle fail with "Supplied consumer
+        // proguard configuration does not exist".
+        assert!(!s.contains("consumerProguardFiles"));
         Ok(())
     }
 
@@ -646,6 +652,14 @@ mod tests {
         // TurboModule-era fallbacks must not bring in turbomodule/core.
         assert!(!s.contains("ReactCommon/turbomodule/core"));
         assert!(!s.contains("React-Codegen"));
+        // The generated C++ angle-includes ubrn runtime headers without a
+        // pod-name prefix (<RustBuffer.h>, <NitroUniffi.hpp>, <nitro-uniffi/...>),
+        // which live in the uniffi-bindgen-react-native pod. The podspec must put
+        // that pod's public-headers dir on HEADER_SEARCH_PATHS so they resolve on
+        // iOS, preserving inherited paths.
+        assert!(s.contains("HEADER_SEARCH_PATHS"));
+        assert!(s.contains("Headers/Public/uniffi-bindgen-react-native"));
+        assert!(s.contains("$(inherited)"));
         Ok(())
     }
 

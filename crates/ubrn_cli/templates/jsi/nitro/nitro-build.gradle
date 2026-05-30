@@ -57,7 +57,14 @@ android {
   defaultConfig {
     minSdkVersion getExtOrIntegerDefault("minSdkVersion")
     targetSdkVersion getExtOrIntegerDefault("targetSdkVersion")
+{%- if jna_required %}
+    // proguard-rules.pro carries the JNA keep-rules and is only emitted when
+    // native (JNA) bindings are generated — see `ProguardRules::filter_by`,
+    // gated on the same `native_bindings` flag. Referencing it unconditionally
+    // when it wasn't emitted makes Gradle fail with "Supplied consumer proguard
+    // configuration does not exist", so the reference is gated to match.
     consumerProguardFiles 'proguard-rules.pro'
+{%- endif %}
 
     buildFeatures {
       prefab true
