@@ -43,16 +43,6 @@ void {{ ad.free_symbol }}(uint64_t handle);
 
 namespace margelo::nitro::{{ module.namespace }} {
 
-namespace {
-/// Hands an error / unexpected-error RustBuffer back to Rust's allocator.
-/// Re-spelled as a local lambda for `check_status` because the buffer-
-/// free symbol name is per-namespace.
-inline void free_status_buffer(RustBuffer buf) noexcept {
-  UniffiRustCallStatus s{};
-  {{ module.rustbuffer_free }}(buf, &s);
-}
-} // namespace
-
 void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
   HybridObject::loadHybridMethods();
   registerHybrids(this, [](Prototype& prototype) {

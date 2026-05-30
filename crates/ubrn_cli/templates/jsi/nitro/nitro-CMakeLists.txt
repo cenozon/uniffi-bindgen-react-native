@@ -44,6 +44,11 @@ add_library({{ name }} SHARED
     {{ bindings_dir }}/register_natives.cpp
     cpp-adapter.cpp
 )
+# NOTE: cpp/generated/amalgam/*.cpp (the iOS-only unity chunks) are
+# intentionally NOT compiled here. Android keeps per-object translation
+# units to avoid the single-giant-TU compile OOM; the amalgamation exists
+# solely to keep iOS's libtool static archive under the 4GB member-offset
+# limit.
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -frtti")

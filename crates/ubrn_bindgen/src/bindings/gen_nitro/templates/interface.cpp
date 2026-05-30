@@ -48,13 +48,6 @@ void {{ ad.free_symbol }}(uint64_t handle);
 
 namespace margelo::nitro::{{ module.namespace }} {
 
-namespace {
-inline void free_status_buffer(RustBuffer buf) noexcept {
-  UniffiRustCallStatus s{};
-  {{ module.rustbuffer_free }}(buf, &s);
-}
-} // namespace
-
 uint64_t {{ iface.cxx_class }}::clone_handle() const {
   // A zero handle means this is a default-constructed shell (an interface
   // whose construction needs arguments, reached via the argless JS shim).

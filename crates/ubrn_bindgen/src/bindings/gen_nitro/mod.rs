@@ -61,6 +61,15 @@ use crate::bindings::metadata::ModuleMetadata;
 pub use self::model::HybridObjectKind;
 use self::model::NitroModule;
 
+/// Number of iOS unity/amalgamation chunks the Nitro backend emits. iOS
+/// compiles K chunks (each #include-ing a disjoint subset of the
+/// per-object Hybrid*.cpp) instead of ~N per-object TUs, so the shared-
+/// header DWARF is emitted ~K times rather than once per object — keeping
+/// libtool's classic Mach-O static archive under the 32-bit (4GB) member-
+/// offset limit. Android is unchanged (per-object TUs). K is medium so no
+/// single chunk approaches the OOM ceiling.
+const K_AMALGAM_CHUNKS: usize = 8;
+
 /// Result of a `generate_all` invocation. Carries the per-namespace
 /// [`ModuleMetadata`] (for the build flow that needs to iterate them) plus
 /// the deduplicated set of HybridObject TS names that ubrn-bindgen
@@ -170,6 +179,11 @@ pub fn generate_all(
     // but emitting unconditionally keeps the CMakeLists source list
     // invariant across platforms.
     cpp::write_register_natives(cpp_dir, &hybrid_objects)?;
+
+    // iOS-only unity chunks (#include subsets of the per-object .cpp). The
+    // podspec compiles these K chunks instead of the per-object TUs;
+    // Android's CMakeLists keeps enumerating the per-object .cpp directly.
+    cpp::write_amalgam_chunks(cpp_dir, &hybrid_objects)?;
 
     // Leave the thread-local clean for the next generate in this thread (the
     // next run also clears up-front, so a `?` early-return above is harmless).

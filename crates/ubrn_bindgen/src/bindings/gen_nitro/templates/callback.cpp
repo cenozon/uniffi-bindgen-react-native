@@ -77,13 +77,6 @@ uint64_t {{ proxy.clone_symbol }}(uint64_t handle, UniffiRustCallStatus* status)
 
 namespace margelo::nitro::{{ module.namespace }} {
 
-namespace {
-inline void free_status_buffer(RustBuffer buf) noexcept {
-  UniffiRustCallStatus s{};
-  {{ module.rustbuffer_free }}(buf, &s);
-}
-} // namespace
-
 void {{ cb.cxx_class }}::loadHybridMethods() {
   HybridObject::loadHybridMethods();
   registerHybrids(this, [](Prototype& prototype) {
@@ -210,7 +203,7 @@ uint64_t {{ cb.cxx_class }}::lower_to_handle(const std::shared_ptr<{{ cb.cxx_cla
 
 namespace {
 
-using HandleMap = ubrn::nitro::CallbackHandleMap<{{ cb.cxx_class }}>;
+using {{ cb.cxx_class }}_HandleMap = ubrn::nitro::CallbackHandleMap<{{ cb.cxx_class }}>;
 
 // Per-method trampolines. uniffi calls these through the vtable with the
 // handle + lowered args. For SYNC methods it also passes an out-return
@@ -242,7 +235,7 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     // real no-op function, never null.)
     *uniffi_out_dropped_callback = ::ubrn::nitro::default_foreign_future_dropped_callback();
     try {
-        auto self = HandleMap::instance().get(self_handle);
+        auto self = {{ cb.cxx_class }}_HandleMap::instance().get(self_handle);
 {%- for arg in method.args %}
         auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- if arg.ty.is_rust_buffer() %}
@@ -377,7 +370,7 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     UniffiRustCallStatus* uniffi_out_call_status
 ) {
     try {
-        auto self = HandleMap::instance().get(self_handle);
+        auto self = {{ cb.cxx_class }}_HandleMap::instance().get(self_handle);
 {%- for arg in method.args %}
         auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- if arg.ty.is_rust_buffer() %}
@@ -418,14 +411,14 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
 /// same foreign instance. The handle map stores a `shared_ptr`, so we look
 /// it up and re-insert. No status param in uniffi's vtable ABI.
 extern "C" uint64_t {{ cb.ts_name }}_trampoline_clone(uint64_t handle) {
-    auto self = HandleMap::instance().get(handle);
-    return HandleMap::instance().insert(self);
+    auto self = {{ cb.cxx_class }}_HandleMap::instance().get(handle);
+    return {{ cb.cxx_class }}_HandleMap::instance().insert(self);
 }
 
 /// Free trampoline (`uniffi_free`): Rust calls this once per insert. No
 /// status param in uniffi's vtable ABI.
 extern "C" void {{ cb.ts_name }}_trampoline_free(uint64_t handle) {
-    HandleMap::instance().remove(handle);
+    {{ cb.cxx_class }}_HandleMap::instance().remove(handle);
 }
 
 // repr(C) mirror of uniffi 0.31's `UniFfiTraitVtable{{ cb.ts_name }}`. Field

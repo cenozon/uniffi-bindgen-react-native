@@ -660,15 +660,21 @@ mod tests {
         assert!(s.contains("HEADER_SEARCH_PATHS"));
         assert!(s.contains("Headers/Public/uniffi-bindgen-react-native"));
         assert!(s.contains("$(inherited)"));
-        // All configs use -fno-standalone-debug (Android's homing mode) so the
-        // per-TU DWARF duplication does not overflow libtool's classic Mach-O .a
-        // 32-bit member-offset field -- Release archives the same standalone DWARF
-        // and hits the same 4GB ceiling. It must NOT strip symbols (debug info,
-        // line tables and backtrace symbolication are preserved) and must NOT be
-        // config-gated (no [config=...] suffix).
-        assert!(s.contains("\"OTHER_CPLUSPLUSFLAGS\" => \"$(inherited) -fno-standalone-debug\""));
-        assert!(s.contains("\"OTHER_CFLAGS\" => \"$(inherited) -fno-standalone-debug\""));
-        assert!(!s.contains("OTHER_CPLUSPLUSFLAGS[config="));
+        // The -fno-standalone-debug workaround is REMOVED: the iOS amalgamation
+        // (compiling K unity chunks instead of ~257 per-object TUs) is the real
+        // fix for the libtool 4GB archive overflow, so full standalone debug info
+        // is retained.
+        assert!(!s.contains("-fno-standalone-debug"));
+        assert!(!s.contains("OTHER_CPLUSPLUSFLAGS"));
+        assert!(!s.contains("OTHER_CFLAGS"));
+        // c++20 + interop settings the Nitro runtime needs stay.
+        assert!(s.contains("\"CLANG_CXX_LANGUAGE_STANDARD\" => \"c++20\""));
+        // iOS compiles ONLY the amalgam chunks + register_natives.cpp, not the
+        // per-object Hybrid*.cpp: source_files names the amalgam dir + headers.
+        assert!(s.contains("amalgam/*.cpp"));
+        assert!(s.contains("register_natives.cpp"));
+        assert!(s.contains("{hpp,h}"));
+        assert!(!s.contains("/**/*.{hpp,cpp,c,h}"));
         Ok(())
     }
 

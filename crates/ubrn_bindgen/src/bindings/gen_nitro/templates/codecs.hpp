@@ -49,6 +49,7 @@
 extern "C" {
 RustBuffer {{ module.rustbuffer_alloc }}(uint64_t size, UniffiRustCallStatus* status);
 RustBuffer {{ module.rustbuffer_reserve }}(RustBuffer buf, uint64_t add, UniffiRustCallStatus* status);
+void {{ module.rustbuffer_free }}(RustBuffer buf, UniffiRustCallStatus* status);
 }
 
 namespace margelo::nitro::{{ module.namespace }} {
@@ -59,6 +60,15 @@ namespace margelo::nitro::{{ module.namespace }} {
 using Writer =
     ::ubrn::nitro::RustBufferWriter<&{{ module.rustbuffer_alloc }}, &{{ module.rustbuffer_reserve }}>;
 using ::ubrn::nitro::RustBufferReader;
+
+// Hands an error / unexpected-error RustBuffer back to Rust's allocator.
+// One definition per namespace here (this header is #pragma once and is
+// #included by every impl .cpp), so the per-object .cpp can be #include-
+// amalgamated into a single iOS unity TU without colliding.
+inline void free_status_buffer(RustBuffer buf) noexcept {
+  UniffiRustCallStatus s{};
+  {{ module.rustbuffer_free }}(buf, &s);
+}
 
 // The per-type `write_<Name>` stream codec is *templated on the writer type
 // `W`* (any `RustBufferWriter<Alloc, Reserve>` instantiation). This is what

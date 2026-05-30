@@ -21,12 +21,16 @@ Pod::Spec.new do |s|
 {%- let dir = self.config.project.bindings.cpp_path(root) %}
 {%- let bindings = self.relative_to(root, dir) %}
 
-  # ubrn-emitted C++ sources: the uniffi FFI glue ({{ tm }}), every Nitro
-  # HybridObject impl, and register_natives.cpp ({{ bindings }}). The static
-  # initializer in register_natives.cpp registers every HybridObject with the
-  # HybridObjectRegistry at library-load time, so there is no nitrogen-
-  # generated autolinking ruby to load and no nitrogen file helper to call.
-  s.source_files = "{{ tm }}/**/*.{hpp,cpp,c,h}", "{{ bindings }}/**/*.{hpp,cpp,c,h}"
+  # ubrn-emitted C++ sources. iOS compiles K unity/amalgamation chunks under
+  # {{ bindings }}/amalgam/ (each #include-ing a disjoint subset of the
+  # per-object Hybrid*.cpp) PLUS register_natives.cpp — NOT the per-object
+  # .cpp themselves. This collapses ~one-TU-per-object down to ~K TUs so the
+  # shared-header DWARF stops overflowing libtool's 32-bit Mach-O .a member
+  # offset (>4GB). All headers are still copied so the chunks' nested
+  # includes resolve. The static initializer in register_natives.cpp
+  # registers every HybridObject with the HybridObjectRegistry at library-
+  # load time, so there is no nitrogen autolinking ruby to load.
+  s.source_files = "{{ tm }}/**/*.{hpp,h}", "{{ bindings }}/**/*.{hpp,h}", "{{ bindings }}/amalgam/*.cpp", "{{ bindings }}/register_natives.cpp"
   s.vendored_frameworks = "{{ framework }}"
   s.dependency    "uniffi-bindgen-react-native", "{{ self.config.project.ubrn_version() }}"
 
@@ -44,28 +48,6 @@ Pod::Spec.new do |s|
     "SWIFT_OBJC_INTEROP_MODE" => "objcxx",
     "DEFINES_MODULE" => "YES",
     "SWIFT_INSTALL_OBJC_HEADER" => "NO",
-    # Match Android's debug-info mode. On Darwin clang defaults to
-    # -fstandalone-debug, which emits a COMPLETE standalone type definition in
-    # every TU that merely references a type (constructor/vtable homing OFF).
-    # Across the many ubrn-emitted TUs that all reference the same generated
-    # Nitro/uniffi types + shared STL/JSI headers, that duplicates the same DWARF
-    # per-TU. DWARF is not deduplicated at the .o level, and libtool concatenates
-    # the .o members into a classic Mach-O/BSD ar .a with no DWARF merging, so the
-    # cumulative member offset overflows the 32-bit field (>4GB): the build aborts
-    # with "Assertion failed: (memberOffset < 0xFFFFFFFF) ... ArchiveWriter.cpp".
-    # The Android NDK (ELF/.so) clang DEFAULTS to -fno-standalone-debug for this
-    # type homing, which is why the identical codegen archives fine there.
-    # -fno-standalone-debug is a debug-info MODE change, NOT symbol stripping: it
-    # keeps line tables, breakpoints, stepping, locals, and emits each type's full
-    # definition once in its homing TU (forward-declared elsewhere, resolved by
-    # lldb from the same static lib + dSYM). TU count is unchanged. Applied to ALL
-    # configs, not just Debug: Release archives the same standalone per-TU DWARF
-    # through libtool and hits the identical 4GB ceiling, and crash symbolication
-    # only needs the function/line info this mode still emits in full -- the homed
-    # type definitions it de-duplicates serve variable inspection, not backtraces.
-    # Applied to C too (benign no-op there; the optimization only affects C++).
-    "OTHER_CPLUSPLUSFLAGS" => "$(inherited) -fno-standalone-debug",
-    "OTHER_CFLAGS" => "$(inherited) -fno-standalone-debug",
     # The generated C++ angle-includes the ubrn runtime headers WITHOUT a
     # pod-name prefix (<RustBuffer.h>, <NitroUniffi.hpp>, <nitro-uniffi/...>),
     # which live in the separate `uniffi-bindgen-react-native` pod. CocoaPods
@@ -76,6 +58,7 @@ Pod::Spec.new do |s|
     # install_modules_dependencies injects.
     "HEADER_SEARCH_PATHS" => (current_header_search_paths + [
       "$(inherited)",
+      "\"$(PODS_TARGET_SRCROOT)/{{ bindings }}\"",
       "\"$(PODS_ROOT)/Headers/Public/uniffi-bindgen-react-native\"",
     ]).join(" "),
   })

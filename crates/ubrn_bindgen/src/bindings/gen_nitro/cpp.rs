@@ -15,6 +15,8 @@
 //! 3. `<namespace>_codecs.hpp` — the (currently empty for V1) header
 //!    placeholder for record / enum codecs.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use askama::Template;
 use camino::Utf8Path;
@@ -116,6 +118,51 @@ pub(super) fn write_register_natives(
     Ok(())
 }
 
+/// Emit the iOS-only unity/amalgamation chunks. Each chunk `#include`s a
+/// disjoint subset of the per-object `Hybrid*.cpp` (which stay in
+/// `cpp_dir`); iOS compiles only these chunks (see nitro-podspec.rb),
+/// collapsing ~N heavy TUs to ~K so per-TU shared-header DWARF stops
+/// overflowing libtool's 32-bit Mach-O archive. Android is unaffected
+/// (its CMakeLists enumerates the per-object `.cpp` directly and never
+/// references `amalgam/`). `register_natives.cpp` is intentionally NOT in
+/// `entries`, so it stays its own TU and its load-time static initializer
+/// is defined exactly once. Chunks are grouped per `cxx_namespace` and
+/// partitioned round-robin over the already-name-sorted `entries` so the
+/// largest object does not cluster.
+pub(super) fn write_amalgam_chunks(
+    cpp_dir: &Utf8Path,
+    entries: &[HybridObjectEntry],
+) -> Result<()> {
+    let k = super::K_AMALGAM_CHUNKS;
+    // Chunks live in a dedicated subdir; `write_file` does not create parents.
+    let amalgam_dir = cpp_dir.join("amalgam");
+    ubrn_common::mk_dir(&amalgam_dir)?;
+    // Group by namespace, preserving the incoming (sorted) order.
+    let mut by_ns: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in entries {
+        by_ns
+            .entry(e.cxx_namespace.as_str())
+            .or_default()
+            .push(e.cxx_class.as_str());
+    }
+    for (ns, classes) in &by_ns {
+        // Round-robin partition into k buckets; skip empties.
+        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); k];
+        for (i, cxx_class) in classes.iter().enumerate() {
+            buckets[i % k].push((*cxx_class).to_string());
+        }
+        for (i, bucket) in buckets.iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let text = AmalgamChunkCpp { includes: bucket }.render()?;
+            let path = amalgam_dir.join(format!("{ns}_chunk_{i:02}.cpp"));
+            ubrn_common::write_file(path, text)?;
+        }
+    }
+    Ok(())
+}
+
 /// Emit the per-callback-interface trampoline pair
 /// (`Hybrid<Name>.{hpp,cpp}`) for one callback interface. The hpp
 /// surfaces the `ensure_<Name>_vtable_init` hook; the cpp defines the
@@ -212,4 +259,112 @@ struct CallbackCpp<'a> {
 #[template(syntax = "cpp", escape = "none", path = "register_natives.cpp")]
 struct RegisterNativesCpp<'a> {
     hybrid_objects: &'a [HybridObjectEntry],
+}
+
+#[derive(Template)]
+#[template(syntax = "cpp", escape = "none", path = "amalgam_chunk.cpp")]
+struct AmalgamChunkCpp<'a> {
+    includes: &'a [String],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bindings::gen_nitro::HybridObjectKind;
+    use camino::Utf8PathBuf;
+
+    fn entry(name: &str, ns: &str) -> HybridObjectEntry {
+        HybridObjectEntry {
+            name: name.to_string(),
+            cxx_class: format!("Hybrid{name}"),
+            cxx_namespace: ns.to_string(),
+            kind: HybridObjectKind::Interface,
+        }
+    }
+
+    #[test]
+    fn write_amalgam_chunks_partitions_deterministically() {
+        // Many objects in one namespace: exercises the round-robin split.
+        let entries: Vec<HybridObjectEntry> =
+            (0..20).map(|i| entry(&format!("Obj{i:02}"), "acme")).collect();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cpp_dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_amalgam_chunks(&cpp_dir, &entries).unwrap();
+
+        let amalgam = cpp_dir.join("amalgam");
+        let mut chunk_files: Vec<String> = std::fs::read_dir(&amalgam)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        chunk_files.sort();
+
+        // At most K chunks, and they follow the `<ns>_chunk_NN.cpp` shape.
+        assert!(
+            chunk_files.len() <= super::super::K_AMALGAM_CHUNKS,
+            "emitted {} chunks, expected <= {}",
+            chunk_files.len(),
+            super::super::K_AMALGAM_CHUNKS
+        );
+        for f in &chunk_files {
+            assert!(
+                f.starts_with("acme_chunk_") && f.ends_with(".cpp"),
+                "unexpected chunk filename: {f}"
+            );
+            // NN is exactly two digits.
+            let nn = &f["acme_chunk_".len()..f.len() - ".cpp".len()];
+            assert_eq!(nn.len(), 2, "chunk index not zero-padded 2 digits: {f}");
+            assert!(nn.chars().all(|c| c.is_ascii_digit()), "non-numeric NN: {f}");
+        }
+
+        // Every per-object cxx_class appears in exactly one chunk via a
+        // `#include "../<cxx_class>.cpp"` line; register_natives.cpp never does.
+        let mut seen: std::collections::BTreeMap<String, usize> = Default::default();
+        for f in &chunk_files {
+            let body = std::fs::read_to_string(amalgam.join(f)).unwrap();
+            assert!(
+                !body.contains("register_natives.cpp"),
+                "register_natives.cpp must not be amalgamated: {f}"
+            );
+            for entry in &entries {
+                let needle = format!("#include \"../{}.cpp\"", entry.cxx_class);
+                if body.contains(&needle) {
+                    *seen.entry(entry.cxx_class.clone()).or_default() += 1;
+                }
+            }
+        }
+        for entry in &entries {
+            assert_eq!(
+                seen.get(&entry.cxx_class).copied().unwrap_or(0),
+                1,
+                "{} must appear in exactly one chunk",
+                entry.cxx_class
+            );
+        }
+    }
+
+    #[test]
+    fn write_amalgam_chunks_groups_per_namespace_and_skips_empty() {
+        // Two namespaces, few objects each -> chunk filenames carry the ns and
+        // empty buckets are skipped (fewer than K files per ns).
+        let entries = vec![
+            entry("Alpha", "one"),
+            entry("Beta", "one"),
+            entry("Gamma", "two"),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let cpp_dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_amalgam_chunks(&cpp_dir, &entries).unwrap();
+
+        let amalgam = cpp_dir.join("amalgam");
+        let files: Vec<String> = std::fs::read_dir(&amalgam)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        // 2 ns-`one` objects -> 2 chunks; 1 ns-`two` object -> 1 chunk; empty
+        // buckets skipped.
+        assert_eq!(files.len(), 3, "got {files:?}");
+        assert_eq!(files.iter().filter(|f| f.starts_with("one_chunk_")).count(), 2);
+        assert_eq!(files.iter().filter(|f| f.starts_with("two_chunk_")).count(), 1);
+    }
 }
