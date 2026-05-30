@@ -2735,6 +2735,14 @@ impl NitroEnum {
         !self.cycle_partners.is_empty()
     }
 
+    /// `true` when at least one variant carries payload fields (an `inner`
+    /// object on the JS side). Templates use this to gate emission of the
+    /// hoisted `inner` PropNameID alias so it isn't declared-but-unused (which
+    /// would trip `-Wall -Werror`) for all-fieldless tagged enums.
+    pub fn any_variant_has_fields(&self) -> bool {
+        self.variants.iter().any(|v| !v.fields.is_empty())
+    }
+
     /// Headers this enum's payload structs depend on, deduped and
     /// excluding its own (a recursive enum references itself, which is
     /// handled by in-file forward declaration, not an include) — and, in the

@@ -15,20 +15,47 @@
   && !defined(UBRN_CYC_{{ module.namespace }}_{{ en.ts_name }}_CONV)
 #define UBRN_CYC_{{ module.namespace }}_{{ en.ts_name }}_CONV 1
 
+#include <NitroModules/JSICache.hpp>
+
 namespace margelo::nitro {
+
+// Interned tag-value cache: the variant tag string ("VariantName") is a fixed
+// ASCII literal, so its `jsi::String` can be allocated once per (runtime, tag)
+// and reused, instead of building a fresh `jsi::String` on every `toJSI` node.
+// Defined exactly once per translation unit via the include guard below; the
+// per-enum CONV guard above is unique per enum, so multiple enum converters in
+// one TU would otherwise each emit this definition.
+#ifndef UBRN_INTERNED_TAG
+#define UBRN_INTERNED_TAG 1
+inline const jsi::Value& ubrnInternedTag(jsi::Runtime& runtime, const char* tag) {
+  static std::unordered_map<jsi::Runtime*,
+      std::unordered_map<const char*, BorrowingReference<jsi::Value>>> cache;
+  auto& perRt = cache[&runtime];
+  auto it = perRt.find(tag);
+  if (it != perRt.end() && it->second != nullptr) return *it->second;
+  auto shared = JSICache::getOrCreateCache(runtime)
+                    .makeShared(jsi::Value(jsi::String::createFromAscii(runtime, tag)));
+  auto [pos, _] = perRt.insert_or_assign(tag, std::move(shared));
+  return *pos->second;
+}
+#endif
 
 inline margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}
 JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::fromJSI(jsi::Runtime& runtime, const jsi::Value& arg) {
   using EnumT = margelo::nitro::{{ module.namespace }}::{{ en.ts_name }};
   jsi::Object obj = arg.asObject(runtime);
+  const auto& tag_id = PropNameIDCache::get(runtime, "tag");
+{%- if en.any_variant_has_fields() %}
+  const auto& inner_id = PropNameIDCache::get(runtime, "inner");
+{%- endif %}
   std::string __tag = JSIConverter<std::string>::fromJSI(
-      runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "tag")));
+      runtime, obj.getProperty(runtime, tag_id));
   switch (hashString(__tag.c_str(), __tag.size())) {
 {%- for variant in en.variants %}
     case hashString("{{ variant.ts_name }}"): {
       margelo::nitro::{{ module.namespace }}::{{ variant.cxx_struct_name(en.ts_name) }} __v{};
 {%- if !variant.fields.is_empty() %}
-      jsi::Object __inner = obj.getProperty(runtime, PropNameIDCache::get(runtime, "inner")).asObject(runtime);
+      jsi::Object __inner = obj.getProperty(runtime, inner_id).asObject(runtime);
 {%- if variant.has_nameless_fields %}
       jsi::Array __arr = __inner.asArray(runtime);
 {%- for field in variant.fields %}
@@ -51,10 +78,14 @@ JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::fromJSI(
 inline jsi::Value
 JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::toJSI(jsi::Runtime& runtime, const margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}& arg) {
   jsi::Object obj(runtime);
+  const auto& tag_id = PropNameIDCache::get(runtime, "tag");
+{%- if en.any_variant_has_fields() %}
+  const auto& inner_id = PropNameIDCache::get(runtime, "inner");
+{%- endif %}
   switch (arg.variant.index()) {
 {%- for variant in en.variants %}
     case {{ loop.index0 }}: {
-      obj.setProperty(runtime, PropNameIDCache::get(runtime, "tag"), JSIConverter<std::string>::toJSI(runtime, "{{ variant.ts_name }}"));
+      obj.setProperty(runtime, tag_id, ubrnInternedTag(runtime, "{{ variant.ts_name }}"));
 {%- if !variant.fields.is_empty() %}
       const auto& __v = std::get<{{ loop.index0 }}>(arg.variant);
 {%- if variant.has_nameless_fields %}
@@ -68,7 +99,7 @@ JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::toJSI(js
       __inner.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, __v.{{ field.cxx_name }}));
 {%- endfor %}
 {%- endif %}
-      obj.setProperty(runtime, PropNameIDCache::get(runtime, "inner"), __inner);
+      obj.setProperty(runtime, inner_id, __inner);
 {%- endif %}
       break;
     }
@@ -85,10 +116,11 @@ JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::canConve
     return false;
   }
   jsi::Object obj = value.getObject(runtime);
-  if (!obj.hasProperty(runtime, PropNameIDCache::get(runtime, "tag"))) {
+  const auto& tag_id = PropNameIDCache::get(runtime, "tag");
+  if (!obj.hasProperty(runtime, tag_id)) {
     return false;
   }
-  jsi::Value __tagValue = obj.getProperty(runtime, PropNameIDCache::get(runtime, "tag"));
+  jsi::Value __tagValue = obj.getProperty(runtime, tag_id);
   if (!__tagValue.isString()) {
     return false;
   }

@@ -317,6 +317,23 @@ public:
     buf_.len += n;
   }
 
+  /// Pre-reserve capacity for `n` bytes beyond the current length in a single
+  /// `Reserve` FFI crossing, collapsing the O(log n) incremental `ensure`
+  /// growth crossings into one. Capacity hint only: never writes, never moves
+  /// `len`, never changes emitted bytes — output is byte-identical. If `n`
+  /// undershoots, the per-write `ensure` calls still catch the rest; if it
+  /// matches/overshoots, those `ensure` calls are no-ops.
+  void reserve_additional(size_t n) {
+    if (n == 0 || buf_.len + n <= buf_.capacity)
+      return;
+    UniffiRustCallStatus s{};
+    size_t want = (buf_.len + n) - buf_.capacity;
+    buf_ = Reserve(buf_, static_cast<uint64_t>(want), &s);
+    if (s.code != 0) {
+      throw std::runtime_error("RustBuffer reserve failed");
+    }
+  }
+
   /// Hand ownership of the underlying RustBuffer to the caller. After
   /// this the writer is consumed and must not be used.
   RustBuffer finish() {

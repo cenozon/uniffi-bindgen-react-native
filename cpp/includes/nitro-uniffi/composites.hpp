@@ -346,11 +346,20 @@ inline std::optional<T> lift_optional(RustBuffer buf) {
 // Sequence<T> / Vec<T>.
 // -----------------------------------------------------------------------
 
+template <typename T>
+inline size_t seq_body_size_hint(const std::vector<T> &, size_t) { return 0; }
+inline size_t seq_body_size_hint(const std::vector<std::string> &v, size_t) {
+  size_t total = 0;
+  for (const auto &s : v) total += 4 + s.size();
+  return total;
+}
+
 template <typename T, RustBuffer (*A)(uint64_t, UniffiRustCallStatus *),
           RustBuffer (*R)(RustBuffer, uint64_t, UniffiRustCallStatus *),
           void (*WriteInner)(Writer<A, R> &, const T &)>
 inline void write_sequence(Writer<A, R> &w, const std::vector<T> &v) {
   w.write_i32(static_cast<int32_t>(v.size()));
+  w.reserve_additional(seq_body_size_hint(v, 0));
   for (const auto &item : v) {
     WriteInner(w, item);
   }
@@ -360,6 +369,7 @@ inline void write_sequence(Writer<A, R> &w, const std::vector<T> &v) {
 template <typename T, typename W, void (*WriteInner)(W &, const T &)>
 inline void write_sequence_w(W &w, const std::vector<T> &v) {
   w.write_i32(static_cast<int32_t>(v.size()));
+  w.reserve_additional(seq_body_size_hint(v, 0));
   for (const auto &item : v) {
     WriteInner(w, item);
   }
@@ -477,6 +487,7 @@ inline void write_bytes(Writer<A, R> &w, const BytesT &v) {
   size_t n = (v == nullptr) ? 0 : v->size();
   w.write_i32(static_cast<int32_t>(n));
   if (n > 0) {
+    w.reserve_additional(n);
     w.write_raw_bytes(v->data(), n);
   }
 }
@@ -486,6 +497,7 @@ template <typename W> inline void write_bytes_w(W &w, const BytesT &v) {
   size_t n = (v == nullptr) ? 0 : v->size();
   w.write_i32(static_cast<int32_t>(n));
   if (n > 0) {
+    w.reserve_additional(n);
     w.write_raw_bytes(v->data(), n);
   }
 }
