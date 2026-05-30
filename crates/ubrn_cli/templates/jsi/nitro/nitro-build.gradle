@@ -3,17 +3,25 @@
 {%- let package_name = self.config.project.android.package_name() %}
 {%- let jna_required = self.config.native_bindings %}
 
-buildscript {
-  def kotlin_version = rootProject.ext.has("kotlinVersion") ? rootProject.ext.get("kotlinVersion") : project.properties["{{ name }}_kotlinVersion"]
+// Only pin the Android Gradle Plugin when this package is built standalone
+// (its own gradle invocation, where it IS the root project). When consumed by
+// a host app the package is an included build / subproject; an unconditional
+// `buildscript {}` here would shadow the app's own (typically newer) AGP and
+// force a downgrade. Guarding on `project == rootProject` keeps the pin for
+// the standalone build while deferring to the host's AGP otherwise.
+if (project == rootProject) {
+  buildscript {
+    def kotlin_version = rootProject.ext.has("kotlinVersion") ? rootProject.ext.get("kotlinVersion") : project.properties["{{ name }}_kotlinVersion"]
 
-  repositories {
-    google()
-    mavenCentral()
-  }
+    repositories {
+      google()
+      mavenCentral()
+    }
 
-  dependencies {
-    classpath "com.android.tools.build:gradle:7.2.1"
-    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    dependencies {
+      classpath "com.android.tools.build:gradle:9.2.1"
+      classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
   }
 }
 
@@ -113,3 +121,4 @@ dependencies {
   implementation "net.java.dev.jna:jna:5.17.0@aar"
   {%- endif %}
 }
+

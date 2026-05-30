@@ -34,3 +34,4 @@ export * as {{ m.ts() }} from './{{ bindings }}/{{ m.ts() }}';
 export async function uniffiInitAsync() {
   // NOOP.
 }
+

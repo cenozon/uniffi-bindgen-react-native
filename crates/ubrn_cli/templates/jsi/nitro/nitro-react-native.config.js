@@ -11,8 +11,8 @@
 // `HybridObjectRegistry`. Without this chain,
 // `NitroModules.createHybridObject(…)` throws at runtime.
 //
-// iOS doesn't need the equivalent dance — `+ (void) load` runs the
-// `NitroTestAutolinking.mm` block automatically.
+// iOS doesn't need the equivalent dance — the `+ (void) load` method in
+// the ubrn-emitted autolinking Objective-C block runs automatically.
 const path = require('path');
 
 module.exports = {
@@ -29,3 +29,4 @@ module.exports = {
         },
     },
 };
+

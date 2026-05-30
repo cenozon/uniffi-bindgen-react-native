@@ -22,14 +22,24 @@ JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::fromJSI(
   using EnumT = margelo::nitro::{{ module.namespace }}::{{ en.ts_name }};
   jsi::Object obj = arg.asObject(runtime);
   std::string __tag = JSIConverter<std::string>::fromJSI(
-      runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "type")));
+      runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "tag")));
   switch (hashString(__tag.c_str(), __tag.size())) {
 {%- for variant in en.variants %}
-    case hashString("{{ variant.tag }}"): {
+    case hashString("{{ variant.ts_name }}"): {
       margelo::nitro::{{ module.namespace }}::{{ variant.cxx_struct_name(en.ts_name) }} __v{};
+{%- if !variant.fields.is_empty() %}
+      jsi::Object __inner = obj.getProperty(runtime, PropNameIDCache::get(runtime, "inner")).asObject(runtime);
+{%- if variant.has_nameless_fields %}
+      jsi::Array __arr = __inner.asArray(runtime);
 {%- for field in variant.fields %}
-      __v.{{ field.cxx_name }} = JSIConverter<{{ field.ty.cxx_type() }}>::fromJSI(runtime, obj.getProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}")));
+      __v.{{ field.cxx_name }} = JSIConverter<{{ field.ty.cxx_type() }}>::fromJSI(runtime, __arr.getValueAtIndex(runtime, {{ loop.index0 }}));
 {%- endfor %}
+{%- else %}
+{%- for field in variant.fields %}
+      __v.{{ field.cxx_name }} = JSIConverter<{{ field.ty.cxx_type() }}>::fromJSI(runtime, __inner.getProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}")));
+{%- endfor %}
+{%- endif %}
+{%- endif %}
       return EnumT{EnumT::Variant{std::move(__v)}};
     }
 {%- endfor %}
@@ -44,12 +54,21 @@ JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::toJSI(js
   switch (arg.variant.index()) {
 {%- for variant in en.variants %}
     case {{ loop.index0 }}: {
-      obj.setProperty(runtime, PropNameIDCache::get(runtime, "type"), JSIConverter<std::string>::toJSI(runtime, "{{ variant.tag }}"));
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "tag"), JSIConverter<std::string>::toJSI(runtime, "{{ variant.ts_name }}"));
 {%- if !variant.fields.is_empty() %}
       const auto& __v = std::get<{{ loop.index0 }}>(arg.variant);
+{%- if variant.has_nameless_fields %}
+      jsi::Array __inner(runtime, {{ variant.fields.len() }});
 {%- for field in variant.fields %}
-      obj.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, __v.{{ field.cxx_name }}));
+      __inner.setValueAtIndex(runtime, {{ loop.index0 }}, JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, __v.{{ field.cxx_name }}));
 {%- endfor %}
+{%- else %}
+      jsi::Object __inner(runtime);
+{%- for field in variant.fields %}
+      __inner.setProperty(runtime, PropNameIDCache::get(runtime, "{{ field.ts_name }}"), JSIConverter<{{ field.ty.cxx_type() }}>::toJSI(runtime, __v.{{ field.cxx_name }}));
+{%- endfor %}
+{%- endif %}
+      obj.setProperty(runtime, PropNameIDCache::get(runtime, "inner"), __inner);
 {%- endif %}
       break;
     }
@@ -66,17 +85,17 @@ JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::canConve
     return false;
   }
   jsi::Object obj = value.getObject(runtime);
-  if (!obj.hasProperty(runtime, PropNameIDCache::get(runtime, "type"))) {
+  if (!obj.hasProperty(runtime, PropNameIDCache::get(runtime, "tag"))) {
     return false;
   }
-  jsi::Value __type = obj.getProperty(runtime, PropNameIDCache::get(runtime, "type"));
-  if (!__type.isString()) {
+  jsi::Value __tagValue = obj.getProperty(runtime, PropNameIDCache::get(runtime, "tag"));
+  if (!__tagValue.isString()) {
     return false;
   }
-  std::string __tag = __type.asString(runtime).utf8(runtime);
+  std::string __tag = __tagValue.asString(runtime).utf8(runtime);
   switch (hashString(__tag.c_str(), __tag.size())) {
 {%- for variant in en.variants %}
-    case hashString("{{ variant.tag }}"):
+    case hashString("{{ variant.ts_name }}"):
 {%- endfor %}
       return true;
     default:

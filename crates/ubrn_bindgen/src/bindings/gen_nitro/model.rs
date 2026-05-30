@@ -3023,11 +3023,18 @@ fn strongly_connected_components(
 
 pub struct NitroEnumVariant {
     /// UpperCamelCase variant name as it appears in the TS union literal.
+    /// This is ALSO the runtime `tag` discriminant value: the standard
+    /// uniffi tagged-enum shape keys a value as
+    /// `{ tag: '<UpperCamelVariantName>', inner: <payload> }`, with the tag
+    /// value being the variant name (`to_upper_camel_case`d) — so the Nitro
+    /// surface must agree byte-for-byte with what the NAPI/JSI backends emit.
     pub ts_name: String,
-    /// lowerCamelCase discriminant tag string used on the JS side
-    /// (`{ type: '<tag>' }`). Distinct from `ts_name` so the union member
-    /// reads naturally in TS while the C++ enum member stays UpperCamel.
-    pub tag: String,
+    /// `true` when the variant's fields are positional (a Rust tuple variant,
+    /// `V(T0, T1)`), `false` for named-field or unit variants. Drives the
+    /// `inner` payload shape: tuple variants surface `inner` as a positional
+    /// array (`Readonly<[T0, T1]>`), named variants as an object
+    /// (`Readonly<{ field: T }>`) — mirroring the standard `variant_inner_type`.
+    pub has_nameless_fields: bool,
     /// Associated-data fields, if any. Empty for unit variants.
     pub fields: Vec<NitroRecordField>,
 }
@@ -3058,7 +3065,7 @@ impl NitroEnumVariant {
     fn from_general(variant: &general::Variant) -> Self {
         Self {
             ts_name: variant.name.to_upper_camel_case(),
-            tag: variant.name.to_lower_camel_case(),
+            has_nameless_fields: matches!(variant.fields_kind, general::FieldsKind::Unnamed),
             fields: variant
                 .fields
                 .iter()

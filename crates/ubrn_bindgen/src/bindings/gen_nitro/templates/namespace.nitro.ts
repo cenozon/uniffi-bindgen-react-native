@@ -25,11 +25,15 @@ export interface {{ record.ts_name }} {
 {%- if en.flat %}
 export type {{ en.ts_name }} = {% for variant in en.variants %}'{{ variant.ts_name }}'{% if !loop.last %} | {% endif %}{% endfor %}
 {%- else %}
-// Discriminated union keyed on `type` — matches the `JSIConverter` ubrn
-// emits in `{{ en.ts_name }}.hpp`.
+// Discriminated union keyed on `tag` (the UpperCamelCase variant name),
+// payload nested under `inner` — byte-for-byte the standard uniffi
+// tagged-enum runtime shape the NAPI/JSI backends emit, so a value built by
+// the shared `@<scope>/<crate>-js` layer (or any other ubrn target)
+// round-trips through the `JSIConverter` ubrn emits in `{{ en.ts_name }}.hpp`.
 export type {{ en.ts_name }} =
 {%- for variant in en.variants %}
-  | { type: '{{ variant.tag }}'{% for field in variant.fields %}; {{ field.ts_name }}: {{ field.ty.ts_type() }}{% endfor %} }
+{%- let has_fields = !variant.fields.is_empty() %}
+  | { tag: '{{ variant.ts_name }}'{% if has_fields %}; inner: {% if variant.has_nameless_fields %}Readonly<[{% for field in variant.fields %}{{ field.ty.ts_type() }}{% if !loop.last %}, {% endif %}{% endfor %}]>{% else %}Readonly<{ {% for field in variant.fields %}{{ field.ts_name }}: {{ field.ty.ts_type() }}{% if !loop.last %}; {% endif %}{% endfor %} }>{% endif %}{% endif %} }
 {%- endfor %}
 {%- endif %}
 {% endfor %}
