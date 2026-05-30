@@ -278,7 +278,7 @@ impl NitroModule {
         // value (a direct field, not wrapped) — these must be complete at X's
         // struct definition. Drives the per-partner `by_value` flag below.
         let mut by_value_refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut record_by_value = |from: &str, ty: &NitroType, bv: &mut BTreeSet<String>| {
+        let record_by_value = |from: &str, ty: &NitroType, bv: &mut BTreeSet<String>| {
             if let Some((rns, rname)) = ty.by_value_type() {
                 if rns == ns && nodes.contains(&rname) && rname != from {
                     bv.insert(rname);
@@ -322,7 +322,6 @@ impl NitroModule {
                         name: name.clone(),
                         header: format!("{name}.hpp"),
                         conv_header: format!("{name}.conv.hpp"),
-                        cxx_type: format!("::margelo::nitro::{ns}::{name}"),
                         struct_sentinel: format!("UBRN_CYC_{ns}_{name}_STRUCT"),
                         by_value: owner_bv.contains(name),
                     })
@@ -2633,8 +2632,7 @@ impl NitroRecord {
 /// One member of a record/enum header `#include` cycle (a strongly-connected
 /// component of size ≥ 2). Carries the spellings the cycle-safe templates need:
 /// the partner header to `#include`, its `<Name>.conv.hpp` converter footer,
-/// the fully-qualified C++ type for the `JSIConverter<…>` specialization, and
-/// the `UBRN_CYC_…` preprocessor sentinels that gate out-of-line converter
+/// and the `UBRN_CYC_…` preprocessor sentinels that gate out-of-line converter
 /// emission until every struct in the cycle is complete.
 pub struct CycleMember {
     /// Bare `UpperCamel` type name, e.g. `DbValue` — used to forward-declare
@@ -2644,8 +2642,6 @@ pub struct CycleMember {
     pub header: String,
     /// `<Name>.conv.hpp` — the partner's guarded out-of-line converter footer.
     pub conv_header: String,
-    /// Fully-qualified C++ type, e.g. `::margelo::nitro::ace_db_js::DbValue`.
-    pub cxx_type: String,
     /// `UBRN_CYC_<ns>_<Name>_STRUCT` — defined once the struct is complete.
     pub struct_sentinel: String,
     /// `true` when the *owning* type holds this partner **by value** (a direct
