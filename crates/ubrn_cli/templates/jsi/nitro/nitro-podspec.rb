@@ -44,6 +44,28 @@ Pod::Spec.new do |s|
     "SWIFT_OBJC_INTEROP_MODE" => "objcxx",
     "DEFINES_MODULE" => "YES",
     "SWIFT_INSTALL_OBJC_HEADER" => "NO",
+    # Match Android's debug-info mode. On Darwin clang defaults to
+    # -fstandalone-debug, which emits a COMPLETE standalone type definition in
+    # every TU that merely references a type (constructor/vtable homing OFF).
+    # Across the many ubrn-emitted TUs that all reference the same generated
+    # Nitro/uniffi types + shared STL/JSI headers, that duplicates the same DWARF
+    # per-TU. DWARF is not deduplicated at the .o level, and libtool concatenates
+    # the .o members into a classic Mach-O/BSD ar .a with no DWARF merging, so the
+    # cumulative member offset overflows the 32-bit field (>4GB): the build aborts
+    # with "Assertion failed: (memberOffset < 0xFFFFFFFF) ... ArchiveWriter.cpp".
+    # The Android NDK (ELF/.so) clang DEFAULTS to -fno-standalone-debug for this
+    # type homing, which is why the identical codegen archives fine there.
+    # -fno-standalone-debug is a debug-info MODE change, NOT symbol stripping: it
+    # keeps line tables, breakpoints, stepping, locals, and emits each type's full
+    # definition once in its homing TU (forward-declared elsewhere, resolved by
+    # lldb from the same static lib + dSYM). TU count is unchanged. Applied to ALL
+    # configs, not just Debug: Release archives the same standalone per-TU DWARF
+    # through libtool and hits the identical 4GB ceiling, and crash symbolication
+    # only needs the function/line info this mode still emits in full -- the homed
+    # type definitions it de-duplicates serve variable inspection, not backtraces.
+    # Applied to C too (benign no-op there; the optimization only affects C++).
+    "OTHER_CPLUSPLUSFLAGS" => "$(inherited) -fno-standalone-debug",
+    "OTHER_CFLAGS" => "$(inherited) -fno-standalone-debug",
     # The generated C++ angle-includes the ubrn runtime headers WITHOUT a
     # pod-name prefix (<RustBuffer.h>, <NitroUniffi.hpp>, <nitro-uniffi/...>),
     # which live in the separate `uniffi-bindgen-react-native` pod. CocoaPods

@@ -660,6 +660,15 @@ mod tests {
         assert!(s.contains("HEADER_SEARCH_PATHS"));
         assert!(s.contains("Headers/Public/uniffi-bindgen-react-native"));
         assert!(s.contains("$(inherited)"));
+        // All configs use -fno-standalone-debug (Android's homing mode) so the
+        // per-TU DWARF duplication does not overflow libtool's classic Mach-O .a
+        // 32-bit member-offset field -- Release archives the same standalone DWARF
+        // and hits the same 4GB ceiling. It must NOT strip symbols (debug info,
+        // line tables and backtrace symbolication are preserved) and must NOT be
+        // config-gated (no [config=...] suffix).
+        assert!(s.contains("\"OTHER_CPLUSPLUSFLAGS\" => \"$(inherited) -fno-standalone-debug\""));
+        assert!(s.contains("\"OTHER_CFLAGS\" => \"$(inherited) -fno-standalone-debug\""));
+        assert!(!s.contains("OTHER_CPLUSPLUSFLAGS[config="));
         Ok(())
     }
 
