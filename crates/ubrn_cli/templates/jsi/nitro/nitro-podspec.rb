@@ -38,11 +38,24 @@ Pod::Spec.new do |s|
   # C++20 + Swift/Obj-C++ interop settings the Nitro runtime needs. nitrogen's
   # file helper set these; we set them inline since we no longer call it.
   current_pod_target_xcconfig = s.attributes_hash["pod_target_xcconfig"] || {}
+  current_header_search_paths = Array(current_pod_target_xcconfig["HEADER_SEARCH_PATHS"])
   s.pod_target_xcconfig = current_pod_target_xcconfig.merge({
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     "SWIFT_OBJC_INTEROP_MODE" => "objcxx",
     "DEFINES_MODULE" => "YES",
     "SWIFT_INSTALL_OBJC_HEADER" => "NO",
+    # The generated C++ angle-includes the ubrn runtime headers WITHOUT a
+    # pod-name prefix (<RustBuffer.h>, <NitroUniffi.hpp>, <nitro-uniffi/...>),
+    # which live in the separate `uniffi-bindgen-react-native` pod. CocoaPods
+    # copies that pod's headers under Pods/Headers/Public/<podname>/ preserving
+    # the nitro-uniffi/ subdir (the runtime podspec sets header_mappings_dir),
+    # so put that directory on the search path for the bare/subdir includes to
+    # resolve. `$(inherited)` keeps the NitroModules / React paths that
+    # install_modules_dependencies injects.
+    "HEADER_SEARCH_PATHS" => (current_header_search_paths + [
+      "$(inherited)",
+      "\"$(PODS_ROOT)/Headers/Public/uniffi-bindgen-react-native\"",
+    ]).join(" "),
   })
 
   # Use install_modules_dependencies helper if React Native >=0.71.0.
