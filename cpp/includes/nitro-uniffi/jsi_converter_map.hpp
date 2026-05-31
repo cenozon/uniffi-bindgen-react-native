@@ -14,15 +14,23 @@
 //
 // The RustBuffer wire codec (`composites.hpp` write_map/read_map) already
 // round-trips any key; the only gap is the JS boundary. We fill it here,
-// matching the JS shapes `model.rs`'s `ts_type()` chooses:
+// matching the JS shape `model.rs`'s `ts_type()` chooses — `Map<K, V>` for
+// EVERY non-string key:
 //
-//   * integer keys (u8/i8/u16/i16/u32/i32/f32/f64) -> `Record<number, V>`,
-//     i.e. a JS OBJECT whose property names are the stringified numeric
-//     keys. We marshal exactly like Nitro's string-keyed converter but
-//     parse each property name back to the numeric `K`.
+//   * integer keys (u8/i8/u16/i16/u32/i32/f32/f64) -> `Map<number, V>`,
+//     i.e. a JS `Map` keyed by JS `number`. (Previously these marshalled
+//     through a plain JS OBJECT / TS `Record<number, V>`, but a JS object
+//     stringifies every property name — so a numeric-keyed object and the
+//     `Map<K, V>` surface `ts_type()` now emits would disagree on runtime
+//     shape. A real `Map` keeps the key a `number` and matches the TS type.)
 //   * 64-bit keys (u64/i64) -> `Map<bigint, V>`, i.e. a JS `Map` keyed by
-//     BigInt — JS objects cannot have bigint property names, so the only
-//     faithful shape is a real `Map`.
+//     BigInt — JS `number` cannot hold a u64/i64 losslessly, so the key is a
+//     `bigint`.
+//
+// Both build/consume a real JS `Map` (constructed via the global `Map`
+// ctor, driven through `set` / `Array.from`), differing only in how the
+// key crosses: a `number` `jsi::Value` for the small ints/floats, a
+// `bigint` for the 64-bit ints.
 //
 // Both are partial specializations on the SFINAE `Enable` slot of Nitro
 // core's primary `JSIConverter<T, Enable>` template, gated so they only
@@ -40,12 +48,9 @@
 #pragma once
 
 #include <NitroModules/JSIConverter.hpp>
-#include <NitroModules/JSIHelpers.hpp>
-#include <NitroModules/PropNameIDCache.hpp>
 
 #include <cstdint>
 #include <jsi/jsi.h>
-#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -75,30 +80,31 @@ template <typename K>
 inline constexpr bool is_number_map_key_v =
     is_nonstring_map_key_v<K> && !is_bigint_map_key_v<K>;
 
-// Parse a JS object property name (always a string) back to the numeric
-// key type `K`. Property names round-trip through JS's own number ->
-// string coercion, so `std::sto*` / `std::strtod` recover them exactly.
-template <typename K> inline K parse_number_key(const std::string &name) {
-  if constexpr (std::is_floating_point_v<K>) {
-    return static_cast<K>(std::strtod(name.c_str(), nullptr));
-  } else if constexpr (std::is_signed_v<K>) {
-    return static_cast<K>(std::strtoll(name.c_str(), nullptr, 10));
-  } else {
-    return static_cast<K>(std::strtoull(name.c_str(), nullptr, 10));
-  }
+// Read a numeric key (the `0`th element of a JS `Map` entry pair) back into
+// the C++ key type `K`. The key crosses as a JS `number`, so a plain
+// `asNumber` + narrowing cast recovers it for every 8/16/32-bit int and
+// float/double `K`.
+template <typename K>
+inline K number_key_from_value(jsi::Runtime &runtime, const jsi::Value &key) {
+  return static_cast<K>(key.asNumber());
 }
 
-// Spell a numeric key as a JS object property name. `std::to_string`
-// matches JS's integer/float -> string coercion for the value ranges
-// uniffi keys span.
-template <typename K> inline std::string number_key_to_string(K key) {
-  return std::to_string(key);
+// Spell a numeric key as a JS `number` `jsi::Value` for `Map.set`.
+template <typename K>
+inline jsi::Value number_key_to_value(jsi::Runtime & /*runtime*/, K key) {
+  return jsi::Value(static_cast<double>(key));
 }
 
 } // namespace ubrn_detail
 
 // ---------------------------------------------------------------------
-// Integer / float keyed maps  <>  JS object  (TS `Record<number, V>`).
+// Integer / float keyed maps  <>  JS `Map<number, V>`.
+//
+// JS objects stringify property names, so a numeric-keyed object would not
+// match the `Map<number, V>` surface `ts_type()` emits. We construct a real
+// `Map` via the global `Map` ctor and drive `set` / `Array.from` exactly as
+// the 64-bit-key path below, differing only in the key crossing as a JS
+// `number` rather than a `bigint`.
 // ---------------------------------------------------------------------
 template <typename KeyType, typename ValueType>
 struct JSIConverter<
@@ -107,19 +113,25 @@ struct JSIConverter<
     final {
   static inline std::unordered_map<KeyType, ValueType>
   fromJSI(jsi::Runtime &runtime, const jsi::Value &arg) {
-    jsi::Object object = arg.asObject(runtime);
-    jsi::Array propertyNames = object.getPropertyNames(runtime);
-    size_t length = propertyNames.size(runtime);
+    jsi::Object jsMap = arg.asObject(runtime);
+    // `Array.from(map)` yields an array of `[key, value]` entry pairs —
+    // avoids driving the JS iterator protocol by hand.
+    jsi::Function arrayFrom = runtime.global()
+                                  .getPropertyAsObject(runtime, "Array")
+                                  .getPropertyAsFunction(runtime, "from");
+    jsi::Array entries =
+        arrayFrom.call(runtime, jsMap).asObject(runtime).asArray(runtime);
+    size_t length = entries.size(runtime);
 
     std::unordered_map<KeyType, ValueType> map;
     map.reserve(length);
     for (size_t i = 0; i < length; ++i) {
-      std::string name =
-          propertyNames.getValueAtIndex(runtime, i).asString(runtime).utf8(
+      jsi::Array pair =
+          entries.getValueAtIndex(runtime, i).asObject(runtime).asArray(
               runtime);
-      jsi::Value value =
-          object.getProperty(runtime, PropNameIDCache::get(runtime, name));
-      map.emplace(ubrn_detail::parse_number_key<KeyType>(name),
+      jsi::Value key = pair.getValueAtIndex(runtime, 0);
+      jsi::Value value = pair.getValueAtIndex(runtime, 1);
+      map.emplace(ubrn_detail::number_key_from_value<KeyType>(runtime, key),
                   JSIConverter<ValueType>::fromJSI(runtime, value));
     }
     return map;
@@ -128,14 +140,16 @@ struct JSIConverter<
   static inline jsi::Value
   toJSI(jsi::Runtime &runtime,
         const std::unordered_map<KeyType, ValueType> &map) {
-    jsi::Object object(runtime);
+    jsi::Function mapCtor =
+        runtime.global().getPropertyAsFunction(runtime, "Map");
+    jsi::Object jsMap = mapCtor.callAsConstructor(runtime).asObject(runtime);
+    jsi::Function set = jsMap.getPropertyAsFunction(runtime, "set");
     for (const auto &pair : map) {
-      std::string name = ubrn_detail::number_key_to_string<KeyType>(pair.first);
+      jsi::Value key = ubrn_detail::number_key_to_value<KeyType>(runtime, pair.first);
       jsi::Value value = JSIConverter<ValueType>::toJSI(runtime, pair.second);
-      object.setProperty(runtime, PropNameIDCache::get(runtime, name),
-                         std::move(value));
+      set.callWithThis(runtime, jsMap, std::move(key), std::move(value));
     }
-    return object;
+    return jsMap;
   }
 
   static inline bool canConvert(jsi::Runtime &runtime,
@@ -144,21 +158,9 @@ struct JSIConverter<
       return false;
     }
     jsi::Object object = value.getObject(runtime);
-    if (!isPlainObject(runtime, object)) {
-      return false;
-    }
-    jsi::Array propNames = object.getPropertyNames(runtime);
-    size_t size = propNames.size(runtime);
-    for (size_t i = 0; i < size; i++) {
-      std::string name =
-          propNames.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
-      jsi::Value propValue =
-          object.getProperty(runtime, PropNameIDCache::get(runtime, name));
-      if (!JSIConverter<ValueType>::canConvert(runtime, propValue)) {
-        return false;
-      }
-    }
-    return true;
+    // A JS `Map` instance — `instanceof global.Map`.
+    jsi::Object mapCtor = runtime.global().getPropertyAsObject(runtime, "Map");
+    return object.instanceOf(runtime, mapCtor.asFunction(runtime));
   }
 };
 

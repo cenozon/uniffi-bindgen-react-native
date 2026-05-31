@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -57,6 +58,25 @@ inline std::string error_field_to_string(const std::string& v) {
 inline std::string error_field_to_string(const std::shared_ptr<::margelo::nitro::ArrayBuffer>& v) {
   return std::string("ArrayBuffer(") + (v ? std::to_string(v->size()) : std::string("null")) +
          " bytes)";
+}
+
+// ---- Interface handles (uniffi `interface` -> `std::shared_ptr<HybridXxx>`)
+// A record / data-enum payload field can itself be an interface handle, e.g.
+// coverall's `Repair{ patch: Arc<Patch> }` or `SimpleDict{ coveralls:
+// Option<Arc<Coveralls>> }`. When such a record is reachable inside an error
+// variant's payload, the generated record `error_field_to_string` recurses
+// into every field — including the interface handle. The handle's underlying
+// Rust value cannot be cheaply rendered (it lives behind the FFI as an opaque
+// pointer), so we surface a non-null/null placeholder rather than the value.
+//
+// SFINAE-excluded for `ArrayBuffer` so the dedicated bytes overload above
+// stays the unique best match for `shared_ptr<ArrayBuffer>` (this template
+// would otherwise be an equally-good candidate and make the call ambiguous).
+template <typename T,
+          typename = std::enable_if_t<
+              !std::is_same_v<T, ::margelo::nitro::ArrayBuffer>>>
+std::string error_field_to_string(const std::shared_ptr<T>& v) {
+  return v ? std::string("<HybridObject>") : std::string("null");
 }
 
 // ---- Timestamp (SystemTime) ----

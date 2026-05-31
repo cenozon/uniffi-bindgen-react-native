@@ -39,6 +39,8 @@
 #include <NitroModules/JSIConverter.hpp>
 #include <NitroModules/Promise.hpp>
 
+#include "js_dispatcher.hpp"
+
 #include <jsi/jsi.h>
 #include <memory>
 #include <utility>
@@ -71,6 +73,15 @@ template <typename T>
 struct JSIConverter<std::shared_ptr<::ubrn::nitro::ForeignAsyncResult<T>>> final {
   static inline std::shared_ptr<::ubrn::nitro::ForeignAsyncResult<T>>
   fromJSI(jsi::Runtime& runtime, const jsi::Value& value) {
+    // Device-path Dispatcher capture (audit bug #6). This converter runs on the
+    // JS thread with a runtime in hand whenever a JS-implemented async foreign
+    // callback method returns its Promise — i.e. before the driving RustFuture
+    // can re-suspend and need the deferred re-poll. On a real RN/Expo app
+    // `registerNatives` (the desktop-only capture site) never runs, so without
+    // this the `future.hpp` continuation would take the inline re-poll and
+    // self-deadlock on uniffi's scheduler mutex. Idempotent + cheap after the
+    // first capture (a single relaxed atomic load).
+    ::ubrn::nitro::ensure_js_dispatcher_from_runtime(runtime);
     auto result = std::make_shared<::ubrn::nitro::ForeignAsyncResult<T>>();
     result->promise =
         JSIConverter<std::shared_ptr<Promise<T>>>::fromJSI(runtime, value);

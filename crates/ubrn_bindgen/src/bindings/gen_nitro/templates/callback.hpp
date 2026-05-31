@@ -69,6 +69,20 @@ public:
   // into Rust; the handle is RAII-freed via the trait's uniffi free symbol.
   explicit {{ cb.cxx_class }}(::ubrn::nitro::FromRustHandle __h)
       : HybridObject(TAG), proxy_handle_(__h.raw) {}
+
+  /// Exception-safe choke point for wrapping an OWNED `Arc<dyn Trait>` handle
+  /// (Rust returned it) in a proxy HybridObject. The raw handle is parked in a
+  /// move-only `UniffiObjectHandle` guard THROUGH the allocation; the object is
+  /// built with a null proxy handle first (the no-arg ctor can't leak), then
+  /// the guard is moved into it only AFTER it exists. A throw before that point
+  /// (allocation / Nitro base ctor) unwinds the guard, freeing the handle — so
+  /// the Rust-side reference is never leaked (audit bug #27).
+  static std::shared_ptr<{{ cb.cxx_class }}> adopt(uint64_t raw_handle) {
+    ubrn::nitro::UniffiObjectHandle<&{{ proxy.free_symbol }}> guard{raw_handle};
+    auto self = std::make_shared<{{ cb.cxx_class }}>();
+    self->proxy_handle_ = std::move(guard);
+    return self;
+  }
 {%- else %}
   {{ cb.cxx_class }}() : HybridObject(TAG) {}
 {%- endif %}

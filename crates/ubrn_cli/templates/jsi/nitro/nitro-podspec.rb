@@ -27,10 +27,16 @@ Pod::Spec.new do |s|
   # .cpp themselves. This collapses ~one-TU-per-object down to ~K TUs so the
   # shared-header DWARF stops overflowing libtool's 32-bit Mach-O .a member
   # offset (>4GB). All headers are still copied so the chunks' nested
-  # includes resolve. The static initializer in register_natives.cpp
-  # registers every HybridObject with the HybridObjectRegistry at library-
-  # load time, so there is no nitrogen autolinking ruby to load.
-  s.source_files = "{{ tm }}/**/*.{hpp,h}", "{{ bindings }}/**/*.{hpp,h}", "{{ bindings }}/amalgam/*.cpp", "{{ bindings }}/register_natives.cpp"
+  # includes resolve.
+  #
+  # UbrnNitroAutolinking.mm is the iOS registration TU: its ObjC class `+load`
+  # registers every HybridObject with the HybridObjectRegistry at image-load
+  # time. It MUST be compiled (not just register_natives.cpp): when the pod is
+  # linked as a static .a, register_natives.cpp's static initializer is dead-
+  # stripped on device (its only external symbol `registerNatives` is unused by
+  # the app), whereas the `+load` survives under the app's standard `-ObjC`
+  # flag. So there is no nitrogen autolinking ruby to load.
+  s.source_files = "{{ tm }}/**/*.{hpp,h}", "{{ bindings }}/**/*.{hpp,h}", "{{ bindings }}/amalgam/*.cpp", "{{ bindings }}/register_natives.cpp", "{{ bindings }}/*.mm"
   s.vendored_frameworks = "{{ framework }}"
   s.dependency    "uniffi-bindgen-react-native", "{{ self.config.project.ubrn_version() }}"
 

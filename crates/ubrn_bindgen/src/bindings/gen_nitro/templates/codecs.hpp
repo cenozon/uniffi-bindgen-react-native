@@ -54,6 +54,13 @@ void {{ module.rustbuffer_free }}(RustBuffer buf, UniffiRustCallStatus* status);
 
 namespace margelo::nitro::{{ module.namespace }} {
 
+// Make the base `ubrn::nitro::error_field_to_string` scalar / composite
+// overloads (`error_message.hpp`) visible by unqualified name in this
+// namespace, so the record/enum overloads below — and the error lifter's
+// `error_field_to_string(__f)` call — resolve a scalar field through them while
+// a record/enum field resolves to a same-namespace overload here (audit bug #29).
+using ::ubrn::nitro::error_field_to_string;
+
 // Namespace-local writer type: this namespace's top-level `lower_<Name>`
 // wrappers allocate through its own `rustbuffer_alloc` / `rustbuffer_reserve`
 // symbols.
@@ -88,6 +95,86 @@ inline {{ record.ts_name }} read_{{ record.ts_name }}(RustBufferReader& r);
 {%- for en in module.enums %}
 template <class W> inline void write_{{ en.ts_name }}(W& w, const {{ en.ts_name }}& value);
 inline {{ en.ts_name }} read_{{ en.ts_name }}(RustBufferReader& r);
+{%- endfor %}
+
+// ---- `error_field_to_string(const <Record/Enum>&)` overloads (audit bug #29) ----
+//
+// A data-carrying uniffi error variant whose payload field is itself a record
+// or (data / flat) enum is now rendered into the exception message (see
+// `NitroType::is_error_message_decodable`, which allows Record / Enum exactly
+// because these overloads exist). They MUST live in this type's own namespace,
+// not `ubrn::nitro`: the base `ubrn::nitro::error_field_to_string(const
+// std::vector<T>&)` / `optional<T>` composite templates recurse with an
+// *unqualified* call resolved by ADL at instantiation — and ADL on a
+// `std::vector<{{ module.namespace }}::Foo>` only searches `{{ module.namespace }}`,
+// not `ubrn::nitro`. Placing the overloads here makes a `Vec<record/enum>` /
+// `Option<record/enum>` error field compile (e.g. a recursive `Tree`). The
+// bodies call unqualified `error_field_to_string`: a scalar field resolves via
+// the `using ::ubrn::nitro::error_field_to_string` above, a nested record/enum
+// via these same-namespace overloads, a composite via the ADL-reachable
+// `ubrn::nitro` templates. Forward-declared first for mutual recursion; emitted
+// for every record / enum (an unused one is a harmless inline).
+{%- for record in module.records %}
+inline std::string error_field_to_string(const {{ record.ts_name }}& value);
+{%- endfor %}
+{%- for en in module.enums %}
+inline std::string error_field_to_string(const {{ en.ts_name }}& value);
+{%- endfor %}
+
+{%- for record in module.records %}
+inline std::string error_field_to_string(const {{ record.ts_name }}& value) {
+  std::string __out = "{{ record.ts_name }}{";
+  bool __first = true;
+{%- for field in record.fields %}
+  if (!__first) { __out += ", "; }
+  __first = false;
+  __out += "{{ field.ts_name }}=";
+  __out += error_field_to_string(value.{{ field.cxx_name }});
+{%- endfor %}
+  __out += "}";
+  (void)__first;
+  return __out;
+}
+{%- endfor %}
+{%- for en in module.enums %}
+{%- if en.flat %}
+inline std::string error_field_to_string(const {{ en.ts_name }}& value) {
+  switch (value) {
+{%- for variant in en.variants %}
+    case {{ en.ts_name }}::{{ variant.ts_name }}: return "{{ en.ts_name }}::{{ variant.ts_name }}";
+{%- endfor %}
+  }
+  return "{{ en.ts_name }}::<unknown>";
+}
+{%- else %}
+inline std::string error_field_to_string(const {{ en.ts_name }}& value) {
+  switch (value.variant.index()) {
+{%- for variant in en.variants %}
+    case {{ loop.index0 }}: {
+      std::string __out = "{{ en.ts_name }}::{{ variant.ts_name }}";
+{%- if !variant.fields.is_empty() %}
+      const auto& __v = std::get<{{ loop.index0 }}>(value.variant);
+      __out += "(";
+      bool __first = true;
+{%- for field in variant.fields %}
+      if (!__first) { __out += ", "; }
+      __first = false;
+{%- if !field.ts_name.is_empty() %}
+      __out += "{{ field.ts_name }}=";
+{%- endif %}
+      __out += error_field_to_string(__v.{{ field.cxx_name }});
+{%- endfor %}
+      __out += ")";
+      (void)__first;
+{%- endif %}
+      return __out;
+    }
+{%- endfor %}
+    default:
+      return "{{ en.ts_name }}::<unknown>";
+  }
+}
+{%- endif %}
 {%- endfor %}
 
 {%- for record in module.records %}
@@ -263,7 +350,7 @@ inline {{ err.cxx_class() }} {{ err.lift_fn() }}(RustBuffer buf) {
 {%- if !field.ts_name.is_empty() %}
         __payload += "{{ field.ts_name }}=";
 {%- endif %}
-        __payload += ::ubrn::nitro::error_field_to_string(__f);
+        __payload += error_field_to_string(__f);
       }
 {%- endfor %}
       return {{ err.cxx_class() }}({{ err.cxx_class() }}Kind::{{ variant.ts_name }},

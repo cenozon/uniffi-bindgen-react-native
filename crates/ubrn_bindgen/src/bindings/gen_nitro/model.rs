@@ -19,6 +19,7 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use uniffi_bindgen::pipeline::general;
 
 use super::HybridObjectEntry;
+use crate::bindings::gen_typescript::Config as TsConfig;
 
 thread_local! {
     /// `(namespace, name)` of every foreign-implementable callback trait —
@@ -34,6 +35,21 @@ thread_local! {
     /// builds a `NitroType` directly), which yields the plain-interface
     /// behavior — the correct default for a non-foreign `Trait`.
     static CALLBACK_TRAITS: RefCell<BTreeSet<(String, String)>> = const { RefCell::new(BTreeSet::new()) };
+
+    /// `(namespace, name)` → the interface's `uniffi_<crate>_fn_free_<obj>`
+    /// symbol, for every uniffi `interface` / `Object` AND every
+    /// `with_foreign` trait (whose proxy half is also handle-bearing) across
+    /// *all* namespaces in the current generate. Built from the authoritative
+    /// type *definitions* (which carry `ffi_func_free`), so a USE-SITE
+    /// `Type::Interface` / `Type::CallbackInterface` — which has only
+    /// `(namespace, name)`, never the symbol — can recover its free symbol for
+    /// the exception-safe handle guard (audit bug #24/#27). See
+    /// [`NitroType::from_type`]'s `Interface` arm and [`NitroType::free_symbol`].
+    ///
+    /// Empty when generation hasn't registered anything (e.g. a unit test that
+    /// builds a `NitroType` directly), which yields a `None` free symbol — the
+    /// guard then degrades to the pre-existing bare-local lowering.
+    static INTERFACE_FREE_SYMBOLS: RefCell<BTreeMap<(String, String), String>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Record `(namespace, name)` as a foreign-implementable callback trait for the
@@ -46,16 +62,42 @@ pub fn register_callback_trait(namespace: &str, name: &str) {
     });
 }
 
+/// Record an interface's (or `with_foreign` trait proxy's) `fn_free_<obj>`
+/// symbol so a use-site `NitroType::Interface` / `CallbackInterface` can
+/// recover it for the RAII handle guard. Called once per definition before any
+/// module is lowered (see `gen_nitro::generate_all`). Idempotent.
+pub fn register_interface_free_symbol(namespace: &str, name: &str, free_symbol: &str) {
+    INTERFACE_FREE_SYMBOLS.with(|map| {
+        map.borrow_mut().insert(
+            (namespace.to_string(), name.to_upper_camel_case()),
+            free_symbol.to_string(),
+        );
+    });
+}
+
 /// Drop every registered callback trait. Called at the end of a generate so a
 /// later run in the same thread starts clean.
 pub fn clear_callback_traits() {
     CALLBACK_TRAITS.with(|set| set.borrow_mut().clear());
+    INTERFACE_FREE_SYMBOLS.with(|map| map.borrow_mut().clear());
 }
 
 fn is_registered_callback_trait(namespace: &str, name: &str) -> bool {
     CALLBACK_TRAITS.with(|set| {
         set.borrow()
             .contains(&(namespace.to_string(), name.to_string()))
+    })
+}
+
+/// Look up the registered `fn_free_<obj>` symbol for an interface / callback
+/// proxy by `(namespace, UpperCamelName)`. `None` when nothing was registered
+/// (a direct unit-test `NitroType`, or a type whose definition lives outside
+/// this generate) — the guard then degrades to the bare-local lowering.
+fn registered_interface_free_symbol(namespace: &str, name: &str) -> Option<String> {
+    INTERFACE_FREE_SYMBOLS.with(|map| {
+        map.borrow()
+            .get(&(namespace.to_string(), name.to_upper_camel_case()))
+            .cloned()
     })
 }
 
@@ -112,6 +154,15 @@ pub struct NitroModule {
     /// `<namespace>_codecs.hpp` and the `.nitro.ts` spec.
     pub errors: Vec<NitroError>,
 
+    /// Uniffi `custom` types (newtypes). Each becomes a nominal `export type
+    /// <Name> = <inner>` alias in the consumer module plus, when the per-crate
+    /// `uniffi.toml` configures `intoCustom` / `fromCustom`, the conversion
+    /// wrappers the plain-TS surface applies. The wire form is the inner
+    /// builtin's (see [`NitroType::Custom`]), so customs contribute no codec /
+    /// C++ files of their own — this collection drives only the TS surface.
+    /// See audit bug #17.
+    pub customs: Vec<NitroCustom>,
+
     /// Per-namespace `ffi_<crate>_rustbuffer_*` symbol names. Captured
     /// straight from the pipeline so we always agree with whatever
     /// `uniffi_meta` decided to name them.
@@ -125,6 +176,13 @@ impl NitroModule {
         let crate_name = namespace.crate_name.clone();
         let ns_name = namespace.name.clone();
         let namespace_camel = ns_name.to_upper_camel_case();
+
+        // The per-crate `uniffi.toml` `[bindings.typescript]` config (reusing
+        // the same parse cli.rs `extract_ts_config` does), so a configured
+        // custom-type `intoCustom`/`fromCustom` conversion lands on the
+        // matching `NitroCustom`. A missing / empty config yields the default
+        // (no configured conversions — plain nominal aliases). See bug #17.
+        let ts_config = extract_nitro_ts_config(namespace)?;
 
         let mut functions = Vec::new();
         for func in &namespace.functions {
@@ -146,6 +204,7 @@ impl NitroModule {
         let mut records = Vec::new();
         let mut enums = Vec::new();
         let mut errors = Vec::new();
+        let mut customs = Vec::new();
         for td in &namespace.type_definitions {
             match td {
                 general::TypeDefinition::Interface(iface) => {
@@ -200,6 +259,9 @@ impl NitroModule {
                         }
                     }
                 }
+                general::TypeDefinition::Custom(custom) => {
+                    customs.push(NitroCustom::from_general(custom, &ts_config)?);
+                }
                 _ => {}
             }
         }
@@ -214,6 +276,7 @@ impl NitroModule {
             records,
             enums,
             errors,
+            customs,
             rustbuffer_alloc: namespace.ffi_rustbuffer_alloc.0.clone(),
             rustbuffer_free: namespace.ffi_rustbuffer_free.0.clone(),
             rustbuffer_reserve: namespace.ffi_rustbuffer_reserve.0.clone(),
@@ -346,6 +409,16 @@ impl NitroModule {
         format!("{}Api", self.namespace_camel)
     }
 
+    /// The lowerCamelCase name of the namespace-singleton accessor the consumer
+    /// module exports (e.g. `extTypesCustom()` for namespace `ext_types_custom`),
+    /// so it reads consistently with its camelCase function / type siblings
+    /// rather than the raw snake_case namespace name. The registry string
+    /// literal (`'<Ns>Api'`) is unaffected — only the JS accessor identifier
+    /// changes. See audit bug #18.
+    pub fn namespace_accessor(&self) -> String {
+        self.namespace.to_lower_camel_case()
+    }
+
     pub fn namespace_api_cxx_class(&self) -> String {
         format!("Hybrid{}Api", self.namespace_camel)
     }
@@ -454,6 +527,12 @@ impl NitroModule {
                 collect(&field.ty);
             }
         }
+        // A custom type can wrap a FOREIGN inner (e.g. `NestedExternalGuid =
+        // Guid` where `Guid` lives in another namespace), and the alias RHS
+        // names that inner — so its foreign refs must be imported too.
+        for c in &self.customs {
+            collect(&c.inner);
+        }
         // Namespace API methods cover both top-level functions and the
         // constructor factories (factories return / take foreign types too).
         for func in self.api_methods() {
@@ -507,6 +586,148 @@ impl NitroModule {
             out.extend(iface.factories.iter());
         }
         out
+    }
+
+    /// The namespace's top-level uniffi functions ONLY — no constructor
+    /// factories folded in. The consumer-module TS surface emits these as the
+    /// flat `export function` forwarders; the constructor factories are NOT
+    /// surfaced as free functions on the consumer side (they are reached only
+    /// through each interface's runtime class — `new <Iface>(...)` /
+    /// `<Iface>.<ctor>(...)`), so the TS class template iterates per-interface
+    /// `factories` rather than this list. Contrast [`Self::api_methods`], which
+    /// DOES fold the factories in because the C++ `<Ns>Api` HybridObject still
+    /// exposes every factory as a method (the class statics delegate to it).
+    pub fn top_level_functions(&self) -> &[NitroFunction] {
+        &self.functions
+    }
+
+    /// The configured custom-type conversion owned by THIS namespace for the
+    /// custom type named `name` (its UpperCamelCase TS name), if the per-crate
+    /// `uniffi.toml` declared one. Cross-namespace customs are presented as a
+    /// plain `import type` alias and converted (if at all) by their owning
+    /// namespace's wrapper, so only same-namespace customs are looked up here.
+    /// See audit bug #17.
+    fn custom_conversion(&self, name: &str) -> Option<&NitroCustomConversion> {
+        self.customs
+            .iter()
+            .find(|c| c.ts_name == name)
+            .and_then(|c| c.conversion.as_ref())
+    }
+
+    /// The deduped `(import-name, module)` pairs every configured custom
+    /// conversion in this namespace needs in scope (e.g. `URL` from
+    /// `@/converters`). Emitted as named imports at the top of the consumer
+    /// wrapper so the `intoCustom` / `fromCustom` expressions resolve.
+    pub fn custom_conversion_imports(&self) -> Vec<TsNamedImport> {
+        let mut by_module: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for c in &self.customs {
+            if let Some(conv) = c.conversion.as_ref() {
+                for (name, module) in &conv.imports {
+                    by_module
+                        .entry(module.clone())
+                        .or_default()
+                        .insert(name.clone());
+                }
+            }
+        }
+        by_module
+            .into_iter()
+            .map(|(module_path, names)| TsNamedImport {
+                module_path,
+                type_names: names.into_iter().collect(),
+            })
+            .collect()
+    }
+
+    /// The expression a free-function / method wrapper passes into the Nitro
+    /// singleton for argument `arg`. When the arg is a same-namespace custom
+    /// type with a configured conversion, the presented (`typeName`) value is
+    /// lowered to the inner builtin via `fromCustom`; an `Optional<custom>` is
+    /// lowered element-wise (preserving `undefined`). Every other arg (plain
+    /// builtin, unconfigured newtype, record, enum, interface, …) passes
+    /// straight through by name. See audit bug #17.
+    pub fn lower_call_arg(&self, arg: &NitroArg) -> String {
+        match &arg.ty {
+            NitroType::Custom { name, .. } => match self.custom_conversion(name) {
+                Some(conv) => conv.lower(&arg.ts_name),
+                None => arg.ts_name.clone(),
+            },
+            NitroType::Optional(inner) => match inner.as_ref() {
+                NitroType::Custom { name, .. } => match self.custom_conversion(name) {
+                    Some(conv) => format!(
+                        "({0} === undefined ? undefined : {1})",
+                        arg.ts_name,
+                        conv.lower(&arg.ts_name)
+                    ),
+                    None => arg.ts_name.clone(),
+                },
+                _ => arg.ts_name.clone(),
+            },
+            _ => arg.ts_name.clone(),
+        }
+    }
+
+    /// The complete consumer-wrapper `return` RHS for a top-level free
+    /// function: the Nitro singleton call with each argument lowered through
+    /// its custom conversion ([`Self::lower_call_arg`]), wrapped in the
+    /// return-side custom lift ([`Self::lift_return_expr`]). When the function
+    /// touches no configured custom type this collapses to the plain
+    /// `<accessor>().<fn>(arg0, arg1)` pass-through. See audit bug #17.
+    pub fn free_function_call(&self, func: &NitroFunction) -> String {
+        let args = func
+            .args
+            .iter()
+            .map(|a| self.lower_call_arg(a))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let call = format!("{}().{}({args})", self.namespace_accessor(), func.ts_name);
+        self.lift_return_expr(func, &call)
+    }
+
+    /// Given the `call_expr` that invokes the Nitro singleton (returning the
+    /// inner-builtin value), render the consumer wrapper's `return` RHS. When
+    /// the return is a same-namespace custom type with a configured conversion,
+    /// the inner value is lifted to the presented (`typeName`) type via
+    /// `intoCustom`; for an async function the lift is threaded through `.then`
+    /// (the call already yields a `Promise`); an `Optional<custom>` is lifted
+    /// element-wise. Every other return passes straight through. See bug #17.
+    pub fn lift_return_expr(&self, func: &NitroFunction, call_expr: &str) -> String {
+        let ReturnKind::Value(ty) = &func.return_kind else {
+            return call_expr.to_string();
+        };
+        let Some((conv, optional)) = self.return_custom_conversion(ty) else {
+            return call_expr.to_string();
+        };
+        // `__v` is the inner-builtin value the singleton produced.
+        let lift_one = |v: &str| {
+            if optional {
+                format!("({0} === undefined ? undefined : {1})", v, conv.lift(v))
+            } else {
+                conv.lift(v)
+            }
+        };
+        if func.is_async {
+            format!("({call_expr}).then((__v) => {})", lift_one("__v"))
+        } else {
+            // Bind the call result once so the lift expression can reference it
+            // (custom `intoCustom` templates may mention `{}` more than once).
+            format!("((__v) => {})({call_expr})", lift_one("__v"))
+        }
+    }
+
+    /// `(conversion, is_optional)` when `ty` is a same-namespace configured
+    /// custom (directly or wrapped in a single `Optional`), else `None`.
+    fn return_custom_conversion(&self, ty: &NitroType) -> Option<(&NitroCustomConversion, bool)> {
+        match ty {
+            NitroType::Custom { name, .. } => self.custom_conversion(name).map(|c| (c, false)),
+            NitroType::Optional(inner) => match inner.as_ref() {
+                NitroType::Custom { name, .. } => {
+                    self.custom_conversion(name).map(|c| (c, true))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Per-type headers the namespace API's method declarations reference.
@@ -572,6 +793,30 @@ pub struct NitroFunction {
     /// per-return-FFI-type, so they're per-function rather than
     /// per-namespace.
     pub async_data: Option<NitroAsyncData>,
+    /// For a constructor factory only: the JS static-method name the
+    /// consumer-module interface class exposes for this constructor (the
+    /// bare lowerCamel uniffi ctor name). `None` for the uniffi-primary
+    /// `new` ctor — it maps to the class `constructor` (sync) or a static
+    /// async factory, not a named static — and for plain top-level
+    /// functions / methods (which are not class statics). `Some("fallibleNew")`
+    /// etc. for every alternate / named constructor. Reserved-word-safe via
+    /// [`ts_fn_name`]. The `cxx_name` / `ts_name` keep the
+    /// `create<Iface>[<Ctor>]` factory spelling (the `.nitro.ts` spec +
+    /// C++ HybridObject method the static delegates to).
+    pub static_name: Option<String>,
+    /// `true` when this factory is the uniffi-authoritative *primary*
+    /// constructor (`CallableKind::Constructor { primary: true, .. }`, i.e.
+    /// the `new` ctor) that landed in `factories` because it is NOT a
+    /// drivable default (it takes args / is async / is fallible). The
+    /// consumer-module class template routes it to the JS `constructor`
+    /// (sync arg-taking / fallible-only) or a static promise-returning
+    /// factory (async) rather than to a named static. `false` for alternate
+    /// constructors and for non-constructor functions.
+    pub is_primary_ctor: bool,
+    /// Author docstring from the uniffi metadata, if any. Emitted as JSDoc on
+    /// the function / method / constructor in the consumer surface. See audit
+    /// bug #23.
+    pub docstring: Option<String>,
 }
 
 /// Reference to a uniffi error type from a callable's `throws` slot.
@@ -588,27 +833,51 @@ pub struct NitroErrorRef {
 }
 
 impl NitroErrorRef {
-    /// C++ exception class name — `<TsName>Error` to disambiguate from
-    /// a same-named data enum, mirroring the codec class.
-    // Reserved for the typed-error emission path (not yet wired into the
-    // templates, which currently lift errors via `lift_fn`).
-    #[allow(dead_code)]
+    /// C++ exception class name. To disambiguate from a same-named data-enum
+    /// value type that co-exists in the same TU (`struct ComplexError`), the
+    /// exception is `<base>Exception` where `<base>` is `ts_name` with a
+    /// trailing `Error` stripped — so `ComplexError` → `ComplexException` (not
+    /// the old double-suffixed `ComplexErrorError`) and `RootError` →
+    /// `RootException`. A name that doesn't end in `Error` simply gains the
+    /// `Exception` suffix (`Arithmetic` → `ArithmeticException`). MUST agree
+    /// byte-for-byte with [`NitroError::cxx_class`] (the definition side). See
+    /// audit bug #28.
     pub fn cxx_class(&self) -> String {
-        format!("{}Error", self.ts_name)
+        error_cxx_class(&self.ts_name)
     }
 
     /// Free-function decoder name in the owning namespace's
     /// `<namespace>_codecs.hpp`, qualified with the foreign namespace when
     /// the error is defined outside `current_ns` (so a cross-crate throws
-    /// resolves against the included foreign codecs header).
+    /// resolves against the included foreign codecs header). Derived from
+    /// [`Self::cxx_class`] so the lifter and the class it returns stay coupled.
     pub fn lift_fn(&self, current_ns: &str) -> String {
         let prefix = if self.namespace == current_ns {
             String::new()
         } else {
             format!("::margelo::nitro::{}::", self.namespace)
         };
-        format!("{prefix}lift_{}Error", self.ts_name)
+        format!("{prefix}lift_{}", self.cxx_class())
     }
+
+    // NOTE: no `lower_fn` (the `code=1` typed-error encode path) — encoding a
+    // JS-thrown typed error back into a uniffi `RustBuffer` for a sync callback
+    // is Nitro-impossible (audit E1: a JS throw reaches C++ only as a
+    // string-only `jsi::JSError`, never a typed payload). The sync callback
+    // trampoline reports the reason string via `code=2`; typed identity is
+    // recovered on the JS side through the `<Err>_Tags` message-prefix
+    // discriminator. See audit bug #7.
+}
+
+/// The C++ exception class name for a uniffi error type whose UpperCamelCase TS
+/// name is `ts_name`: strip a trailing `Error` and append `Exception`, so an
+/// already-`Error`-suffixed name doesn't double up (`ComplexError` →
+/// `ComplexException`) and a bare name still disambiguates from its value-type
+/// twin (`Arithmetic` → `ArithmeticException`). Single source of truth shared
+/// by [`NitroError::cxx_class`] and [`NitroErrorRef::cxx_class`]. See bug #28.
+fn error_cxx_class(ts_name: &str) -> String {
+    let base = ts_name.strip_suffix("Error").unwrap_or(ts_name);
+    format!("{base}Exception")
 }
 
 /// FFI symbols required to drive the uniffi rust-future poll loop. All
@@ -639,8 +908,8 @@ impl NitroAsyncData {
 
 impl NitroFunction {
     fn from_function(func: &general::Function) -> Result<Self> {
-        let ts_name = func.name.to_lower_camel_case();
-        let cxx_name = sanitize_cxx_ident(&ts_name);
+        let ts_name = ts_fn_name(&func.name);
+        let cxx_name = sanitize_cxx_ident(&func.name.to_lower_camel_case());
         let uniffi_symbol = func.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &func.inputs {
@@ -660,12 +929,15 @@ impl NitroFunction {
                 .async_data
                 .as_ref()
                 .map(NitroAsyncData::from_general),
+            static_name: None,
+            is_primary_ctor: false,
+            docstring: func.docstring.clone(),
         })
     }
 
     fn from_constructor(ctor: &general::Constructor) -> Result<Self> {
-        let ts_name = ctor.name.to_lower_camel_case();
-        let cxx_name = sanitize_cxx_ident(&ts_name);
+        let ts_name = ts_fn_name(&ctor.name);
+        let cxx_name = sanitize_cxx_ident(&ctor.name.to_lower_camel_case());
         let uniffi_symbol = ctor.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &ctor.inputs {
@@ -690,6 +962,9 @@ impl NitroFunction {
                 .async_data
                 .as_ref()
                 .map(NitroAsyncData::from_general),
+            static_name: None,
+            is_primary_ctor: false,
+            docstring: ctor.docstring.clone(),
         })
     }
 
@@ -705,6 +980,16 @@ impl NitroFunction {
     /// just a function whose return is the interface handle. The returned
     /// handle is owned (uniffi `Arc::into_raw`), so the lift wraps it
     /// directly with no extra clone.
+    ///
+    /// The factory's `ts_name`/`cxx_name` keep the `create<Iface>[<Ctor>]`
+    /// spelling (the `.nitro.ts` spec + C++ HybridObject method name). The
+    /// consumer-module interface *class* surface is driven by the separate
+    /// [`Self::static_name`] / [`Self::is_primary_ctor`] fields set here:
+    /// `is_primary` is the uniffi-authoritative
+    /// `CallableKind::Constructor { primary: true, .. }` flag, and
+    /// `static_name` is the bare lowerCamel ctor name the class exposes as a
+    /// static (`None` for the primary `new`, which maps to the JS
+    /// `constructor` / a static async factory).
     fn from_constructor_factory(
         ctor: &general::Constructor,
         iface_ts_name: &str,
@@ -719,13 +1004,29 @@ impl NitroFunction {
         } else {
             format!("create{iface_ts_name}{ctor_name}")
         };
-        let ts_name = factory_base.to_lower_camel_case();
-        let cxx_name = ts_name.clone();
+        let ts_name = ts_fn_name(&factory_base);
+        let cxx_name = sanitize_cxx_ident(&factory_base.to_lower_camel_case());
         let uniffi_symbol = ctor.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &ctor.inputs {
             args.push(NitroArg::from_general(arg)?);
         }
+        // uniffi-authoritative primary flag (set by name: `new` -> primary),
+        // independent of arity / async / throws — exactly what gen_typescript
+        // reads (builders.rs `CallableKind::Constructor { primary: true, .. }`).
+        let is_primary_ctor = matches!(
+            ctor.callable.kind,
+            general::CallableKind::Constructor { primary: true, .. }
+        );
+        // The class static the consumer module exposes for this ctor: the bare
+        // lowerCamel uniffi ctor name (`fallibleNew`, `secondary`, ...).
+        // The primary `new` ctor has no named static — it becomes the JS
+        // `constructor` (sync) or a static async factory — so it is `None`.
+        let static_name = if is_primary_ctor {
+            None
+        } else {
+            Some(ts_fn_name(&ctor.name))
+        };
         Ok(Self {
             ts_name,
             cxx_name,
@@ -739,12 +1040,15 @@ impl NitroFunction {
                 .async_data
                 .as_ref()
                 .map(NitroAsyncData::from_general),
+            static_name,
+            is_primary_ctor,
+            docstring: ctor.docstring.clone(),
         })
     }
 
     fn from_method(method: &general::Method) -> Result<Self> {
-        let ts_name = method.name.to_lower_camel_case();
-        let cxx_name = sanitize_cxx_ident(&ts_name);
+        let ts_name = ts_fn_name(&method.name);
+        let cxx_name = sanitize_cxx_ident(&method.name.to_lower_camel_case());
         let uniffi_symbol = method.callable.ffi_func.0.clone();
         let mut args = Vec::new();
         for arg in &method.inputs {
@@ -764,6 +1068,9 @@ impl NitroFunction {
                 .async_data
                 .as_ref()
                 .map(NitroAsyncData::from_general),
+            static_name: None,
+            is_primary_ctor: false,
+            docstring: method.docstring.clone(),
         })
     }
 }
@@ -783,6 +1090,13 @@ fn throws_from(ty: Option<&general::Type>) -> Option<NitroErrorRef> {
 }
 
 impl NitroFunction {
+    /// Author docstring formatted as a JSDoc `/** … */` block for the consumer
+    /// surface, or `None` when the function carries no docstring. See
+    /// [`format_ts_docstring`] / audit bug #23.
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
+    }
+
     /// The C++ return type as it appears in the HybridObject method
     /// signature. For sync methods this is the lowered/lifted scalar
     /// type; for async methods it's `std::shared_ptr<Promise<T>>` —
@@ -887,9 +1201,16 @@ pub struct NitroInterface {
     /// constructor.
     pub factories: Vec<NitroFunction>,
     pub methods: Vec<NitroFunction>,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
 }
 
 impl NitroInterface {
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
+    }
+
     fn from_general(iface: &general::Interface) -> Result<Self> {
         let ts_name = iface.name.to_upper_camel_case();
         let cxx_class = format!("Hybrid{}", ts_name);
@@ -900,14 +1221,22 @@ impl NitroInterface {
         // fully-qualified `Hybrid<Name>`.
         let self_ty = NitroType::from_type(&iface.self_type.ty)?;
 
-        // One pass over the constructors: the first argless/sync/infallible
-        // one becomes the `primary` (wired into the C++ default constructor,
-        // kept in `constructors`); every other constructor becomes a factory
-        // method on the namespace API (Nitro's argless `createHybridObject`
-        // can't drive an argument-taking / async / fallible constructor).
+        // One pass over the constructors. Classification follows uniffi's
+        // authoritative `CallableKind::Constructor { primary }` flag (set by
+        // name: `new` -> primary; see pipeline/general/callable.rs), NOT a
+        // home-grown arity/async/throws heuristic.
+        //
+        // A ctor lands in `constructors` (wired into the C++ default
+        // constructor, driven by `createHybridObject('<Name>')`) ONLY when it
+        // is BOTH the primary `new` AND a *drivable default* — argless, sync,
+        // infallible — because that's the only shape Nitro's argless
+        // `createHybridObject` path can run. Every other constructor (the
+        // arg-taking / async / fallible primary, plus all alternates) becomes
+        // a factory method on the namespace API; the consumer-module class
+        // surface then routes each factory via its `is_primary_ctor` /
+        // `static_name` fields (set in `from_constructor_factory`).
         let mut constructors = Vec::new();
         let mut factories = Vec::new();
-        let mut have_primary = false;
         for ctor in &iface.constructors {
             let parsed = match NitroFunction::from_constructor(ctor) {
                 Ok(f) => f,
@@ -919,12 +1248,17 @@ impl NitroInterface {
                     continue;
                 }
             };
-            let is_primary = !have_primary
-                && parsed.args.is_empty()
-                && !parsed.is_async
-                && parsed.throws.is_none();
-            if is_primary {
-                have_primary = true;
+            let is_primary = matches!(
+                ctor.callable.kind,
+                general::CallableKind::Constructor { primary: true, .. }
+            );
+            // Whether this ctor can be wired into the C++ argless
+            // `createHybridObject` default-ctor path — a real constraint
+            // (the default constructor takes no args and cannot await / throw
+            // a typed error through that path).
+            let is_drivable_default =
+                parsed.args.is_empty() && !parsed.is_async && parsed.throws.is_none();
+            if is_primary && is_drivable_default {
                 constructors.push(parsed);
             } else {
                 // Re-derive as a factory (return type = the interface). The
@@ -958,21 +1292,55 @@ impl NitroInterface {
             constructors,
             factories,
             methods,
+            docstring: iface.docstring.clone(),
         })
     }
 
-    /// The interface's primary (argless, sync, infallible) constructor,
-    /// if any. Nitro vends HybridObjects through
-    /// `NitroModules.createHybridObject('<Name>')`, which runs the C++
-    /// default constructor with no arguments — so we can only wire a
-    /// uniffi constructor into that path when it takes no args. The
-    /// common `#[uniffi::constructor] fn new() -> Arc<Self>` shape fits.
-    /// Interfaces whose construction needs arguments stay default-handle
-    /// (the namespace API can still hand them back from method returns).
-    pub fn primary_constructor(&self) -> Option<&NitroFunction> {
-        self.constructors
+    /// The factory for the uniffi-primary `new` constructor *when it landed in
+    /// `factories`* — i.e. the primary takes args / is async / is fallible, so
+    /// it could NOT be wired into the C++ argless default-ctor path (which is
+    /// `primary_constructor` instead). The consumer-module class template uses
+    /// this to emit the JS `constructor(args)` (sync arg-taking / fallible-only)
+    /// or a static promise-returning factory (async — JS forbids async
+    /// constructors). `None` when the primary is a drivable default (then
+    /// `primary_constructor` is `Some`) or when the interface has no primary
+    /// (UDL alternate-only objects are rare but valid).
+    ///
+    /// At most one factory carries `is_primary_ctor` (uniffi marks exactly one
+    /// constructor primary), so `find` is unambiguous.
+    pub fn primary_ctor_factory(&self) -> Option<&NitroFunction> {
+        self.factories.iter().find(|f| f.is_primary_ctor)
+    }
+
+    /// The constructor factories the consumer-module class exposes as *named
+    /// statics* (`static <ctorName>(...)`) — every alternate / named ctor,
+    /// excluding the primary (which is `primary_constructor` /
+    /// `primary_ctor_factory`). Each carries a `Some(static_name)`. Iterated by
+    /// the TS class template; the bodies delegate to the same `<Ns>Api`
+    /// HybridObject factory method (`create<Iface><Ctor>`) the C++ side exposes.
+    pub fn static_factories(&self) -> Vec<&NitroFunction> {
+        self.factories
             .iter()
-            .find(|c| c.args.is_empty() && !c.is_async && c.throws.is_none())
+            .filter(|f| f.static_name.is_some())
+            .collect()
+    }
+
+    /// The interface's primary constructor *iff* it is a drivable default
+    /// (the uniffi-primary `new` AND argless / sync / infallible), if any.
+    /// Nitro vends HybridObjects through
+    /// `NitroModules.createHybridObject('<Name>')`, which runs the C++
+    /// default constructor with no arguments — so a uniffi constructor can be
+    /// wired into that path only when it is the primary and takes no args /
+    /// doesn't await / doesn't throw. The common
+    /// `#[uniffi::constructor] fn new() -> Arc<Self>` shape fits.
+    ///
+    /// `from_general` already routes exactly the primary-and-drivable-default
+    /// constructor (at most one) into `constructors` and every other ctor into
+    /// `factories`, so this is simply the head of `constructors`. Interfaces
+    /// whose primary construction needs arguments / is async / is fallible
+    /// have an empty `constructors` and surface that ctor as a factory instead.
+    pub fn primary_constructor(&self) -> Option<&NitroFunction> {
+        self.constructors.first()
     }
 
     /// Record / enum headers the `.hpp` must `#include` for complete types in
@@ -1043,6 +1411,20 @@ pub struct ForeignTsImport {
     pub type_names: Vec<String>,
 }
 
+/// One VALUE `import { … } from '<module_path>'` line the consumer wrapper
+/// emits for the runtime symbols a configured custom-type conversion needs in
+/// scope (e.g. `import { URL } from '@/converters'`). Distinct from
+/// [`ForeignTsImport`] (a type-only import); these symbols are referenced by
+/// the `intoCustom` / `fromCustom` expressions at runtime. See
+/// [`NitroModule::custom_conversion_imports`] / audit bug #17.
+pub struct TsNamedImport {
+    /// Module specifier the symbols are imported from, verbatim from the
+    /// configured `imports = [["URL", "@/converters"]]`.
+    pub module_path: String,
+    /// Sorted, deduped symbol names imported from that module.
+    pub type_names: Vec<String>,
+}
+
 /// A foreign-implementable callback interface. Covers two uniffi shapes:
 ///
 /// * UDL `callback interface` / `#[uniffi::export(callback_interface)]`
@@ -1080,6 +1462,8 @@ pub struct NitroCallbackInterface {
     /// proxy clone/free its handle. `None` for foreign-only UDL callback
     /// interfaces.
     pub proxy: Option<NitroCallbackProxy>,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
 }
 
 /// Rust-callable surface of a `with_foreign` trait, used to build the
@@ -1115,6 +1499,8 @@ pub struct NitroCallbackMethod {
     /// Typed error this method may throw, if any. Drives the proxy's
     /// `lift_<Name>Error` decode + rethrow on a `RustCallStatus` error.
     pub throws: Option<NitroErrorRef>,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
 }
 
 impl NitroCallbackMethod {
@@ -1165,25 +1551,39 @@ impl NitroCallbackMethod {
 
     /// Whether the generated JS-impl bridge (the `setJsImpl` hook + the
     /// per-method `_fn_` member the virtual prefers) can be emitted for this
-    /// method.
+    /// method. EVERY method is supported.
     ///
-    /// Nitro's `JSIConverter<std::function<R(Args...)>>` collapses a
-    /// `Promise<void>`-returning JS function to a fire-and-forget
-    /// `AsyncJSCallback<void>` whose `operator()` returns `void` — which is
-    /// not convertible to the `std::shared_ptr<Promise<void>>` an async-void
-    /// virtual must return, so a `std::function`-typed member for that case
-    /// is ill-formed *and* would lose the JS completion signal the
-    /// foreign-future trampoline awaits. Such methods keep the proxy / throw
-    /// fallback instead (they aren't exercised through the JS-impl path).
-    ///
-    /// Sync methods (any return, including void) and async methods returning
-    /// a value are all supported.
+    /// The previously-excluded async-void case is now bound exactly like
+    /// async-value: the JS-impl member is typed
+    /// `std::shared_ptr<ForeignAsyncResult<void>>` (see
+    /// [`Self::cxx_return_signature`]), NOT a bare `Promise<void>`. Because
+    /// `ForeignAsyncResult<T>` is not a `Promise`, Nitro's
+    /// `JSIConverter<std::function<R(Args...)>>` keeps the `SyncJSCallback`
+    /// path (its `is_promise_v<R>` test is false), and
+    /// `JSIConverter+Promise.hpp` handles the `is_void_v` payload explicitly —
+    /// so the JS method's returned Promise is `.then`/`.catch`-chained and
+    /// awaited rather than mis-read as the raw value or dropped. Keeping this
+    /// `true` for every method makes the consumer module's `impl:` parameter
+    /// type (which iterates ALL methods) agree with the `setJsImpl` binding
+    /// (which iterates only the supported ones), so async-void trait methods
+    /// like `delay`/`tryDelay` are actually bound rather than throwing
+    /// "not implemented" at runtime. See audit bug #4.
     pub fn supports_js_impl(&self) -> bool {
-        !(self.is_async && matches!(self.return_kind, ReturnKind::Void))
+        true
+    }
+
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
     }
 }
 
 impl NitroCallbackInterface {
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
+    }
+
     /// Whether any method supports the JS-impl bridge (see
     /// [`NitroCallbackMethod::supports_js_impl`]). When false the `setJsImpl`
     /// hook + the consumer-facing JS-impl factory are not emitted at all.
@@ -1211,8 +1611,8 @@ impl NitroCallbackInterface {
         let mut methods = Vec::new();
         for method in &cb.methods {
             let res = (|| -> Result<NitroCallbackMethod> {
-                let ts_name = method.name.to_lower_camel_case();
-                let cxx_name = sanitize_cxx_ident(&ts_name);
+                let ts_name = ts_fn_name(&method.name);
+                let cxx_name = sanitize_cxx_ident(&method.name.to_lower_camel_case());
                 let mut args = Vec::new();
                 for arg in &method.inputs {
                     args.push(NitroArg::from_general(arg)?);
@@ -1228,6 +1628,7 @@ impl NitroCallbackInterface {
                     // no `fn_method_*` symbol and no proxy dispatch.
                     uniffi_symbol: None,
                     throws: throws_from(method.throws.as_ref()),
+                    docstring: method.docstring.clone(),
                 })
             })();
             match res {
@@ -1244,6 +1645,7 @@ impl NitroCallbackInterface {
             vtable_init_symbol,
             methods,
             proxy: None,
+            docstring: cb.docstring.clone(),
         })
     }
 
@@ -1268,8 +1670,8 @@ impl NitroCallbackInterface {
         let mut methods = Vec::new();
         for method in &iface.methods {
             let res = (|| -> Result<NitroCallbackMethod> {
-                let ts_name = method.name.to_lower_camel_case();
-                let cxx_name = sanitize_cxx_ident(&ts_name);
+                let ts_name = ts_fn_name(&method.name);
+                let cxx_name = sanitize_cxx_ident(&method.name.to_lower_camel_case());
                 let mut args = Vec::new();
                 for arg in &method.inputs {
                     args.push(NitroArg::from_general(arg)?);
@@ -1296,6 +1698,7 @@ impl NitroCallbackInterface {
                     is_async: method.is_async,
                     uniffi_symbol,
                     throws: throws_from(method.throws.as_ref()),
+                    docstring: method.docstring.clone(),
                 })
             })();
             match res {
@@ -1315,6 +1718,7 @@ impl NitroCallbackInterface {
                 clone_symbol: iface.ffi_func_clone.0.clone(),
                 free_symbol: iface.ffi_func_free.0.clone(),
             }),
+            docstring: iface.docstring.clone(),
         })
     }
 
@@ -1415,6 +1819,69 @@ impl NitroArg {
         let lowered_name = format!("{}_lowered", self.ts_name);
         self.ty.lift_expr(&lowered_name, current_ns)
     }
+
+    /// The exception-safe argument-lowering *declaration* statement for an
+    /// outbound FFI call (interface method, namespace-API free function, or
+    /// callback proxy dispatch). Implements the three-way split (audit bug
+    /// #24): an owning `RustBuffer` arg is parked in a `RustBufferGuard`; an
+    /// interface / callback handle arg is parked in a move-only
+    /// `UniffiObjectHandle<&free_symbol>` guard; everything else stays a bare
+    /// `auto <name>_lowered = …` local. Each guarded value is `.take()`-d into
+    /// the FFI call by [`Self::pass_expr`] only once *every* arg has lowered
+    /// successfully, so a later throwing lowering frees the already-built
+    /// buffers / cloned handles on unwind instead of leaking them.
+    ///
+    /// A handle-bearing arg whose `free_symbol` is unknown (an unregistered
+    /// type, e.g. a direct unit-test `NitroType`) falls back to a bare local —
+    /// it cannot be guarded without the symbol, and that path is not reached by
+    /// real generated code (every emitted interface registers its free symbol).
+    pub fn lower_guard_stmt(
+        &self,
+        current_ns: &str,
+        alloc_symbol: &str,
+        reserve_symbol: &str,
+    ) -> String {
+        let lowered = self
+            .ty
+            .lower_expr(&self.ts_name, current_ns, alloc_symbol, reserve_symbol);
+        if self.ty.is_rust_buffer() {
+            format!(
+                "ubrn::nitro::RustBufferGuard {name}_guard{{ {lowered}, &free_status_buffer }};",
+                name = self.ts_name,
+            )
+        } else if let Some(free) = self.handle_guard_free_symbol() {
+            format!(
+                "ubrn::nitro::UniffiObjectHandle<&{free}> {name}_guard{{ {lowered} }};",
+                name = self.ts_name,
+            )
+        } else {
+            format!("auto {name}_lowered = {lowered};", name = self.ts_name)
+        }
+    }
+
+    /// The call-site expression for this arg in an outbound FFI call: the
+    /// guarded forms relinquish ownership via `.take()`, the bare form passes
+    /// its `<name>_lowered` local directly. Mirrors [`Self::lower_guard_stmt`].
+    pub fn pass_expr(&self) -> String {
+        if self.ty.is_rust_buffer() || self.handle_guard_free_symbol().is_some() {
+            format!("{}_guard.take()", self.ts_name)
+        } else {
+            format!("{}_lowered", self.ts_name)
+        }
+    }
+
+    /// `Some(free_symbol)` when this arg is a handle-bearing type whose owning
+    /// `fn_free_<obj>` symbol is known — i.e. it both needs a move-only handle
+    /// guard AND we can name the free hook to instantiate one. Used by both
+    /// helpers above so the declaration and the call site agree on whether the
+    /// arg is guarded.
+    fn handle_guard_free_symbol(&self) -> Option<String> {
+        if self.ty.needs_handle_guard() {
+            self.ty.free_symbol()
+        } else {
+            None
+        }
+    }
 }
 
 /// The subset of uniffi types ubrn's Nitro backend currently emits.
@@ -1490,6 +1957,22 @@ pub enum NitroType {
     Interface {
         namespace: String,
         name: String,
+    },
+    /// A uniffi `custom` type (newtype) — a thin nominal wrapper around a
+    /// `builtin` (e.g. `Url`/`String`, `Handle`/`Int64`). The wire format and
+    /// every C++ codec / lift / lower / header path are exactly the `inner`
+    /// builtin's (uniffi gives a custom type no FFI identity of its own), so
+    /// all those methods delegate straight through to `inner`. Only the
+    /// TS-surface spelling differs: [`Self::ts_type`] returns the nominal
+    /// `name` alias (the consumer module emits `export type <Name> = <inner>`),
+    /// and the configured `intoCustom` / `fromCustom` conversions (threaded via
+    /// the per-namespace `TsConfig`) are applied in the plain-TS wrapper. See
+    /// audit bug #17. `namespace` is the owning uniffi namespace (drives the
+    /// cross-namespace `import type` of the alias).
+    Custom {
+        namespace: String,
+        name: String,
+        inner: Box<NitroType>,
     },
     /// A placeholder for any uniffi type the Nitro backend can't model.
     /// `from_type` is total over uniffi's type universe today, so this is
@@ -1569,13 +2052,23 @@ impl NitroType {
                     }
                 }
             }
-            // A uniffi `custom` type is a thin wrapper around a builtin
-            // (e.g. `Url`/`String`, `JsonValue`/`String`) whose only role
-            // on the FFI side is to inherit the builtin's wire format.
-            // Recursing into the builtin gives us a working round-trip
-            // immediately; renaming/converters live in the TS-side wrapper
-            // module and don't affect the C ABI.
-            Type::Custom { builtin, .. } => Self::from_type(builtin)?,
+            // A uniffi `custom` type (newtype) is a thin nominal wrapper around
+            // a builtin (e.g. `Url`/`String`, `JsonValue`/`String`) whose only
+            // role on the FFI side is to inherit the builtin's wire format. We
+            // PRESERVE the nominal `name` (so the TS surface keeps the alias and
+            // configured converters can apply) while recursing into `builtin`
+            // for the wire path — every codec / C++ / header method on
+            // `Self::Custom` delegates to `inner`, so the C ABI is unchanged vs
+            // the previous erase-to-builtin behavior. See audit bug #17.
+            Type::Custom {
+                namespace,
+                name,
+                builtin,
+            } => Self::Custom {
+                namespace: namespace.clone(),
+                name: name.to_upper_camel_case(),
+                inner: Box::new(Self::from_type(builtin)?),
+            },
         })
     }
 
@@ -1609,36 +2102,56 @@ impl NitroType {
             // matching how Nitro itself models optionals and the idiomatic
             // `field?:` / `obj?.x` usage.
             Self::Optional(inner) => format!("({}) | undefined", inner.ts_type()),
-            Self::Sequence(inner) => format!("({})[]", inner.ts_type()),
-            Self::Map(k, v) => {
-                // TS `Record<K, V>` requires `K` extend `string | number | symbol`.
-                // bigint and complex keys fall back to `Map<K, V>`.
-                if Self::is_record_key_compatible(k) {
-                    format!("Record<{}, {}>", k.ts_type(), v.ts_type())
-                } else {
-                    format!("Map<{}, {}>", k.ts_type(), v.ts_type())
-                }
-            }
+            // Canonical (`gen_typescript` `type_helpers.rs`) emits `Array<T>`,
+            // not `(T)[]`; structurally identical, but we mirror the oracle for
+            // parity. See audit bug #14.
+            Self::Sequence(inner) => format!("Array<{}>", inner.ts_type()),
+            // Always `Map<K, V>` (a real JS `Map`), NEVER `Record<K, V>` (a
+            // plain object). A `Record<number, V>` stringifies its numeric keys
+            // at the C++ converter boundary, breaking `.get(<numericKey>)` /
+            // `.size` / `for…of` on the JS side; the paired C++ map converter
+            // marshals a real JS `Map` for any key type. See audit bug #12.
+            Self::Map(k, v) => format!("Map<{}, {}>", k.ts_type(), v.ts_type()),
             Self::CallbackInterface { name, .. } => name.clone(),
             Self::Record { name, .. } => name.to_upper_camel_case(),
             Self::Enum { name, .. } => name.to_upper_camel_case(),
             Self::Interface { name, .. } => name.to_upper_camel_case(),
+            // The nominal alias — the consumer module declares
+            // `export type <Name> = <inner>` so this resolves. See bug #17.
+            Self::Custom { name, .. } => name.clone(),
             Self::Stub => "unknown".into(),
         }
     }
 
-    fn is_record_key_compatible(ty: &NitroType) -> bool {
+    /// Whether a configured custom-type `intoCustom` / `fromCustom` conversion
+    /// can be applied at the wrapper boundary when THIS type is the custom's
+    /// inner (wire) builtin. True only for scalar builtins that have a plain JS
+    /// runtime VALUE form (`string`, `number`, `bigint`, `boolean`, `Date`,
+    /// `ArrayBuffer`) — the conversion expressions reference only the value
+    /// plus imported helpers, so they resolve. A custom over a Record / Enum /
+    /// Interface (or a composite) is Nitro-limited: those surface as TYPE-ONLY
+    /// under Nitro (no runtime `new MyEnum.A()` / `MyEnum_Tags`), so a JSI-style
+    /// conversion expression that constructs them would not type-check. For
+    /// those the wrapper falls back to a plain pass-through alias to the inner
+    /// type (the same documented limitation as record-field conversion). #17.
+    fn inner_supports_js_conversion(&self) -> bool {
         matches!(
-            ty,
-            Self::String
+            self,
+            Self::Bool
                 | Self::U8
                 | Self::U16
                 | Self::U32
+                | Self::U64
                 | Self::I8
                 | Self::I16
                 | Self::I32
+                | Self::I64
                 | Self::F32
                 | Self::F64
+                | Self::String
+                | Self::Bytes
+                | Self::Timestamp
+                | Self::Duration
         )
     }
 
@@ -1693,6 +2206,9 @@ impl NitroType {
                 namespace,
                 name.to_upper_camel_case()
             ),
+            // A custom type has no C++ identity of its own — it is the inner
+            // builtin's C++ type on the wire (see the `Custom` doc-comment).
+            Self::Custom { inner, .. } => inner.cxx_type(),
             Self::Stub => "::ubrn::nitro::StubValue".into(),
         }
     }
@@ -1724,6 +2240,8 @@ impl NitroType {
             | Self::Enum { .. }
             | Self::Stub => "RustBuffer",
             Self::CallbackInterface { .. } | Self::Interface { .. } => "uint64_t",
+            // The wire form is the inner builtin's (see the `Custom` doc-comment).
+            Self::Custom { inner, .. } => inner.c_type(),
         }
     }
 
@@ -1734,6 +2252,47 @@ impl NitroType {
     pub fn is_rust_buffer(&self) -> bool {
         self.c_type() == "RustBuffer"
     }
+
+    /// The owning interface / callback-proxy `uniffi_<crate>_fn_free_<obj>`
+    /// symbol for a handle-bearing type (`Interface` or `CallbackInterface`),
+    /// recovered from the per-generate [`INTERFACE_FREE_SYMBOLS`] registry by
+    /// `(namespace, name)` — the use-site `Type` carries no symbol of its own.
+    /// Drives the move-only RAII handle guard (`UniffiObjectHandle<&free>`) that
+    /// the arg-lowering / return-handle paths use so a cloned Arc / handle-map
+    /// entry isn't leaked on a throwing-lowering or `make_shared` unwind (audit
+    /// bugs #24/#27). A `Custom` delegates to its inner; everything else (and an
+    /// unregistered type — e.g. a direct unit-test `NitroType`) is `None`, in
+    /// which case the caller falls back to the bare-local lowering.
+    pub fn free_symbol(&self) -> Option<String> {
+        match self {
+            Self::Interface { namespace, name } | Self::CallbackInterface { namespace, name } => {
+                registered_interface_free_symbol(namespace, name)
+            }
+            Self::Custom { inner, .. } => inner.free_symbol(),
+            _ => None,
+        }
+    }
+
+    /// Whether an *argument* of this type, once lowered to its `uint64_t`
+    /// handle, must be parked in a move-only RAII handle guard (released into
+    /// the FFI call only after every arg lowering has succeeded) rather than
+    /// held in a bare local — true for `Interface` / `CallbackInterface` args,
+    /// whose lowering clones an Arc / inserts a handle-map entry that a later
+    /// throwing arg lowering would otherwise leak. See audit bug #24/#25.
+    pub fn needs_handle_guard(&self) -> bool {
+        match self {
+            Self::Interface { .. } | Self::CallbackInterface { .. } => true,
+            Self::Custom { inner, .. } => inner.needs_handle_guard(),
+            _ => false,
+        }
+    }
+
+    // NOTE: the owned-handle return guard (audit bug #27) needs no predicate —
+    // `lift_expr`'s `Interface` / `CallbackInterface` arms unconditionally route
+    // the returned Arc handle through the `Hybrid<Name>::adopt` choke point,
+    // which parks it in a move-only guard THROUGH the `make_shared` allocation.
+    // So the F2 fix is structural in `lift_expr` and a `returns_owned_handle`
+    // predicate would be dead — it is intentionally not carried.
 
     /// Qualifier prefix for a record / enum codec free-function
     /// (`write_/read_/lower_/lift_<Name>`) defined in `type_ns`, as seen
@@ -1873,6 +2432,12 @@ impl NitroType {
             // which *consumes* one Arc reference. Clone first so the JS-side
             // wrapper keeps its own live reference.
             Self::Interface { .. } => format!("{name}->clone_handle()"),
+            // A custom type lowers exactly as its inner builtin (it has no
+            // wire identity of its own); the nominal alias / converters live in
+            // the TS surface only.
+            Self::Custom { inner, .. } => {
+                inner.lower_expr(name, current_ns, alloc_symbol, reserve_symbol)
+            }
             Self::Stub => {
                 format!("::ubrn::nitro::lower_stub(/* unsupported in nitro v1 */ {name})")
             }
@@ -1930,12 +2495,16 @@ impl NitroType {
                 // trait's `fn_method_*` symbols (see the with_foreign branch
                 // of `callback.{hpp,cpp}`). This only arises for `with_foreign`
                 // traits — a foreign-only UDL callback interface has no Rust
-                // impl that could be returned. The proxy ctor takes ownership
-                // of the handle (uniffi already gave us our own reference). The
-                // class lives in the callback's owning namespace, so qualify
-                // when it's foreign.
+                // impl that could be returned. Route through the proxy's
+                // `Hybrid<Name>::adopt` choke point (not a bare `make_shared`),
+                // which parks the owned handle in a move-only guard THROUGH the
+                // allocation and relinquishes it only after the object exists —
+                // so a throwing `make_shared` / Nitro base ctor frees the handle
+                // instead of leaking the Rust-side reference (audit bug #27). The
+                // class lives in the callback's owning namespace, so qualify when
+                // it's foreign.
                 format!(
-                    "std::make_shared<{prefix}Hybrid{cb}>(::ubrn::nitro::FromRustHandle{{{name}}})",
+                    "{prefix}Hybrid{cb}::adopt({name})",
                     prefix = Self::cxx_class_ns_prefix(namespace),
                     cb = cb_name.to_upper_camel_case(),
                 )
@@ -1959,10 +2528,20 @@ impl NitroType {
                 namespace,
                 name: type_name,
             } => format!(
-                "std::make_shared<::margelo::nitro::{}::Hybrid{}>({name})",
+                // Route the owned Arc handle (uniffi `Arc::into_raw`, from an
+                // interface-returning method / ctor) through the `Hybrid<Name>::adopt`
+                // choke point rather than a bare `make_shared`: adopt parks the
+                // handle in a move-only guard THROUGH the allocation and relinquishes
+                // it only after the wrapper object exists, so a throwing `make_shared`
+                // / Nitro base ctor frees the handle instead of leaking the Rust-side
+                // strong count (audit bug #27).
+                "::margelo::nitro::{}::Hybrid{}::adopt({name})",
                 namespace,
                 type_name.to_upper_camel_case()
             ),
+            // A custom type lifts exactly as its inner builtin (no wire
+            // identity of its own).
+            Self::Custom { inner, .. } => inner.lift_expr(name, current_ns),
             Self::Stub => format!("::ubrn::nitro::lift_stub(/* unsupported in nitro v1 */ {name})"),
             _ => format!("ubrn::nitro::lift_{}({name})", self.lower_suffix()),
         }
@@ -1974,7 +2553,13 @@ impl NitroType {
     /// the value's own finalizer does. Currently `Bytes`, whose payload we
     /// expose directly as the ArrayBuffer's backing store.
     pub fn lift_consumes_buffer(&self) -> bool {
-        matches!(self, Self::Bytes)
+        match self {
+            Self::Bytes => true,
+            // A custom type inherits its inner builtin's buffer-ownership
+            // behavior (e.g. a `custom Blob = Bytes` consumes the buffer).
+            Self::Custom { inner, .. } => inner.lift_consumes_buffer(),
+            _ => false,
+        }
     }
 
     /// Zero-copy top-level lift that consumes the `RustBuffer` (see
@@ -1985,6 +2570,10 @@ impl NitroType {
             Self::Bytes => {
                 format!("ubrn::nitro::lift_bytes_owning<&{free_symbol}>({name})")
             }
+            // A custom type defers to its inner builtin's owning lift (the only
+            // case that reaches here is a custom wrapping `Bytes`, since
+            // `lift_consumes_buffer` gates this path).
+            Self::Custom { inner, .. } => inner.lift_owning_expr(name, current_ns, free_symbol),
             // Only `Bytes` sets `lift_consumes_buffer`, so this is unreachable
             // for other types; fall back to the copying lift to stay total.
             _ => self.lift_expr(name, current_ns),
@@ -2100,6 +2689,10 @@ impl NitroType {
                 namespace,
                 name.to_upper_camel_case()
             ),
+            // A custom type serializes exactly as its inner builtin.
+            Self::Custom { inner, .. } => {
+                inner.write_fn_template_arg(current_ns, alloc_symbol, reserve_symbol)
+            }
             Self::Stub => "&ubrn::nitro::unsupported_compound_inside_composite".into(),
             _ => format!(
                 "&ubrn::nitro::write_{}<&{alloc_symbol}, &{reserve_symbol}>",
@@ -2180,6 +2773,8 @@ impl NitroType {
                 namespace,
                 name.to_upper_camel_case()
             ),
+            // A custom type's stream thunk is its inner builtin's.
+            Self::Custom { inner, .. } => inner.codec_write_thunk_arg(current_ns),
             Self::Stub => "&ubrn::nitro::unsupported_compound_inside_composite".into(),
             _ => format!("&ubrn::nitro::write_{}_w", self.lower_suffix()),
         }
@@ -2254,6 +2849,8 @@ impl NitroType {
                 namespace,
                 name.to_upper_camel_case()
             ),
+            // A custom type's reader is its inner builtin's.
+            Self::Custom { inner, .. } => inner.read_fn_template_arg(current_ns),
             Self::Stub => "&ubrn::nitro::unsupported_compound_inside_composite".into(),
             _ => format!("&ubrn::nitro::read_{}", self.lower_suffix()),
         }
@@ -2295,6 +2892,9 @@ impl NitroType {
             Self::Interface { name, .. } | Self::CallbackInterface { name, .. } => {
                 vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
             }
+            // A custom type pulls in whatever its inner builtin needs (the
+            // alias itself has no header — it's TS-surface-only).
+            Self::Custom { inner, .. } => inner.referenced_headers(),
             _ => Vec::new(),
         }
     }
@@ -2317,6 +2917,8 @@ impl NitroType {
             Self::Record { namespace, name } | Self::Enum { namespace, name } => {
                 out.insert((namespace.clone(), name.to_upper_camel_case()));
             }
+            // A custom type references whatever its inner builtin does.
+            Self::Custom { inner, .. } => inner.referenced_value_types(out),
             _ => {}
         }
     }
@@ -2334,6 +2936,9 @@ impl NitroType {
             Self::Record { namespace, name } | Self::Enum { namespace, name } => {
                 Some((namespace.clone(), name.to_upper_camel_case()))
             }
+            // A custom directly wrapping a record / enum holds it by value
+            // (the alias is a transparent newtype on the C++ side).
+            Self::Custom { inner, .. } => inner.by_value_type(),
             _ => None,
         }
     }
@@ -2361,6 +2966,9 @@ impl NitroType {
             Self::CallbackInterface { name, .. } => {
                 vec![format!("Hybrid{}.hpp", name.to_upper_camel_case())]
             }
+            // A custom type needs whatever complete-type headers its inner
+            // builtin does.
+            Self::Custom { inner, .. } => inner.referenced_value_headers(),
             _ => Vec::new(),
         }
     }
@@ -2385,6 +2993,9 @@ impl NitroType {
                     format!("Hybrid{}", name.to_upper_camel_case()),
                 )]
             }
+            // A custom type forward-declares whatever interfaces its inner
+            // builtin references.
+            Self::Custom { inner, .. } => inner.referenced_interface_classes(),
             _ => Vec::new(),
         }
     }
@@ -2409,6 +3020,9 @@ impl NitroType {
             {
                 out.insert(namespace.clone());
             }
+            // A custom type reaches into whatever foreign codecs its inner
+            // builtin does (the custom alias itself has no codec).
+            Self::Custom { inner, .. } => inner.foreign_codec_namespaces(current_ns, out),
             _ => {}
         }
     }
@@ -2447,6 +3061,22 @@ impl NitroType {
                 out.entry(namespace.clone())
                     .or_default()
                     .insert(name.to_upper_camel_case());
+            }
+            // A foreign custom type surfaces its own nominal alias (imported
+            // from the owning namespace's spec), and its inner builtin may in
+            // turn reference further foreign types (e.g. `custom T =
+            // Sequence<ForeignRecord>`), so recurse through `inner` too.
+            Self::Custom {
+                namespace,
+                name,
+                inner,
+            } => {
+                if !namespace.is_empty() && namespace != current_ns {
+                    out.entry(namespace.clone())
+                        .or_default()
+                        .insert(name.to_upper_camel_case());
+                }
+                inner.foreign_ts_type_refs(current_ns, out);
             }
             _ => {}
         }
@@ -2487,12 +3117,20 @@ impl NitroType {
     /// `error_field_to_string` overloads. Composites of those round-trip too
     /// (their decoders exist and `error_field_to_string` recurses through the
     /// `std::optional` / `std::vector` / `std::unordered_map` overloads).
-    /// Records, enums, interfaces, callbacks and stubs are *not* surfaced:
-    /// a record / data-enum reader exists but has no `to_string`, and — more
-    /// importantly — an error enum used as another error's field has *no*
-    /// reader emitted at all (errors become exception classes, not value
-    /// types), so reading it would reference a non-existent `read_<Name>`.
-    /// Such variants fall back to the tag-only message, exactly as before.
+    ///
+    /// Records and data-enums are now ALSO surfaced (audit bug #29): every
+    /// record / enum — including an error enum used as another error's *field*,
+    /// which is emitted as a value enum too (see [`NitroModule::from_general`]'s
+    /// `EnumShape::Error` arm, which pushes onto BOTH `errors` and `enums`) —
+    /// has a `read_<Name>` reader in `<ns>_codecs.hpp`, and the codegen emits a
+    /// matching `error_field_to_string(const <Name>&)` overload (the G2 step in
+    /// the fix plan), so `RootError::Complex(error=ComplexException::OsError(...))`
+    /// renders into `error.message` rather than degrading to the tag-only form.
+    /// This predicate MUST stay coupled with those emitted overloads.
+    ///
+    /// Interfaces, callbacks and stubs stay unsurfaced: an interface / callback
+    /// crosses as an opaque handle with no value reader, and a `Stub` has no
+    /// codec at all — those variants fall back to the tag-only message.
     pub fn is_error_message_decodable(&self) -> bool {
         match self {
             Self::Bool
@@ -2512,11 +3150,14 @@ impl NitroType {
             | Self::Duration => true,
             Self::Optional(inner) | Self::Sequence(inner) => inner.is_error_message_decodable(),
             Self::Map(k, v) => k.is_error_message_decodable() && v.is_error_message_decodable(),
-            Self::Record { .. }
-            | Self::Enum { .. }
-            | Self::Interface { .. }
-            | Self::CallbackInterface { .. }
-            | Self::Stub => false,
+            // A custom type stringifies exactly as its inner builtin (it's a
+            // transparent newtype on the wire / for the error-message render).
+            Self::Custom { inner, .. } => inner.is_error_message_decodable(),
+            // A record / data-enum has a `read_<Name>` + an
+            // `error_field_to_string(const <Name>&)` overload (see the doc
+            // comment), so its payload renders into the error message.
+            Self::Record { .. } | Self::Enum { .. } => true,
+            Self::Interface { .. } | Self::CallbackInterface { .. } | Self::Stub => false,
         }
     }
 }
@@ -2573,6 +3214,8 @@ impl ReturnKind {
 pub struct NitroRecord {
     pub ts_name: String,
     pub fields: Vec<NitroRecordField>,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
     /// The other record/enum types this record forms a header `#include`
     /// cycle with — i.e. the rest of its strongly-connected component in the
     /// record/enum dependency graph (see [`NitroModule::resolve_cycles`]).
@@ -2596,8 +3239,22 @@ impl NitroRecord {
         Ok(Self {
             ts_name,
             fields,
+            docstring: record.docstring.clone(),
             cycle_partners: Vec::new(),
         })
+    }
+
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
+    }
+
+    /// `true` when at least one field carries a default value — gates the
+    /// consumer module's runtime `create` / `defaults` factory (a record with
+    /// no defaults needs no factory; every field must be supplied). See audit
+    /// bug #10.
+    pub fn has_defaults(&self) -> bool {
+        self.fields.iter().any(|f| f.default_value.is_some())
     }
 
     /// `true` when this record participates in a header `#include` cycle and
@@ -2673,6 +3330,22 @@ pub struct NitroRecordField {
     #[allow(dead_code)]
     pub rust_name: String,
     pub ty: NitroType,
+    /// The field's default value rendered as a TS literal (`BigInt("31")`,
+    /// `undefined`, `"default-value"`, `Foo.create({})`, …), if the uniffi
+    /// metadata carries one. Drives the record runtime `create`/`defaults`
+    /// factory the consumer module emits (see [`NitroRecord::has_defaults`]).
+    /// `None` for fields with no default — the consumer must supply them. See
+    /// audit bug #10. Always `None` for enum-variant fields (a variant payload
+    /// has no defaults).
+    pub default_value: Option<String>,
+    /// Author docstring from the uniffi metadata, if any. Emitted as JSDoc on
+    /// the field in the consumer surface (see [`format_ts_docstring`]). See
+    /// audit bug #23.
+    pub docstring: Option<String>,
+    /// `true` when the field's type is `Optional<T>` — the consumer / spec
+    /// surface then spells it as an OPTIONAL PROPERTY (`name?: T`) rather than
+    /// a required `name: (T) | undefined`. Cached at construction from `ty`.
+    pub optional: bool,
 }
 
 impl NitroRecordField {
@@ -2690,11 +3363,41 @@ impl NitroRecordField {
             camel
         };
         let cxx_name = sanitize_cxx_ident(&ts_name);
+        let ty = NitroType::from_type_lossy(&field.ty.ty);
+        let optional = matches!(ty, NitroType::Optional(_));
         Self {
             ts_name,
             cxx_name,
             rust_name: field.name.clone(),
-            ty: NitroType::from_type_lossy(&field.ty.ty),
+            ty,
+            default_value: field.default.as_ref().map(render_default_value),
+            docstring: field.docstring.clone(),
+            optional,
+        }
+    }
+
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
+    }
+
+    /// Whether this field is surfaced as an OPTIONAL PROPERTY (`name?: T`) in
+    /// the record / variant TS type — true exactly when the field type is
+    /// `Optional<T>`. Pairs with [`Self::ts_field_type`] (which unwraps the one
+    /// `Optional`). Record/variant-field position ONLY — [`NitroType::ts_type`]
+    /// in arg / return position is unchanged. See audit bug #9.
+    pub fn ts_is_optional(&self) -> bool {
+        self.optional
+    }
+
+    /// The TS type spelled for this field in record / variant-field position:
+    /// the inner type with ONE level of `Optional` unwrapped when
+    /// [`Self::ts_is_optional`] (the `?:` carries the optionality), else the
+    /// plain `ty.ts_type()`. See audit bug #9.
+    pub fn ts_field_type(&self) -> String {
+        match &self.ty {
+            NitroType::Optional(inner) => inner.ts_type(),
+            other => other.ts_type(),
         }
     }
 }
@@ -2707,6 +3410,8 @@ pub struct NitroEnum {
     pub ts_name: String,
     pub variants: Vec<NitroEnumVariant>,
     pub flat: bool,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
     /// The other record/enum types this enum forms a header `#include` cycle
     /// with — its SCC partners. See [`NitroRecord::cycle_partners`]. Always
     /// empty for flat enums (no payloads, so they reference nothing).
@@ -2721,12 +3426,25 @@ impl NitroEnum {
             .iter()
             .map(NitroEnumVariant::from_general)
             .collect();
+        // NOTE: an explicit `#[repr]` discriminant (`en.meta_discr_type`) is
+        // deliberately NOT carried. The flat enum is emitted as a STRING-valued
+        // `export enum X { Dog = 'Dog' }` (locked decision) because Nitro's
+        // flat-enum JSIConverter hashes the variant NAME — a numeric value would
+        // break `canConvert`, and the wire form is the C++-computed 1-based
+        // ordinal regardless. So the explicit discriminant has no runtime role
+        // on the Nitro surface and is dropped rather than carried dead (#15/#16).
         Ok(Self {
             ts_name,
             variants,
             flat: en.is_flat,
+            docstring: en.docstring.clone(),
             cycle_partners: Vec::new(),
         })
+    }
+
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
     }
 
     /// `true` when this enum participates in a header `#include` cycle and
@@ -2942,15 +3660,145 @@ fn sanitize_ts_arg_ident(name: &str) -> String {
     // a binding identifier. Kept small + targeted — a uniffi arg name is
     // already lowerCamelCase, so most JS keywords (e.g. `class`, `for`)
     // can't appear, but the value-position reserved words below can.
-    const TS_RESERVED_ARG_IDENTS: &[&str] = &[
-        "this", "arguments", "eval", "default", "function", "in", "instanceof", "new", "return",
-        "typeof", "void", "delete", "yield", "await",
-    ];
-    if TS_RESERVED_ARG_IDENTS.contains(&name) {
+    if TS_RESERVED_IDENTS.contains(&name) {
         format!("{name}_")
     } else {
         name.to_string()
     }
+}
+
+/// TS reserved words that are illegal as a value-position binding identifier
+/// (parameter or declaration name). Shared by [`sanitize_ts_arg_ident`] (arg
+/// identifiers) and [`ts_fn_name`] (JS-facing function/method/ctor names) so
+/// both apply one source of truth. `this` is the load-bearing case for args
+/// (it silently changes a function's arity); the rest are strict-mode reserved
+/// words. For function names the relevant ones are `void`/`function`/etc. — a
+/// uniffi name like `async fn void()` would otherwise emit `export function
+/// void()`, a hard TS1359 syntax error.
+const TS_RESERVED_IDENTS: &[&str] = &[
+    "this", "arguments", "eval", "default", "function", "in", "instanceof", "new", "return",
+    "typeof", "void", "delete", "yield", "await",
+];
+
+/// Make `name` safe as a JS-facing function/method/constructor identifier.
+///
+/// `new` is returned unchanged here: it is the conventional primary-constructor
+/// name and the consumer-module class template maps it to the JS `constructor`
+/// (it never reaches a declaration site as the literal name `new`), so it must
+/// NOT be rewritten — unlike in [`sanitize_ts_arg_ident`], where a *parameter*
+/// literally named `new` is illegal and is suffixed.
+///
+/// For every other name we lowerCamelCase (matching the rest of the JS-facing
+/// surface) and, if the result collides with a TS reserved word
+/// ([`TS_RESERVED_IDENTS`]), suffix `_` (so `async fn void` -> `void_`). Only
+/// the JS-facing `ts_name` is rewritten; `cxx_name` and `uniffi_symbol` are
+/// left untouched (the FFI wire is positional / symbol-keyed and never reads
+/// this identifier).
+fn ts_fn_name(name: &str) -> String {
+    if name == "new" {
+        return name.to_string();
+    }
+    let camel = name.to_lower_camel_case();
+    if TS_RESERVED_IDENTS.contains(&camel.as_str()) {
+        format!("{camel}_")
+    } else {
+        camel
+    }
+}
+
+/// Render a uniffi `DefaultValue` as a TS literal for the consumer module's
+/// record-defaults factory. Nitro-local mirror of gen_typescript's
+/// `render_default_value` / `render_literal` (`api_module/builders.rs`), with
+/// two Nitro-specific spellings: 64-bit integers become `BigInt("N")` (Nitro
+/// surfaces `u64`/`i64` as `bigint`) and bare `Bytes` defaults become a fresh
+/// `ArrayBuffer` (Nitro's `Vec<u8>` surface is `ArrayBuffer`, not `Uint8Array`).
+/// See audit bug #10.
+fn render_default_value(dv: &general::DefaultValue) -> String {
+    match dv {
+        general::DefaultValue::Literal(lit_node) => render_literal(&lit_node.lit),
+        general::DefaultValue::Default(tn) => render_type_default(&tn.ty),
+    }
+}
+
+/// Render an explicit `Literal` default. Mirrors gen_typescript's
+/// `render_literal`; see [`render_default_value`].
+fn render_literal(lit: &general::Literal) -> String {
+    match lit {
+        general::Literal::Boolean(b) => b.to_string(),
+        general::Literal::String(s) => format!("\"{s}\""),
+        general::Literal::Int(n, _, type_node) => match &type_node.ty {
+            general::Type::Int64 | general::Type::UInt64 => format!("BigInt(\"{n}\")"),
+            _ => n.to_string(),
+        },
+        general::Literal::UInt(n, _, type_node) => match &type_node.ty {
+            general::Type::Int64 | general::Type::UInt64 => format!("BigInt(\"{n}\")"),
+            _ => n.to_string(),
+        },
+        general::Literal::Float(s, _) => s.clone(),
+        general::Literal::Enum(variant, type_node) => {
+            // No containing enum context here, so use the bare type name +
+            // UpperCamelCase variant (matching gen_typescript's fallback).
+            let type_name = match &type_node.ty {
+                general::Type::Enum { name, .. } | general::Type::Custom { name, .. } => {
+                    name.to_upper_camel_case()
+                }
+                other => NitroType::from_type_lossy(other).ts_type(),
+            };
+            format!("{type_name}.{}", variant.to_upper_camel_case())
+        }
+        general::Literal::EmptySequence => "[]".into(),
+        general::Literal::EmptyMap => "new Map()".into(),
+        general::Literal::None => "undefined".into(),
+        general::Literal::Some { inner } => render_default_value(inner),
+    }
+}
+
+/// Render the natural zero-value for a bare `default` keyword (no explicit
+/// literal). Mirrors gen_typescript's `render_type_default`, adjusted for
+/// Nitro's surface (`bigint`/`ArrayBuffer`); see [`render_default_value`].
+fn render_type_default(ty: &general::Type) -> String {
+    match ty {
+        general::Type::UInt8
+        | general::Type::UInt16
+        | general::Type::UInt32
+        | general::Type::Int8
+        | general::Type::Int16
+        | general::Type::Int32
+        | general::Type::Float32
+        | general::Type::Float64 => "0".into(),
+        general::Type::UInt64 | general::Type::Int64 => "BigInt(0)".into(),
+        general::Type::Boolean => "false".into(),
+        general::Type::String => "\"\"".into(),
+        general::Type::Bytes => "new ArrayBuffer(0)".into(),
+        general::Type::Optional { .. } => "undefined".into(),
+        general::Type::Sequence { .. } => "[]".into(),
+        general::Type::Map { .. } => "new Map()".into(),
+        general::Type::Custom { builtin, .. } => render_type_default(builtin),
+        general::Type::Record { name, .. } => {
+            format!("{}.create({{}})", name.to_upper_camel_case())
+        }
+        // No clear default semantic (matching gen_typescript): fall back to
+        // `undefined` so strict-mode TS surfaces the gap.
+        general::Type::Enum { .. }
+        | general::Type::Interface { .. }
+        | general::Type::CallbackInterface { .. }
+        | general::Type::Timestamp
+        | general::Type::Duration => "undefined".into(),
+    }
+}
+
+/// Format an author docstring as a JSDoc `/** … */` block for the consumer /
+/// spec surface. Nitro-local mirror of gen_typescript's `format_docstring`
+/// (`api_module/docstring.rs`): dedent the source, prefix each line with ` * `,
+/// and wrap. Returns `None` for `None` / all-whitespace docstrings so the
+/// templates can fall back to their existing boilerplate. See audit bug #23.
+pub fn format_ts_docstring(docstring: Option<&str>) -> Option<String> {
+    let ds = docstring?;
+    if ds.trim().is_empty() {
+        return None;
+    }
+    let middle = textwrap::indent(&textwrap::dedent(ds), " * ");
+    Some(format!("/**\n{middle}\n */"))
 }
 
 /// Dedup + sort a header-name iterator, dropping `own` (a type never
@@ -3076,6 +3924,8 @@ pub struct NitroEnumVariant {
     pub has_nameless_fields: bool,
     /// Associated-data fields, if any. Empty for unit variants.
     pub fields: Vec<NitroRecordField>,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
 }
 
 impl NitroEnumVariant {
@@ -3084,6 +3934,11 @@ impl NitroEnumVariant {
     /// `std::variant` over these. Unit variants get an empty struct.
     pub fn cxx_struct_name(&self, enum_name: &str) -> String {
         format!("{}_{}", enum_name.to_upper_camel_case(), self.ts_name)
+    }
+
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
     }
 
     /// True when, as an *error* variant, this variant carries fields that we
@@ -3111,6 +3966,12 @@ impl NitroEnumVariant {
                 .enumerate()
                 .map(|(i, f)| NitroRecordField::from_general(f, i))
                 .collect(),
+            docstring: variant.docstring.clone(),
+            // NOTE: an explicit `#[repr]` discriminant (`variant.meta_discr`)
+            // is NOT carried — the flat-enum `export enum X { Dog = 'Dog' }`
+            // form uses the variant NAME as the value (Nitro's converter hashes
+            // the name; a numeric value would break it), so the explicit repr
+            // has no runtime role on the Nitro surface. See #15/#16.
         }
     }
 }
@@ -3119,23 +3980,39 @@ impl NitroEnumVariant {
 /// Codegen for errors is a future scope — they become C++ exception
 /// classes plus `lift_<Name>Error` decoders that map the variant
 /// ordinal back to the typed exception. For now we capture enough
-/// metadata (name + variants + flat flag) so templates can iterate
-/// `module.errors` without panicking, but no codec body is emitted.
+/// metadata (name + variants) so templates can iterate `module.errors`
+/// without panicking, but no codec body is emitted.
 pub struct NitroError {
     pub ts_name: String,
     pub variants: Vec<NitroEnumVariant>,
-    pub flat: bool,
+    /// Author docstring from the uniffi metadata, if any (audit bug #23).
+    pub docstring: Option<String>,
 }
 
 impl NitroError {
-    /// C++ exception class name we emit (matches `NitroErrorRef::cxx_class`).
+    /// Author docstring formatted as JSDoc, or `None`. See [`format_ts_docstring`].
+    pub fn ds(&self) -> Option<String> {
+        format_ts_docstring(self.docstring.as_deref())
+    }
+
+    /// C++ exception class name we emit (matches [`NitroErrorRef::cxx_class`]).
+    /// `<base>Exception` with a trailing `Error` stripped — see
+    /// [`error_cxx_class`] / audit bug #28.
     pub fn cxx_class(&self) -> String {
-        format!("{}Error", self.ts_name)
+        error_cxx_class(&self.ts_name)
     }
-    /// Lifter free-function name (matches `NitroErrorRef::lift_fn`).
+    /// Lifter free-function name (matches [`NitroErrorRef::lift_fn`] in the
+    /// same namespace). Derived from [`Self::cxx_class`] so they stay coupled.
     pub fn lift_fn(&self) -> String {
-        format!("lift_{}Error", self.ts_name)
+        format!("lift_{}", self.cxx_class())
     }
+    // NOTE: no `lower_fn` — a typed `code=1` sync-callback encode path is
+    // Nitro-impossible (audit E1: `HybridFunction` collapses a JS throw to a
+    // string-only `jsi::JSError`, so there is no typed buffer to lower into).
+    // Typed errors are surfaced via the message-prefix + `<Err>_Tags.tagOf`
+    // discriminator instead. The error's `flat` bit is likewise unused — the
+    // `<Err>_Tags` discriminator is emitted for every error regardless of
+    // shape — so it is not carried.
 }
 
 impl NitroError {
@@ -3149,9 +4026,136 @@ impl NitroError {
         Ok(Self {
             ts_name,
             variants,
-            flat: en.is_flat,
+            docstring: en.docstring.clone(),
         })
     }
+}
+
+/// A uniffi `custom` type (newtype). Surfaces in the consumer module as a
+/// nominal `export type <Name> = <ts_alias>` plus — when configured — the
+/// `intoCustom` / `fromCustom` conversion wrappers. The wire form is the inner
+/// builtin's (see [`NitroType::Custom`]), so this carries no codec emission.
+/// See audit bug #17.
+pub struct NitroCustom {
+    /// UpperCamelCase TS name (the nominal alias).
+    pub ts_name: String,
+    /// The inner builtin, kept so the templates can spell the alias's RHS
+    /// (`export type <Name> = <inner.ts_type()>`) and so the codec / header
+    /// machinery has the underlying type if it ever needs it.
+    pub inner: NitroType,
+    /// The configured TS conversion, if the per-crate `uniffi.toml`
+    /// `[bindings.typescript.customTypes.<Name>]` declared one. `None` means a
+    /// plain structural newtype (the alias is the bare inner type and no
+    /// conversion wrapper is emitted). When `Some`, the wrapper free-funcs /
+    /// methods apply `into_custom` / `from_custom`.
+    pub conversion: Option<NitroCustomConversion>,
+}
+
+/// A configured custom-type conversion, lifted from the TS `CustomTypeConfig`
+/// (`intoCustom` / `fromCustom` / `typeName` / `imports`). The expr strings use
+/// `{}` as the value placeholder, exactly like the JSI backend's
+/// `CustomTypeConfig::lift` / `lower`.
+pub struct NitroCustomConversion {
+    /// The concrete TS type the custom value is presented as on the consumer
+    /// surface (the configured `typeName`, e.g. `URL`), if any. `None` falls
+    /// back to the inner builtin's TS spelling.
+    pub type_name: Option<String>,
+    /// `intoCustom` expression template (`{}` = the lowered/builtin value),
+    /// applied when lifting a value out of the FFI into the custom type.
+    pub into_custom: String,
+    /// `fromCustom` expression template (`{}` = the custom value), applied when
+    /// lowering a custom value into the builtin form for the FFI.
+    pub from_custom: String,
+    /// `(import-name, module)` pairs the configured conversion needs in scope.
+    pub imports: Vec<(String, String)>,
+}
+
+impl NitroCustomConversion {
+    /// Lift a wire/inner value into the presented custom type — the
+    /// `intoCustom` template with `{}` substituted by `value`. Applied to a
+    /// value coming *out* of the Nitro singleton (whose spec speaks the inner
+    /// builtin) so the consumer surface presents the configured `typeName`.
+    /// Mirrors the JSI backend's `CustomTypeConfig::lift`.
+    pub fn lift(&self, value: &str) -> String {
+        self.into_custom.replace("{}", value)
+    }
+
+    /// Lower a presented custom value into the wire/inner builtin — the
+    /// `fromCustom` template with `{}` substituted by `value`. Applied to an
+    /// argument *before* handing it to the Nitro singleton. Mirrors the JSI
+    /// backend's `CustomTypeConfig::lower`.
+    pub fn lower(&self, value: &str) -> String {
+        self.from_custom.replace("{}", value)
+    }
+}
+
+impl NitroCustom {
+    fn from_general(custom: &general::CustomType, config: &TsConfig) -> Result<Self> {
+        let ts_name = custom.name.to_upper_camel_case();
+        let inner = NitroType::from_type(&custom.builtin.ty)?;
+        // The config keys custom types by their UDL name; match on the
+        // UpperCamelCase spelling (the same `ts_name`) so a `[bindings.
+        // typescript.customTypes.<Name>]` entry binds. Absent => no conversion.
+        //
+        // A conversion is only attached when the inner builtin has a plain JS
+        // runtime value form ([`NitroType::inner_supports_js_conversion`]). A
+        // custom over a Record / Enum / Interface surfaces type-only under
+        // Nitro, so a JSI-style conversion expr that constructs it (e.g. `new
+        // MyEnum.A(v)`) would not resolve — we drop the conversion and fall
+        // back to the plain inner-type alias (documented Nitro limit). See #17.
+        let conversion = if inner.inner_supports_js_conversion() {
+            config
+                .custom_types
+                .get(&ts_name)
+                .map(|c| NitroCustomConversion {
+                    type_name: c.type_name.clone(),
+                    into_custom: c.into_custom.clone(),
+                    from_custom: c.from_custom.clone(),
+                    imports: c.imports.clone(),
+                })
+        } else {
+            None
+        };
+        Ok(Self {
+            ts_name,
+            inner,
+            conversion,
+        })
+    }
+
+    /// The TS type the consumer surface presents this custom value as: the
+    /// configured `typeName` when set, else the inner builtin's spelling. The
+    /// alias declaration is `export type <ts_name> = <ts_alias_type()>`.
+    pub fn ts_alias_type(&self) -> String {
+        match self.conversion.as_ref().and_then(|c| c.type_name.as_ref()) {
+            Some(name) => name.clone(),
+            None => self.inner.ts_type(),
+        }
+    }
+}
+
+/// Parse the per-crate `uniffi.toml` `[bindings.typescript]` section out of the
+/// namespace's captured `config_toml`, mirroring `cli.rs`'s `extract_ts_config`
+/// (same `bindings.typescript` / `js` / `ts` aliasing). A namespace without a
+/// config yields the default (no configured custom conversions). Kept local to
+/// gen_nitro so [`NitroModule::from_general`] needs no extra parameter and we
+/// don't depend on a private cli function.
+fn extract_nitro_ts_config(namespace: &general::Namespace) -> Result<TsConfig> {
+    #[derive(Default, serde::Deserialize)]
+    struct BindingsSection {
+        #[serde(default, alias = "javascript", alias = "js", alias = "ts")]
+        typescript: TsConfig,
+    }
+    #[derive(Default, serde::Deserialize)]
+    struct ConfigRoot {
+        #[serde(default)]
+        bindings: BindingsSection,
+    }
+    let Some(ref config_toml) = namespace.config_toml else {
+        return Ok(TsConfig::default());
+    };
+    let root: ConfigRoot = toml::from_str(config_toml)?;
+    Ok(root.bindings.typescript)
 }
 
 #[cfg(test)]
@@ -3223,6 +4227,7 @@ mod tests {
             is_async,
             uniffi_symbol: None,
             throws: None,
+            docstring: None,
         }
     }
 

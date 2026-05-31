@@ -13,20 +13,19 @@
 {%- let bindings = self.config.project.bindings.ts_path(root) %}
 {%- let bindings = self.relative_to(root, bindings) %}
 
-// Re-export every emitted namespace module under its own TS namespace:
-// the `<Namespace>Api` / HybridObject types from the `.nitro.ts` spec, the
-// record / enum DTOs, the per-interface client factory functions, and the
-// singleton accessor function.
+// Re-export every emitted namespace module flat: the `<Namespace>Api` /
+// HybridObject types from the `.nitro.ts` spec, the record / enum DTOs, the
+// per-interface runtime classes, the error helpers, and the singleton
+// accessor function.
 //
-// Namespaced (`export * as <ns>`) rather than flat (`export *`) on purpose:
-// each RPC-service namespace independently defines same-named request /
-// result DTOs (`CreateRequestDto`, `GetAllResultDto`, …), so a flat
-// re-export would collide (TS2308 "already exported a member"). Namespacing
-// keeps every symbol reachable as `<ns>.<Symbol>` with zero collisions; the
-// hand-written consumer entrypoint flattens these into the shape its
-// client-factory helper expects.
+// Flat (`export *`) matches all three sibling backends (JSI / WASM / -node),
+// so a consumer can `import { foo } from 'react-native-<project>'` without a
+// `<ns>.` prefix (audit bug #19). Cross-namespace DTO collisions, when they
+// occur (multiple modules declaring same-named records), are solved narrowly
+// at those modules rather than by blanket-namespacing every single-module
+// project.
 {%- for m in self.config.modules %}
-export * as {{ m.ts() }} from './{{ bindings }}/{{ m.ts() }}';
+export * from './{{ bindings }}/{{ m.ts() }}';
 {%- endfor %}
 
 // Parity with the index.web.ts variant. The native flow is sync; this is a

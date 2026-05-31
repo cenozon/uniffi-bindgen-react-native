@@ -130,6 +130,17 @@ pub fn generate_all(
                 if matches!(iface.imp, general::ObjectImpl::CallbackTrait) {
                     model::register_callback_trait(&namespace.name, &iface.name);
                 }
+                // Every `interface` / `Object` (and `with_foreign` trait
+                // proxy) is handle-bearing and carries a `fn_free_<obj>`
+                // symbol. Register it by `(namespace, name)` so a use-site
+                // `Type::Interface` / `Type::CallbackInterface` can recover the
+                // symbol for the exception-safe handle guard (audit bug
+                // #24/#27 — the use-site `Type` has no symbol of its own).
+                model::register_interface_free_symbol(
+                    &namespace.name,
+                    &iface.name,
+                    &iface.ffi_func_free.0,
+                );
             }
         }
     }
@@ -174,11 +185,21 @@ pub fn generate_all(
 
     // Single project-level `register_natives.cpp` — the host Nitro
     // test runner `dlopen`s the cdylib and looks up
-    // `extern "C" void registerNatives(jsi::Runtime&)`. Mobile builds
-    // rely on Android `JNI_OnLoad` / iOS `+ load` autolinking instead,
-    // but emitting unconditionally keeps the CMakeLists source list
-    // invariant across platforms.
+    // `extern "C" void registerNatives(jsi::Runtime&)`. Android relies on
+    // the file-scope static initializer at `System.loadLibrary` / dlopen.
+    // Emitting unconditionally keeps the CMakeLists source list invariant
+    // across platforms.
     cpp::write_register_natives(cpp_dir, &hybrid_objects)?;
+
+    // Single project-level iOS autolinking `UbrnNitroAutolinking.mm` — an
+    // Objective-C++ TU whose ObjC class `+load` registers every HybridObject
+    // (audit bug #5). On a real iOS device the `register_natives.cpp` static
+    // initializer is dead-stripped from the static archive (its only external
+    // symbol `registerNatives` is unreferenced by the app); the `+load` of an
+    // ObjC class force-loaded by the app's `-ObjC` flag survives and runs at
+    // image-load time. The podspec adds this `.mm` to `source_files`; the
+    // Android CMakeLists enumerates only `.cpp`, so it is never compiled there.
+    cpp::write_autolinking(cpp_dir, &hybrid_objects)?;
 
     // iOS-only unity chunks (#include subsets of the per-object .cpp). The
     // podspec compiles these K chunks instead of the per-object TUs;

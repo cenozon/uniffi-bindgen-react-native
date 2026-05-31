@@ -91,14 +91,26 @@ fn nitro_emit_against_futures_cdylib() {
         spec.contains("Promise<void>"),
         "spec should have a Promise<void> for sleep_no_return"
     );
-    // The error enums must show up as type aliases.
+    // Errors no longer emit a dead type-only `<Name>Variant` alias in the spec
+    // (audit bug #8 dropped it). The runtime discriminable surface lives in the
+    // consumer module: a `<Err>_Tags` string enum + a `<Err>` helper with
+    // `tagOf` / per-variant `is<Variant>` parsers.
     assert!(
-        spec.contains("export type MyErrorVariant"),
-        "spec should declare MyError as an error-variant type"
+        !spec.contains("MyErrorVariant") && !spec.contains("AsyncErrorVariant"),
+        "spec must not emit the dead `<Name>Variant` type alias; got:\n{spec}"
+    );
+    let reexport_path = ts_dir.join("futures.ts");
+    assert!(reexport_path.exists(), "consumer module at {reexport_path}");
+    let reexport = std::fs::read_to_string(&reexport_path).unwrap();
+    assert!(
+        reexport.contains("export enum MyError_Tags")
+            && reexport.contains("export namespace MyError_Tags"),
+        "consumer module should declare the MyError runtime error helper; got:\n{reexport}"
     );
     assert!(
-        spec.contains("export type AsyncErrorVariant"),
-        "spec should declare AsyncError as an error-variant type"
+        reexport.contains("export enum AsyncError_Tags")
+            && reexport.contains("export namespace AsyncError_Tags"),
+        "consumer module should declare the AsyncError runtime error helper; got:\n{reexport}"
     );
 
     // --- C++ namespace API impl ----------------------------------------
@@ -131,14 +143,16 @@ fn nitro_emit_against_futures_cdylib() {
         "always_ready must reference the i8 free symbol"
     );
     // Async + throws: fallible_me catches UniffiTypedError and rethrows the
-    // decoded MyErrorError.
+    // decoded exception. The exception class strips the trailing `Error` and
+    // appends `Exception` (audit bug #28), so `MyError` → `MyException` and the
+    // decoder is `lift_MyException` (NOT the old doubled `lift_MyErrorError`).
     assert!(
         api_cpp.contains("UniffiTypedError"),
         "async throws path must catch UniffiTypedError"
     );
     assert!(
-        api_cpp.contains("lift_MyErrorError"),
-        "fallible_me must decode via lift_MyErrorError"
+        api_cpp.contains("lift_MyException"),
+        "fallible_me must decode via lift_MyException"
     );
 
     // --- C++ codecs header ---------------------------------------------
@@ -146,16 +160,16 @@ fn nitro_emit_against_futures_cdylib() {
     assert!(codecs_path.exists(), "codecs at {codecs_path}");
     let codecs = std::fs::read_to_string(&codecs_path).unwrap();
     assert!(
-        codecs.contains("class MyErrorError"),
-        "codecs must declare the MyErrorError exception class"
+        codecs.contains("class MyException"),
+        "codecs must declare the MyException exception class"
     );
     assert!(
-        codecs.contains("class AsyncErrorError"),
-        "codecs must declare the AsyncErrorError exception class"
+        codecs.contains("class AsyncException"),
+        "codecs must declare the AsyncException exception class"
     );
     assert!(
-        codecs.contains("MyErrorError lift_MyErrorError(RustBuffer"),
-        "codecs must define lift_MyErrorError"
+        codecs.contains("MyException lift_MyException(RustBuffer"),
+        "codecs must define lift_MyException"
     );
     assert!(
         codecs.contains("Kind::Foo"),

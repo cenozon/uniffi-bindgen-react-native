@@ -94,27 +94,31 @@ fn nitro_emit_against_coverall_cdylib() {
     assert!(spec_path.exists(), "missing TS spec at {spec_path}");
     let spec = std::fs::read_to_string(&spec_path).unwrap();
 
-    // Records become `export interface <Name>` blocks. SimpleDict and
+    // Records become `export type <Name> = {` blocks (audit bug #13) — the
+    // canonical JSI surface, not the old `export interface`. SimpleDict and
     // EmptyStruct are the canary cases.
     assert!(
-        spec.contains("export interface SimpleDict"),
-        "spec should declare SimpleDict as an interface; got:\n{spec}"
+        spec.contains("export type SimpleDict = {"),
+        "spec should declare SimpleDict as a `export type` record; got:\n{spec}"
     );
     assert!(
-        spec.contains("export interface EmptyStruct"),
-        "spec should declare EmptyStruct as an interface; got:\n{spec}"
+        spec.contains("export type EmptyStruct = {"),
+        "spec should declare EmptyStruct as a `export type` record; got:\n{spec}"
     );
 
-    // Flat enums become TS string unions. Color is the canary case.
-    // The exact whitespace varies, so match the substring shape rather
-    // than the full type-decl text.
+    // Flat enums become string-valued runtime `export enum` values (audit bug
+    // #11), NOT type-only unions — so `Color.Red` resolves at runtime. Color is
+    // the canary case. The exact whitespace varies, so match the substring
+    // shape rather than the full decl text.
     assert!(
-        spec.contains("export type Color = "),
-        "spec should declare Color as a `export type` union; got:\n{spec}"
+        spec.contains("export enum Color {"),
+        "spec should declare Color as a runtime `export enum`; got:\n{spec}"
     );
     assert!(
-        spec.contains("'Red'") && spec.contains("'Blue'") && spec.contains("'Green'"),
-        "Color union should list every variant as a TS string literal; got:\n{spec}"
+        spec.contains("Red = 'Red'")
+            && spec.contains("Blue = 'Blue'")
+            && spec.contains("Green = 'Green'"),
+        "Color enum should give each variant a string value; got:\n{spec}"
     );
 
     // ---- C++ codecs header: lift/lower free functions ----

@@ -133,17 +133,26 @@ void {{ cb.cxx_class }}::setJsImpl(
   // Rust-backed proxy (Rust handed us this trait object): dispatch the call
   // into Rust. Clone our handle first — uniffi consumes the receiver — then
   // lower args, invoke, and lift the result, exactly like an interface method.
+  //
+  // Exception-safe lowering (audit bug #24/#25): the cloned receiver handle is
+  // parked in a move-only `UniffiObjectHandle` guard, every owning RustBuffer
+  // arg in a `RustBufferGuard`, and every interface / callback handle arg in
+  // its own handle guard. They are `.take()`-d into the dispatch only after all
+  // lowerings succeed, so a throwing arg lowering (alloc OOM, a bad JS value)
+  // frees the already-built receiver clone / handles / buffers on unwind
+  // instead of leaking the Arc ref / handle-map entry.
   if (proxy_handle_.raw() != 0) {
     auto __status = ubrn::nitro::make_status();
-    uint64_t __self = {{ proxy.clone_symbol }}(proxy_handle_.raw(), &__status);
+    ubrn::nitro::UniffiObjectHandle<&{{ proxy.free_symbol }}> __self_guard{
+        {{ proxy.clone_symbol }}(proxy_handle_.raw(), &__status)};
     ubrn::nitro::check_status(__status, free_status_buffer);
     __status = ubrn::nitro::make_status();
 {%- for arg in method.args %}
-    auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
+    {{ arg.lower_guard_stmt(module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
 {%- endfor %}
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
-    {{ sym }}(__self{% for arg in method.args %}, {{ arg.ts_name }}_lowered{% endfor %}, &__status);
+    {{ sym }}(__self_guard.take(){% for arg in method.args %}, {{ arg.pass_expr() }}{% endfor %}, &__status);
 {%- if let Some(throws) = method.throws %}
     try {
       ubrn::nitro::check_status(__status, free_status_buffer);
@@ -155,7 +164,7 @@ void {{ cb.cxx_class }}::setJsImpl(
 {%- endif %}
     return;
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
-    auto __raw = {{ sym }}(__self{% for arg in method.args %}, {{ arg.ts_name }}_lowered{% endfor %}, &__status);
+    auto __raw = {{ sym }}(__self_guard.take(){% for arg in method.args %}, {{ arg.pass_expr() }}{% endfor %}, &__status);
 {%- if let Some(throws) = method.throws %}
     try {
       ubrn::nitro::check_status(__status, free_status_buffer);
@@ -237,20 +246,25 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     try {
         auto self = {{ cb.cxx_class }}_HandleMap::instance().get(self_handle);
 {%- for arg in method.args %}
-        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- if arg.ty.is_rust_buffer() %}
-        // Rust handed us ownership of this arg buffer; the lift copied it
-        // out, so free it now (exactly once).
-        free_status_buffer({{ arg.ts_name }}_lowered);
+        // Rust handed us ownership of this arg buffer. Park it in a RustBufferGuard
+        // on entry so it is freed exactly once on ANY scope exit — including a
+        // throwing lift (malformed payload / OOM), which the old free-after-lift
+        // missed, leaking this and every still-unlifted buffer arg (audit bug #25).
+        ubrn::nitro::RustBufferGuard {{ arg.ts_name }}_buf_guard{ {{ arg.ts_name }}_lowered, &free_status_buffer };
 {%- endif %}
+        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- endfor %}
         // Call the JS method — it returns
         // `std::shared_ptr<ForeignAsyncResult<T>>`, whose `.promise` is a C++
         // `Promise<T>` already chained (via the wrapper's `JSIConverter`, see
         // `nitro-uniffi/js_async_callback.hpp`) to the JS method's returned JS
         // Promise — i.e. it settles when the JS `async` method's Promise does.
-        // The listeners capture `self` + `promise` so both stay alive until
-        // the promise settles and we fire `uniffi_callback`.
+        // The resolve/reject listeners capture `self`, which keeps the
+        // HybridObject alive until the promise settles and we fire
+        // `uniffi_callback`. The C++ `Promise` itself is anchored independently
+        // by the JS `.then`/`.catch` continuation closures it is chained to —
+        // capturing it here would be a redundant self-reference (audit bug #31).
         auto __result = self->{{ method.cxx_name }}(
 {%- for arg in method.args -%}
             {{ arg.ts_name }}{% if !loop.last %}, {% endif %}
@@ -372,12 +386,14 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
     try {
         auto self = {{ cb.cxx_class }}_HandleMap::instance().get(self_handle);
 {%- for arg in method.args %}
-        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- if arg.ty.is_rust_buffer() %}
-        // Rust handed us ownership of this arg buffer; the lift copied it
-        // out, so free it now (exactly once).
-        free_status_buffer({{ arg.ts_name }}_lowered);
+        // Rust handed us ownership of this arg buffer. Park it in a RustBufferGuard
+        // on entry so it is freed exactly once on ANY scope exit — including a
+        // throwing lift (malformed payload / OOM), which the old free-after-lift
+        // missed, leaking this and every still-unlifted buffer arg (audit bug #25).
+        ubrn::nitro::RustBufferGuard {{ arg.ts_name }}_buf_guard{ {{ arg.ts_name }}_lowered, &free_status_buffer };
 {%- endif %}
+        auto {{ arg.ts_name }} = {{ arg.lifted_from_lowered_expr(module.namespace) }};
 {%- endfor %}
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
@@ -397,11 +413,21 @@ extern "C" void {{ cb.ts_name }}_trampoline_{{ method.cxx_name }}(
         uniffi_out_call_status->code = 0;
     } catch (const std::exception& e) {
         // Surface JS-side exceptions back to Rust as unexpected errors
-        // (code=2). On error the out-return is left unwritten; Rust does
-        // not read it. A follow-up pass can route typed uniffi errors.
-        (void)e;
+        // (code=2) carrying the message string. uniffi lifts error_buf as a
+        // String and runs `From<UnexpectedUniFFICallbackError>` for a fallible
+        // method (the intended fallback) or panics for an infallible one (by
+        // design). We lower `e.what()` rather than handing back an empty
+        // `RustBuffer{}` so the reason survives — and, since the TS error class
+        // self-encodes its tag + payload into the message (audit bug #8 / C5),
+        // the JS-thrown typed error's identity reaches Rust through the string.
+        // We cannot send a typed code=1 here: Nitro flattens a thrown JS value
+        // to a `std::exception`'s `what()`, so no typed Rust error enum value is
+        // recoverable to feed a `lower_<Name>Error` encoder. This mirrors the
+        // async reject / sync-failure paths, which also lower the message string.
+        // (bug #7) On error the out-return is left unwritten; Rust does not read it.
         uniffi_out_call_status->code = 2;
-        uniffi_out_call_status->error_buf = RustBuffer{};
+        uniffi_out_call_status->error_buf =
+            ubrn::nitro::lower_string<&{{ module.rustbuffer_alloc }}>(e.what());
     }
 }
 {%- endif %}

@@ -118,6 +118,33 @@ pub(super) fn write_register_natives(
     Ok(())
 }
 
+/// Emit the project-level iOS autolinking `<Module>Autolinking.mm`
+/// (Objective-C++). Its ObjC class's `+ (void)load` registers every collected
+/// [`HybridObjectEntry`] with Nitro's process-global `HybridObjectRegistry`,
+/// reusing the same registration body as [`write_register_natives`].
+///
+/// This is the canonical Nitrogen mechanism and the fix for the iOS
+/// static-archive dead-strip (audit bug #5): the app's standard `-ObjC` flag
+/// force-loads any archive member defining an ObjC class, and the ObjC runtime
+/// calls `+load` at image-load time — so registration survives on device,
+/// where the `register_natives.cpp` static initializer (whose only external
+/// symbol `registerNatives` is unreferenced by the app) was being stripped.
+///
+/// iOS-only by construction: it is added to `nitro-podspec.rb`'s `source_files`
+/// but NOT to the Android CMakeLists (which enumerates only `.cpp`). The
+/// `registerNatives` C symbol in `register_natives.cpp` is kept for the desktop
+/// `dlsym` test runner. Always emits (an empty slice yields a no-op `+load`),
+/// keeping the podspec glob invariant.
+pub(super) fn write_autolinking(cpp_dir: &Utf8Path, entries: &[HybridObjectEntry]) -> Result<()> {
+    let text = AutolinkingMm {
+        hybrid_objects: entries,
+    }
+    .render()?;
+    let path = cpp_dir.join("UbrnNitroAutolinking.mm");
+    ubrn_common::write_file(path, text)?;
+    Ok(())
+}
+
 /// Emit the iOS-only unity/amalgamation chunks. Each chunk `#include`s a
 /// disjoint subset of the per-object `Hybrid*.cpp` (which stay in
 /// `cpp_dir`); iOS compiles only these chunks (see nitro-podspec.rb),
@@ -258,6 +285,12 @@ struct CallbackCpp<'a> {
 #[derive(Template)]
 #[template(syntax = "cpp", escape = "none", path = "register_natives.cpp")]
 struct RegisterNativesCpp<'a> {
+    hybrid_objects: &'a [HybridObjectEntry],
+}
+
+#[derive(Template)]
+#[template(syntax = "cpp", escape = "none", path = "autolinking.mm")]
+struct AutolinkingMm<'a> {
     hybrid_objects: &'a [HybridObjectEntry],
 }
 

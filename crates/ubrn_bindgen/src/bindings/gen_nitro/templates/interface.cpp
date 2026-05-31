@@ -90,23 +90,18 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 ) {
 {%- if method.is_async %}
 {%- if let Some(ad) = method.async_data %}
-  // Exception-safe lowering — the cloned receiver handle and owning RustBuffer
-  // args are parked in move-only guards and `.take()`-d into the eager future
-  // kick-off only after every lowering succeeds, so a throw mid-prologue frees
-  // the already-built handle/buffers instead of leaking them.
+  // Exception-safe lowering (audit bug #24) — the cloned receiver handle, owning
+  // RustBuffer args, and interface / callback handle args are parked in move-only
+  // guards and `.take()`-d into the eager future kick-off only after every
+  // lowering succeeds, so a throw mid-prologue frees the already-built
+  // handle/buffers instead of leaking them.
   ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
 {%- for arg in method.args %}
-{%- if arg.ty.is_rust_buffer() %}
-  ubrn::nitro::RustBufferGuard {{ arg.ts_name }}_guard{
-      {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }},
-      &free_status_buffer};
-{%- else %}
-  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
-{%- endif %}
+  {{ arg.lower_guard_stmt(module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
 {%- endfor %}
   uint64_t __handle = {{ method.uniffi_symbol }}(__self_guard.take(){% if !method.args.is_empty() %},{% endif %}
 {%- for arg in method.args -%}
-    {% if arg.ty.is_rust_buffer() %}{{ arg.ts_name }}_guard.take(){% else %}{{ arg.ts_name }}_lowered{% endif %}{% if !loop.last %}, {% endif %}
+    {{ arg.pass_expr() }}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   );
 {%- match method.return_kind %}
@@ -156,27 +151,23 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- endif %}
 {%- else %}
   auto __status = ubrn::nitro::make_status();
-  // Exception-safe lowering: the cloned receiver handle and every owning
-  // RustBuffer arg are parked in move-only guards, then `.take()`-d into the
-  // FFI call only once *all* lowerings have succeeded. If a later arg's
-  // lowering throws (a RustBufferWriter alloc, or a JSIConverter on a bad JS
-  // value), the guards free the already-built handle/buffers on unwind instead
-  // of leaking them. The success path is move-only — no extra alloc or copy.
+  // Exception-safe lowering (audit bug #24): the cloned receiver handle, every
+  // owning RustBuffer arg, and every interface / callback handle arg are parked
+  // in move-only guards, then `.take()`-d into the FFI call only once *all*
+  // lowerings have succeeded. If a later arg's lowering throws (a
+  // RustBufferWriter alloc, a clone_handle on a zero handle, or a JSIConverter
+  // on a bad JS value), the guards free the already-built handle/buffers on
+  // unwind instead of leaking them. The success path is move-only — no extra
+  // alloc or copy.
   ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
 {%- for arg in method.args %}
-{%- if arg.ty.is_rust_buffer() %}
-  ubrn::nitro::RustBufferGuard {{ arg.ts_name }}_guard{
-      {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }},
-      &free_status_buffer};
-{%- else %}
-  auto {{ arg.ts_name }}_lowered = {{ arg.ty.lower_expr(arg.ts_name, module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }};
-{%- endif %}
+  {{ arg.lower_guard_stmt(module.namespace, module.rustbuffer_alloc, module.rustbuffer_reserve) }}
 {%- endfor %}
 {%- match method.return_kind %}
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Void %}
   {{ method.uniffi_symbol }}(__self_guard.take(),
 {%- for arg in method.args -%}
-    {% if arg.ty.is_rust_buffer() %}{{ arg.ts_name }}_guard.take(){% else %}{{ arg.ts_name }}_lowered{% endif %},
+    {{ arg.pass_expr() }},
 {%- endfor -%}
     &__status);
 {%- if let Some(throws) = method.throws %}
@@ -194,7 +185,7 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
   auto __raw = {{ method.uniffi_symbol }}(__self_guard.take(),
 {%- for arg in method.args -%}
-    {% if arg.ty.is_rust_buffer() %}{{ arg.ts_name }}_guard.take(){% else %}{{ arg.ts_name }}_lowered{% endif %},
+    {{ arg.pass_expr() }},
 {%- endfor -%}
     &__status);
 {%- if let Some(throws) = method.throws %}

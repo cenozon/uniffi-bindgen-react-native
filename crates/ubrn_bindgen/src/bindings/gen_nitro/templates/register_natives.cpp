@@ -39,11 +39,18 @@ std::once_flag g_register_once;
 void register_natives_impl() {
   using namespace margelo::nitro;
 {%- for entry in hybrid_objects %}
-  HybridObjectRegistry::registerHybridObjectConstructor(
-      "{{ entry.name }}",
-      []() -> std::shared_ptr<HybridObject> {
-        return std::make_shared<::margelo::nitro::{{ entry.cxx_namespace }}::{{ entry.cxx_class }}>();
-      });
+  // Guard each registration: `registerHybridObjectConstructor` THROWS on a
+  // duplicate name. The `std::once_flag` below makes this function run once per
+  // process, but on iOS the `UbrnNitroAutolinking.mm` `+load` may have already
+  // registered these names (if this static initializer also survives stripping);
+  // skip the ones already present so coexistence is a no-op, not a crash.
+  if (!HybridObjectRegistry::hasHybridObject("{{ entry.name }}")) {
+    HybridObjectRegistry::registerHybridObjectConstructor(
+        "{{ entry.name }}",
+        []() -> std::shared_ptr<HybridObject> {
+          return std::make_shared<::margelo::nitro::{{ entry.cxx_namespace }}::{{ entry.cxx_class }}>();
+        });
+  }
 {%- endfor %}
 }
 

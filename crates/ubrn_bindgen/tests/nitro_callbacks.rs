@@ -109,8 +109,8 @@ fn nitro_emit_against_callbacks_cdylib() {
 
     // Composite types come through with the expected TS spellings.
     //   `string?` → `(string) | undefined`
-    //   `sequence<i32>` → `(number)[]`
-    //   `sequence<f64?>?` → `((number) | undefined)[] | undefined`
+    //   `sequence<i32>` → `Array<number>` (canonical `Array<T>`, not `(T)[]`)
+    //   `sequence<f64?>?` → `(Array<(number) | undefined>) | undefined`
     //   Optionals spell `| undefined` (not `| null`) because Nitro's
     //   `JSIConverter<std::optional<T>>` maps `nullopt` to/from JS `undefined`
     //   only; the exact `(x) | undefined` parenthesization matters for the
@@ -119,9 +119,15 @@ fn nitro_emit_against_callbacks_cdylib() {
         spec.contains("| undefined"),
         "spec should mention optional type:\n{spec}"
     );
+    // Sequences now spell the canonical `Array<T>` (audit bug #14), never the
+    // old `(T)[]`.
     assert!(
-        spec.contains(")[]"),
+        spec.contains("Array<"),
         "spec should mention array type:\n{spec}"
+    );
+    assert!(
+        !spec.contains(")[]"),
+        "spec must not emit the old `(T)[]` sequence spelling:\n{spec}"
     );
     // `Uint8Array` only appears if a bytes type is present in callbacks
     // — this fixture doesn't use one, so we don't assert that.

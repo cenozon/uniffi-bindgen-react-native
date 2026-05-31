@@ -4,57 +4,98 @@ import type { HybridObject } from 'react-native-nitro-modules'
 {%- for imp in module.foreign_ts_type_imports() %}
 import type { {% for name in imp.type_names %}{{ name }}{% if !loop.last %}, {% endif %}{% endfor %} } from '{{ imp.module_path }}'
 {%- endfor %}
+{% for c in module.customs %}
+// Uniffi custom type (newtype) `{{ c.ts_name }}`. The spec describes the WIRE
+// shape (the inner builtin), so Nitrogen + the C++ codec agree; the consumer
+// module re-presents it under the same nominal alias. See audit bug #17.
+export type {{ c.ts_name }} = {{ c.inner.ts_type() }}
+{%- endfor %}
 
 {% for record in module.records %}
+{%- match record.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
 /**
  * Uniffi record `{{ record.ts_name }}`. ubrn emits the C++ struct + its
  * `JSIConverter` in `{{ record.ts_name }}.hpp` and the RustBuffer codec
  * (`lift_{{ record.ts_name }}` / `lower_{{ record.ts_name }}`) in
  * `{{ module.namespace }}_codecs.hpp` — no Nitrogen involved.
  */
-export interface {{ record.ts_name }} {
+{%- endmatch %}
+export type {{ record.ts_name }} = {
 {%- for field in record.fields %}
-  {{ field.ts_name }}: {{ field.ty.ts_type() }}
+{%- match field.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
+{%- endmatch %}
+  {{ field.ts_name }}{% if field.ts_is_optional() %}?{% endif %}: {{ field.ts_field_type() }}
 {%- endfor %}
 }
 {% endfor %}
 {% for en in module.enums %}
+{%- match en.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
 /**
  * Uniffi enum `{{ en.ts_name }}`.
  */
+{%- endmatch %}
 {%- if en.flat %}
-export type {{ en.ts_name }} = {% for variant in en.variants %}'{{ variant.ts_name }}'{% if !loop.last %} | {% endif %}{% endfor %}
+// Flat (fieldless) enum — a string-valued runtime `export enum` (audit bug
+// #11). Nitro's flat-enum JSIConverter hashes the variant NAME, so the value
+// must be the variant name string (a numeric enum would break canConvert); the
+// string form stays assignable to/from the old union and round-trips unchanged.
+export enum {{ en.ts_name }} {
+{%- for variant in en.variants %}
+{%- match variant.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
+{%- endmatch %}
+  {{ variant.ts_name }} = '{{ variant.ts_name }}',
+{%- endfor %}
+}
 {%- else %}
 // Discriminated union keyed on `tag` (the UpperCamelCase variant name),
 // payload nested under `inner` — byte-for-byte the standard uniffi
 // tagged-enum runtime shape the NAPI/JSI backends emit, so a value built by
 // the shared `@<scope>/<crate>-js` layer (or any other ubrn target)
 // round-trips through the `JSIConverter` ubrn emits in `{{ en.ts_name }}.hpp`.
+// The `{{ en.ts_name }}_Tags` companion mirrors the canonical JSI surface
+// (audit bug #15) so the `tag` reads as `{{ en.ts_name }}_Tags.<Variant>`.
+export enum {{ en.ts_name }}_Tags {
+{%- for variant in en.variants %}
+  {{ variant.ts_name }} = '{{ variant.ts_name }}',
+{%- endfor %}
+}
 export type {{ en.ts_name }} =
 {%- for variant in en.variants %}
 {%- let has_fields = !variant.fields.is_empty() %}
-  | { tag: '{{ variant.ts_name }}'{% if has_fields %}; inner: {% if variant.has_nameless_fields %}Readonly<[{% for field in variant.fields %}{{ field.ty.ts_type() }}{% if !loop.last %}, {% endif %}{% endfor %}]>{% else %}Readonly<{ {% for field in variant.fields %}{{ field.ts_name }}: {{ field.ty.ts_type() }}{% if !loop.last %}; {% endif %}{% endfor %} }>{% endif %}{% endif %} }
+  | { tag: {{ en.ts_name }}_Tags.{{ variant.ts_name }}{% if has_fields %}; inner: {% if variant.has_nameless_fields %}Readonly<[{% for field in variant.fields %}{{ field.ty.ts_type() }}{% if !loop.last %}, {% endif %}{% endfor %}]>{% else %}Readonly<{ {% for field in variant.fields %}{{ field.ts_name }}{% if field.ts_is_optional() %}?{% endif %}: {{ field.ts_field_type() }}{% if !loop.last %}; {% endif %}{% endfor %} }>{% endif %}{% endif %} }
 {%- endfor %}
 {%- endif %}
 {% endfor %}
 {% for err in module.errors %}
+{%- match err.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
 /**
  * Uniffi error `{{ err.ts_name }}`. Methods that declare
  * `throws({{ err.ts_name }})` reject their Promise (or throw, for sync
- * methods) with a JS Error whose `kind` matches one of the variant tags
- * below. The C++ side throws a `{{ err.ts_name }}Error` instance; Nitro's
- * `HybridFunction::callMethod` translates that into a `jsi::JSError`.
- *
- * For data-carrying variants the decoded fields are rendered into the JS
- * `error.message` as `{{ err.ts_name }}::<Variant>(field=value, ...)`, so
- * the payload uniffi serialized after the variant tag is not lost.
+ * methods) with a JS `Error`. The C++ side throws a `{{ err.cxx_class() }}`
+ * instance; Nitro's `HybridFunction::callMethod` translates that into a
+ * `jsi::JSError` whose `message` is `{{ err.ts_name }}::<Variant>(field=value,
+ * ...)`. Field-typed payloads are Nitro-impossible (the throw collapses to a
+ * string-only `jsi::JSError`), so the payload lives in `error.message`; the
+ * consumer module's `{{ err.ts_name }}` runtime helper + `{{ err.ts_name }}_Tags`
+ * discriminate by parsing that prefix. See audit bug #8.
  */
-{%- if err.flat %}
-export type {{ err.ts_name }}Variant = {% for variant in err.variants %}'{{ variant.ts_name }}'{% if !loop.last %} | {% endif %}{% endfor %}
-{%- else %}
-export type {{ err.ts_name }}Variant = {% for variant in err.variants %}{ tag: '{{ variant.ts_name }}' }{% if !loop.last %} | {% endif %}{% endfor %}
-{%- endif %}
-{% endfor %}
+{%- endmatch %}
+{%- endfor %}
 
 /**
  * Namespace API for the uniffi `{{ module.namespace }}` crate. Hosts every
@@ -75,16 +116,26 @@ export interface {{ module.namespace_api_ts_name() }} extends HybridObject<{
 }
 
 {% for iface in module.interfaces %}
+{%- match iface.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
 /**
  * Uniffi interface `{{ iface.ts_name }}`. Each method invokes the
  * corresponding uniffi C ABI symbol from the C++ impl class
  * `{{ iface.cxx_class }}`.
  */
+{%- endmatch %}
 export interface {{ iface.ts_name }} extends HybridObject<{
   ios: 'c++'
   android: 'c++'
 }> {
 {%- for method in iface.methods %}
+{%- match method.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
+{%- endmatch %}
   {{ method.ts_name }}(
 {%- for arg in method.args -%}
     {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
@@ -95,6 +146,10 @@ export interface {{ iface.ts_name }} extends HybridObject<{
 {% endfor %}
 
 {% for cb in module.callback_interfaces %}
+{%- match cb.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
 /**
  * Uniffi callback interface `{{ cb.ts_name }}`. JS-side implements every
  * method; the generated C++ trampoline class `{{ cb.cxx_class }}`
@@ -105,11 +160,17 @@ export interface {{ iface.ts_name }} extends HybridObject<{
  * (`Hybrid{{ cb.ts_name }}Spec`) that user code subclasses on the JS
  * side, then hands to a method that takes this type as an argument.
  */
+{%- endmatch %}
 export interface {{ cb.ts_name }} extends HybridObject<{
   ios: 'c++'
   android: 'c++'
 }> {
 {%- for method in cb.methods %}
+{%- match method.ds() %}
+{%- when Some with (ds) %}
+{{ ds }}
+{%- when None %}
+{%- endmatch %}
   {{ method.ts_name }}(
 {%- for arg in method.args -%}
     {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}

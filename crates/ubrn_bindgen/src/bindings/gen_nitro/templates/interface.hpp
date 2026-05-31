@@ -59,6 +59,28 @@ public:
   explicit {{ iface.cxx_class }}(uint64_t raw_handle)
       : HybridObject(TAG), handle_(raw_handle) {}
 
+  /// Exception-safe choke point for wrapping an OWNED uniffi Arc handle
+  /// (uniffi `Arc::into_raw`, from an interface-returning method/ctor return
+  /// or a composite-decoded handle) in a fresh HybridObject. The raw handle is
+  /// parked in a move-only `UniffiObjectHandle` guard THROUGH the allocation;
+  /// the object is built with a null handle first (the no-arg ctor can't leak),
+  /// then the guard is moved into the object only AFTER it exists. If the
+  /// allocation or the Nitro `HybridObject` base ctor throws, the guard frees
+  /// the handle on unwind — so the Rust-side strong count is never leaked
+  /// (audit bug #27). Routing every owned-handle lift through here means no
+  /// call site has to spell the guard dance.
+  static std::shared_ptr<{{ iface.cxx_class }}> adopt(uint64_t raw_handle) {
+    ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> guard{raw_handle};
+    // Allocate with an explicit NULL handle (`uint64_t{0}` selects the
+    // borrowed-handle ctor, never the argless default that would drive a fresh
+    // uniffi constructor) so the in-flight object owns nothing while the guard
+    // still does. Only after the object exists do we move the guard's handle
+    // into it; a throw before that point unwinds the guard, freeing the handle.
+    auto self = std::make_shared<{{ iface.cxx_class }}>(uint64_t{0});
+    self->handle_ = std::move(guard);
+    return self;
+  }
+
   /// Public accessor for the raw uniffi handle. Used internally where a
   /// borrowed (non-consuming) view of the handle is needed.
   uint64_t raw_handle() const { return handle_.raw(); }

@@ -219,7 +219,13 @@ inline void write_interface_handle_w(W &w, const std::shared_ptr<HybridT> &v) {
 
 template <typename HybridT>
 inline std::shared_ptr<HybridT> read_interface_handle(RustBufferReader &r) {
-  return std::make_shared<HybridT>(r.read_u64());
+  // The decoded u64 is an OWNED Arc handle (uniffi `Arc::into_raw`). Route it
+  // through the generated `Hybrid<Name>::adopt` choke point, which parks the
+  // handle in a move-only guard THROUGH the allocation and only relinquishes it
+  // into the object after it exists — so a throwing allocation / Nitro base
+  // ctor frees the handle on unwind instead of leaking the strong count (audit
+  // bug #27). A bare `make_shared<HybridT>(raw)` had no such guard window.
+  return HybridT::adopt(r.read_u64());
 }
 
 // -----------------------------------------------------------------------
@@ -262,7 +268,11 @@ inline void write_callback_handle_w(W &w, const std::shared_ptr<HybridT> &v) {
 
 template <typename HybridT>
 inline std::shared_ptr<HybridT> read_callback_proxy(RustBufferReader &r) {
-  return std::make_shared<HybridT>(::ubrn::nitro::FromRustHandle{r.read_u64()});
+  // The decoded u64 is an OWNED `Arc<dyn Trait>` handle. Route it through the
+  // generated proxy `Hybrid<Name>::adopt` choke point — same exception-safe
+  // guard dance as `read_interface_handle`, so a throwing allocation / Nitro
+  // base ctor frees the handle on unwind rather than leaking it (audit bug #27).
+  return HybridT::adopt(r.read_u64());
 }
 
 // -----------------------------------------------------------------------

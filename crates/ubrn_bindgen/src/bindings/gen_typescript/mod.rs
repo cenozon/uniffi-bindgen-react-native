@@ -4,7 +4,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/
  */
 pub(crate) mod api_module;
-mod config;
+pub(crate) mod config;
 pub(crate) mod ffi_module;
 pub(crate) mod ffi_module_player;
 mod type_mapping;
