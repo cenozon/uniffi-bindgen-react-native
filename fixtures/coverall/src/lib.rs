@@ -169,6 +169,42 @@ pub struct ErrorDict {
     errors: Vec<RootError>,
 }
 
+// Error enum whose data-carrying variants have payload fields that are
+// COMPOSITES of a record / data-enum (Vec<SimpleDict>, Option<SimpleDict>,
+// Option<MaybeSimpleDict>). This is the shape ace-db carries but no neutral
+// fixture did before; it forces the Nitro error lifter to instantiate the
+// `error_field_to_string(std::vector<Record>&)` / `optional<Record>` /
+// `optional<Enum>` composite templates with a generated element type.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum CompositePayloadError {
+    #[error("ManyDicts")]
+    ManyDicts { dicts: Vec<SimpleDict> },
+    #[error("MaybeDict")]
+    MaybeDict { dict: Option<SimpleDict> },
+    #[error("MaybeEnum")]
+    MaybeEnum { maybe: Option<MaybeSimpleDict> },
+    // Nested-composite payload fields — a composite WRAPPING another composite
+    // (Option<Vec<..>>, Option<HashMap<..>>). These force the Nitro error lifter
+    // to instantiate `error_field_to_string(std::optional<T>&)` with T being a
+    // `std::vector` / `std::unordered_map` — i.e. the optional<T> composite
+    // template's body must resolve `error_field_to_string(*v)` for a `vector` /
+    // `map`, which are sibling composites declared LATER in error_message.hpp.
+    // This is the ace-db shape (FeatureTypeMetaSpec.includeProperties =
+    // Option<Vec<String>>, nodeProperties = Option<HashMap<String, DbValue>>)
+    // that no prior neutral fixture carried.
+    #[error("MaybeList")]
+    MaybeList { list: Option<Vec<String>> },
+    #[error("MaybeDictMap")]
+    MaybeDictMap { map: Option<HashMap<String, SimpleDict>> },
+}
+
+#[uniffi::export]
+fn throw_composite_payload_error() -> Result<(), CompositePayloadError> {
+    Err(CompositePayloadError::ManyDicts {
+        dicts: vec![SimpleDict::default()],
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SimpleDict {
     text: String,

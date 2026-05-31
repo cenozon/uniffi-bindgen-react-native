@@ -87,6 +87,37 @@ error_field_to_string(const std::chrono::system_clock::time_point& v) {
 }
 
 // ---- Composites: optional / vector / map ----
+//
+// Forward-declare ALL THREE composite templates before any of their bodies.
+// The composite bodies call `error_field_to_string` UNQUALIFIED on their
+// element type, so for a composite WRAPPING a sibling composite (e.g.
+// `optional<vector<T>>`, `optional<unordered_map<K,V>>`, `vector<map<K,V>>`)
+// the inner call is resolved at instantiation by two-phase lookup: candidates
+// are (a) names visible at the *definition point* of the OUTER composite plus
+// (b) ADL on the argument. The argument is a `std::vector` / `std::optional` /
+// `std::unordered_map`, whose only associated namespace is `std` (no
+// `error_field_to_string` there), so ADL cannot reach the sibling — and absent
+// these forward declarations the sibling is also not yet visible at the outer
+// template's definition point if it is declared later in this file. That is the
+// exact clang error "call to function 'error_field_to_string' that is neither
+// visible in the template definition nor found by argument-dependent lookup".
+// Declaring every composite up-front makes the whole composite-of-composite
+// chain order-independent (a partial reorder is insufficient: whichever
+// composite is declared last would still be unreachable from the others).
+//
+// The scalar / string / ArrayBuffer / shared_ptr / timestamp overloads above
+// already precede the composites, so they remain visible at every definition
+// point and need no forward declaration. The per-record / per-enum generated
+// overloads (in the namespace codecs header) are co-located with their type in
+// `margelo::nitro::<ns>` and are found by ADL on the argument — they are a
+// separate, working resolution path and are unaffected by this block.
+template <typename T>
+std::string error_field_to_string(const std::optional<T>& v);
+template <typename T>
+std::string error_field_to_string(const std::vector<T>& v);
+template <typename K, typename V>
+std::string error_field_to_string(const std::unordered_map<K, V>& v);
+
 template <typename T>
 std::string error_field_to_string(const std::optional<T>& v) {
   return v.has_value() ? error_field_to_string(*v) : std::string("null");
