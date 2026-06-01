@@ -637,4 +637,45 @@ impl ISecond {
 
 pub struct EmptyStruct;
 
+
+// ---- Nitro parity fixtures (P2 uniffi object traits, P3 arg defaults) ----
+// Neutral, additive: exercised only by tests/bindings/test_coverall_nitro.ts.
+// Mirrors the JSI/TS oracle (fixtures/trait-methods + fixtures/defaults).
+
+/// P2: a proc-macro object exporting Display/Debug/Eq/Hash/Ord. The Nitro
+/// `toString()`/`equals()` base-virtual overrides + `toDebugString()`/
+/// `hashCode()`/`compareTo()` methods must route to THESE Rust trait impls.
+/// The trait-export attribute goes on the STRUCT (mirroring fixtures/trait-methods
+/// `ProcTraitMethods`), not the impl block.
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, uniffi::Object)]
+#[uniffi::export(Display, Debug, Eq, Hash, Ord)]
+pub struct NitroTraitObj {
+    val: i32,
+}
+
+#[uniffi::export]
+impl NitroTraitObj {
+    #[uniffi::constructor]
+    pub fn new(val: i32) -> Arc<Self> {
+        Arc::new(Self { val })
+    }
+
+    pub fn value(&self) -> i32 {
+        self.val
+    }
+}
+
+impl std::fmt::Display for NitroTraitObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NitroTraitObj({})", self.val)
+    }
+}
+
+/// P3: a top-level exported function whose second arg has a uniffi default.
+/// The Nitro consumer wrapper must emit `= "x"` so omitting the arg uses it.
+#[uniffi::export(default(suffix = "x"))]
+pub fn nitro_default_args(base: String, suffix: String) -> String {
+    format!("{base}{suffix}")
+}
+
 uniffi::include_scaffolding!("coverall");

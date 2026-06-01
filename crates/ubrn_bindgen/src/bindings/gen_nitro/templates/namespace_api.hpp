@@ -36,6 +36,16 @@ public:
   );
 {%- endfor %}
 
+{%- if module.has_async_api_methods() %}
+  // Non-spec async-cancellation hooks (reached from the `.ts` wrapper via an
+  // `as unknown as { ... }` cast, the same precedent as the callback
+  // `setJsImpl` hook). `__uniffiBeginAbortable()` arms the next async kick-off
+  // on this thread + returns its token; `__uniffiAbort(token)` cancels the
+  // in-flight future (a settled / unknown token is a safe no-op).
+  double __uniffiBeginAbortable();
+  void __uniffiAbort(double token);
+{%- endif %}
+
 protected:
   void loadHybridMethods() override;
 };

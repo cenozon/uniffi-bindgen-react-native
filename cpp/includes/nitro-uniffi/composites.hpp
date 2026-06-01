@@ -356,8 +356,35 @@ inline std::optional<T> lift_optional(RustBuffer buf) {
 // Sequence<T> / Vec<T>.
 // -----------------------------------------------------------------------
 
+// Fixed wire width (bytes) of an element type `T` when it lives *inside* a
+// composite, matching the big-endian primitive encodings the `write_<prim>`
+// thunks emit (`bool` is wire-encoded as a single `i8`). 0 means "not a
+// fixed-width scalar" — a variable-width element (string, optional, nested
+// composite, record/enum) for which we make no up-front reservation.
+template <typename T> inline constexpr size_t seq_elem_fixed_width() {
+  if constexpr (std::is_same_v<T, bool>) {
+    return 1; // wire-encoded as i8
+  } else if constexpr (std::is_arithmetic_v<T>) {
+    return sizeof(T); // u8..u64 / i8..i64 / float / double
+  } else {
+    return 0;
+  }
+}
+
+// Capacity-only hint for the sequence body (excludes the leading i32 count).
+// For a fixed-width element type this is exactly `count * sizeof(elem)`, so the
+// whole sequence reserves in one shot; for variable-width elements it returns
+// 0 (incremental growth). The `std::string` overload below is the only
+// variable-width type with a cheap exact prefix, so it keeps its own hint.
 template <typename T>
-inline size_t seq_body_size_hint(const std::vector<T> &, size_t) { return 0; }
+inline size_t seq_body_size_hint(const std::vector<T> &v, size_t) {
+  constexpr size_t w = seq_elem_fixed_width<T>();
+  if constexpr (w > 0) {
+    return v.size() * w;
+  } else {
+    return 0;
+  }
+}
 inline size_t seq_body_size_hint(const std::vector<std::string> &v, size_t) {
   size_t total = 0;
   for (const auto &s : v) total += 4 + s.size();

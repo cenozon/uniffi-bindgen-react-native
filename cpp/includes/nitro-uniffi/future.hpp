@@ -27,9 +27,48 @@
 // for an immediately-ready future, which uniffi signals synchronously inside
 // the first `poll`. Instead we now create a pending `Promise`, arm the
 // continuation, and return immediately: when Rust fires the continuation we
-// complete + lift + `resolve()` directly (Nitro's `Promise::resolve` marshals
-// to the JS thread itself, exactly as `Promise::async` relies on). A
-// ready-on-first-poll future therefore resolves with zero thread hops.
+// complete + lift + `resolve()` directly. A ready-on-first-poll future
+// therefore resolves with zero thread hops.
+//
+// `Promise::resolve` does NOT itself marshal back to the JS thread — Nitro's
+// `Promise` runs its resolved/rejected listeners *inline* on whatever thread
+// calls `resolve()`/`reject()` (`react-native-nitro-modules` `core/Promise.hpp`).
+// Thread-correctness here rests instead on the *poll-on-JS-thread discipline*:
+// a `Wake` re-poll is deferred onto `get_js_dispatcher()->runAsync` (see
+// `rust_future_async_continuation` below), so the terminal `Ready` continuation
+// — and thus `on_ready()` / `resolve()` — runs on the JS thread. The one
+// exception is the immediately-ready first poll, which fires synchronously
+// inside the kick-off call that already runs on the JS thread. Either way
+// `resolve()`/`reject()` is reached on the JS thread; never call them from a
+// Rust executor thread.
+//
+// CANCELLATION (parity with the JSI backend's `uniffiRustCallAsync`):
+// uniffi's async C ABI also exposes
+// `ffi_<crate>_rust_future_cancel_<T>(handle)` — one arg, void return, no
+// status. It transitions the RustFuture's scheduler to `Cancelled` and fires
+// any armed continuation immediately with `Ready`; the subsequent `complete`
+// then returns `RustCallStatus::cancelled()` (code 3), which `status.hpp`
+// already maps to a rejecting `UniffiUnexpectedError`. `cancel` is idempotent
+// and a no-op after the future settles, BUT its uniffi-documented safety
+// contract requires the handle has NOT yet been passed to `free`. The JSI
+// backend honours this by removing its abort listener BEFORE `freeFunc` in a
+// `finally`; we honour the same ordering by *deregistering* this future from
+// the process-global `CancelRegistry` inside `on_ready`, paired with and
+// strictly BEFORE `free_fn(handle)` — so an abort that races completion can
+// never reach a freed handle (a post-deregistration `abort_rust_future` is a
+// registry miss = safe no-op).
+//
+// In JSI the whole poll loop lives in TS, so JS owns the bigint handle and can
+// call `cancelFunc(rustFuture)` directly. Here the loop is in C++ and the
+// handle never escapes to JS; Nitro's `Promise<T>` is strictly one-directional
+// (no channel to push a cancel callback back into C++). So the conveyance is a
+// process-global token registry plus a non-spec `__uniffiBeginAbortable()` /
+// `__uniffiAbort(token)` HybridObject method pair (the same non-spec-method
+// precedent as the callback `setJsImpl` hook): the wrapper calls
+// `__uniffiBeginAbortable()` synchronously just before kicking off the typed
+// async call (arming a thread-local token consumed by `drive_rust_future_async`),
+// then registers `signal.addEventListener("abort", () => api.__uniffiAbort(token))`
+// and removes it on settle.
 
 #pragma once
 
@@ -49,6 +88,8 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 namespace ubrn::nitro {
@@ -62,6 +103,123 @@ enum class RustFuturePoll : int8_t {
 
 using PollFn = void (*)(uint64_t, void (*)(uint64_t, int8_t), uint64_t);
 using FreeFutureFn = void (*)(uint64_t);
+/// uniffi's `ffi_<crate>_rust_future_cancel_<T>` — one arg (the RustFuture
+/// handle), void return, no status. Idempotent; safe to call after the future
+/// settles, but NOT after `free` (uniffi's documented contract).
+using CancelFutureFn = void (*)(uint64_t);
+
+namespace detail {
+
+/// Process-global registry mapping an opaque JS-facing cancel *token* to the
+/// in-flight RustFuture handle + its `cancel` symbol. An entry exists only
+/// between a future's kick-off and its terminal `on_ready` (which deregisters
+/// strictly before `free_fn` runs), so `abort` can never reach a freed handle.
+struct CancelEntry {
+  uint64_t handle;
+  CancelFutureFn cancel_fn;
+};
+
+inline std::mutex &cancel_registry_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+inline std::unordered_map<uint64_t, CancelEntry> &cancel_registry() {
+  static std::unordered_map<uint64_t, CancelEntry> registry;
+  return registry;
+}
+
+/// Monotonic token source. `0` is reserved as "no token" (an un-armed call),
+/// so the first real token is `1`.
+inline uint64_t next_cancel_token() {
+  std::lock_guard<std::mutex> lock(cancel_registry_mutex());
+  static uint64_t counter = 0;
+  return ++counter;
+}
+
+/// Thread-local "armed token" set by `begin_abortable_future()` on the JS
+/// thread, consumed by the very next `drive_rust_future_async[/ _void]` kick-off
+/// on the same thread. Both calls run synchronously on the JS thread with no
+/// intervening await, so the slot is never observed by another future. `0`
+/// means un-armed (the future is then registered with no cancel token and is
+/// simply non-abortable, matching a JSI call made without an `AbortSignal`).
+inline uint64_t &armed_cancel_token() {
+  thread_local uint64_t token = 0;
+  return token;
+}
+
+} // namespace detail
+
+/// Arm the next async kick-off on this (JS) thread as abortable: allocate a
+/// fresh token, stash it in the thread-local slot, and return it to JS. The
+/// wrapper calls this synchronously immediately before the typed async call.
+/// Reached from JS via a non-spec `__uniffiBeginAbortable()` HybridObject method
+/// (the same non-spec-method precedent as the callback `setJsImpl` hook).
+inline uint64_t begin_abortable_future() {
+  uint64_t token = detail::next_cancel_token();
+  detail::armed_cancel_token() = token;
+  return token;
+}
+
+/// Abort the in-flight future registered under `token`, if any. A registry
+/// miss (the future already settled and deregistered, or the token was never
+/// registered) is a safe no-op — exactly the idempotent / post-settle behaviour
+/// uniffi's `rust_future_cancel` guarantees. Reached from JS via a non-spec
+/// `__uniffiAbort(token)` HybridObject method.
+inline void abort_rust_future(uint64_t token) {
+  CancelFutureFn cancel_fn = nullptr;
+  uint64_t handle = 0;
+  {
+    std::lock_guard<std::mutex> lock(detail::cancel_registry_mutex());
+    auto &registry = detail::cancel_registry();
+    auto it = registry.find(token);
+    if (it == registry.end()) {
+      return;
+    }
+    cancel_fn = it->second.cancel_fn;
+    handle = it->second.handle;
+  }
+  // Call cancel OUTSIDE the lock: it may synchronously fire the armed
+  // continuation (`Ready`), whose `on_ready` deregisters this token — which
+  // re-takes the registry mutex. Holding it here would self-deadlock.
+  if (cancel_fn != nullptr) {
+    cancel_fn(handle);
+  }
+}
+
+namespace detail {
+
+/// Register `{handle, cancel_fn}` under `token` so a later `abort_rust_future`
+/// can reach it. No-op when `token == 0` (un-armed call) or `cancel_fn` is null.
+inline void register_cancellable(uint64_t token, uint64_t handle,
+                                 CancelFutureFn cancel_fn) {
+  if (token == 0 || cancel_fn == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(cancel_registry_mutex());
+  cancel_registry()[token] = CancelEntry{handle, cancel_fn};
+}
+
+/// Drop `token`'s registry entry. Called from `on_ready` strictly before
+/// `free_fn(handle)`, preserving uniffi's "cancel-before-free" ordering. No-op
+/// for `token == 0`.
+inline void deregister_cancellable(uint64_t token) {
+  if (token == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(cancel_registry_mutex());
+  cancel_registry().erase(token);
+}
+
+/// Take (and clear) the thread-local armed token, returning `0` if un-armed.
+/// Called once per kick-off, synchronously on the JS thread.
+inline uint64_t take_armed_cancel_token() {
+  uint64_t token = armed_cancel_token();
+  armed_cancel_token() = 0;
+  return token;
+}
+
+} // namespace detail
 
 /// Type-erased state for one in-flight RustFuture. Heap-allocated and kept
 /// alive across (re-)polls; `on_ready` carries the `T`-specific complete +
@@ -121,11 +279,21 @@ rust_future_async_continuation(uint64_t cb_data, int8_t poll_result) noexcept {
 template <typename T>
 inline std::shared_ptr<::margelo::nitro::Promise<T>>
 drive_rust_future_async(uint64_t handle, PollFn poll_fn, FreeFutureFn free_fn,
-                        std::function<T()> &&complete) {
+                        std::function<T()> &&complete,
+                        CancelFutureFn cancel_fn = nullptr) {
   auto promise = ::margelo::nitro::Promise<T>::create();
+  // Consume the thread-local token armed by the wrapper's
+  // `__uniffiBeginAbortable()` (0 = un-armed / non-abortable), then register
+  // this future so `__uniffiAbort(token)` can reach it.
+  uint64_t cancel_token = detail::take_armed_cancel_token();
+  detail::register_cancellable(cancel_token, handle, cancel_fn);
   auto *state = new RustFutureAsyncState{handle, poll_fn, nullptr};
-  state->on_ready = [handle, free_fn, complete = std::move(complete),
+  state->on_ready = [handle, free_fn, cancel_token, complete = std::move(complete),
                      promise]() {
+    // Deregister BEFORE free_fn (uniffi cancel-before-free contract): after
+    // this point an aborting `abort_rust_future` is a registry-miss no-op, so
+    // it can never call `cancel` on the about-to-be-freed handle.
+    detail::deregister_cancellable(cancel_token);
     try {
       T value = complete();
       free_fn(handle);
@@ -144,11 +312,15 @@ drive_rust_future_async(uint64_t handle, PollFn poll_fn, FreeFutureFn free_fn,
 inline std::shared_ptr<::margelo::nitro::Promise<void>>
 drive_rust_future_async_void(uint64_t handle, PollFn poll_fn,
                              FreeFutureFn free_fn,
-                             std::function<void()> &&complete) {
+                             std::function<void()> &&complete,
+                             CancelFutureFn cancel_fn = nullptr) {
   auto promise = ::margelo::nitro::Promise<void>::create();
+  uint64_t cancel_token = detail::take_armed_cancel_token();
+  detail::register_cancellable(cancel_token, handle, cancel_fn);
   auto *state = new RustFutureAsyncState{handle, poll_fn, nullptr};
-  state->on_ready = [handle, free_fn, complete = std::move(complete),
+  state->on_ready = [handle, free_fn, cancel_token, complete = std::move(complete),
                      promise]() {
+    detail::deregister_cancellable(cancel_token);
     try {
       complete();
       free_fn(handle);

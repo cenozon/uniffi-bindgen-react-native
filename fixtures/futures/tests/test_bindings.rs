@@ -5,4 +5,6 @@
  */
 ubrn_macros::build_foreign_language_testcases! {
     "tests/bindings/test_futures.ts" => [Jsi, Napi],
+    // Nitro-only round-trip for the JS-aborts-Rust-future path (parity item P1).
+    "tests/bindings/test_futures_nitro.ts" => [Nitro],
 }

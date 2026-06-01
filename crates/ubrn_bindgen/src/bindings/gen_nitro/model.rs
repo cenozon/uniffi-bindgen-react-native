@@ -601,6 +601,14 @@ impl NitroModule {
         &self.functions
     }
 
+    /// `true` when the namespace-API HybridObject exposes at least one async
+    /// method (a top-level async function or an async constructor factory).
+    /// Gates emission of the non-spec `__uniffiBeginAbortable()` /
+    /// `__uniffiAbort()` cancel hooks on the namespace-API HybridObject.
+    pub fn has_async_api_methods(&self) -> bool {
+        self.api_methods().iter().any(|f| f.is_async)
+    }
+
     /// The configured custom-type conversion owned by THIS namespace for the
     /// custom type named `name` (its UpperCamelCase TS name), if the per-crate
     /// `uniffi.toml` declared one. Cross-namespace customs are presented as a
@@ -674,13 +682,25 @@ impl NitroModule {
     /// touches no configured custom type this collapses to the plain
     /// `<accessor>().<fn>(arg0, arg1)` pass-through. See audit bug #17.
     pub fn free_function_call(&self, func: &NitroFunction) -> String {
+        let accessor = format!("{}()", self.namespace_accessor());
+        self.free_function_call_on(func, &accessor)
+    }
+
+    /// Like [`Self::free_function_call`] but against a caller-supplied receiver
+    /// expression (e.g. a bound `__api` local) rather than re-deriving the
+    /// `<accessor>()` singleton call each time. The abortable async wrapper
+    /// binds the singleton once so its `__uniffiBeginAbortable()` /
+    /// `__uniffiAbort(token)` calls and the typed call all target the SAME
+    /// instance (and the begin/typed-call pair stays synchronous, so the armed
+    /// cancel token is consumed by exactly this call's kick-off).
+    pub fn free_function_call_on(&self, func: &NitroFunction, receiver: &str) -> String {
         let args = func
             .args
             .iter()
             .map(|a| self.lower_call_arg(a))
             .collect::<Vec<_>>()
             .join(", ");
-        let call = format!("{}().{}({args})", self.namespace_accessor(), func.ts_name);
+        let call = format!("{receiver}.{}({args})", func.ts_name);
         self.lift_return_expr(func, &call)
     }
 
@@ -1089,6 +1109,46 @@ fn throws_from(ty: Option<&general::Type>) -> Option<NitroErrorRef> {
     }
 }
 
+/// Reshape a uniffi object's `UniffiTraitMethods` into the emittable
+/// [`NitroUniffiTrait`] list. Each present trait method is built as an ordinary
+/// [`NitroFunction`] (reusing the FFI-symbol / arg-lowering / return-lift path),
+/// then tagged with which Nitro surface it maps to. Mirrors gen_typescript's
+/// `collect_uniffi_traits` (`api_module/builders.rs`): Display→`toString`,
+/// Debug→`toDebugString`, Eq→`equals` (only `eq`, never `ne`), Hash→`hashCode`,
+/// Ord→`compareTo`. A trait method that fails to parse is skipped (logged), so a
+/// single unsupported shape never drops the whole interface. See parity item P2.
+fn collect_uniffi_traits(tm: &general::UniffiTraitMethods) -> Vec<NitroUniffiTrait> {
+    let mut traits = Vec::new();
+    let build = |slot: &Option<general::Method>, label: &str| -> Option<NitroFunction> {
+        let m = slot.as_ref()?;
+        match NitroFunction::from_method(m) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("nitro: skipping uniffi trait `{label}`: {e}");
+                None
+            }
+        }
+    };
+    if let Some(method) = build(&tm.display_fmt, "Display") {
+        traits.push(NitroUniffiTrait::Display { method });
+    }
+    if let Some(method) = build(&tm.debug_fmt, "Debug") {
+        traits.push(NitroUniffiTrait::Debug { method });
+    }
+    // uniffi also exposes `eq_ne`, but (like the JSI oracle) we render only the
+    // `eq_eq` method — `equals()`'s negation is the caller's concern.
+    if let Some(method) = build(&tm.eq_eq, "Eq") {
+        traits.push(NitroUniffiTrait::Eq { method });
+    }
+    if let Some(method) = build(&tm.hash_hash, "Hash") {
+        traits.push(NitroUniffiTrait::Hash { method });
+    }
+    if let Some(method) = build(&tm.ord_cmp, "Ord") {
+        traits.push(NitroUniffiTrait::Ord { method });
+    }
+    traits
+}
+
 impl NitroFunction {
     /// Author docstring formatted as a JSDoc `/** … */` block for the consumer
     /// surface, or `None` when the function carries no docstring. See
@@ -1201,8 +1261,43 @@ pub struct NitroInterface {
     /// constructor.
     pub factories: Vec<NitroFunction>,
     pub methods: Vec<NitroFunction>,
+    /// uniffi object trait impls (`#[uniffi::export(Display, Eq, …)]`) reshaped
+    /// into emittable C++ overrides / registered methods. Mirrors the JSI
+    /// backend's `obj.uniffi_traits` (`ObjectTemplate.ts`): Display→`toString`,
+    /// Debug→`toDebugString`, Eq→`equals`, Hash→`hashCode`, Ord→`compareTo`.
+    /// See parity item P2.
+    pub uniffi_traits: Vec<NitroUniffiTrait>,
     /// Author docstring from the uniffi metadata, if any (audit bug #23).
     pub docstring: Option<String>,
+}
+
+/// A uniffi object trait impl, reshaped for the Nitro HybridObject surface.
+/// Each carries the underlying trait `Method` as a [`NitroFunction`] so the
+/// existing FFI-symbol / arg-lowering / return-lift machinery is reused; the
+/// emitter spells the C++ signature by hand (a base-virtual override for
+/// `toString`/`equals`, a plain `registerHybridMethod` for the rest).
+///
+/// `Eq`/`Ord` carry one interface arg (`other: &Self`), lowered via the same
+/// `clone_handle()` path a normal interface arg uses — identical to the JSI
+/// oracle's `FfiConverterTypeX.lower(other)`.
+///
+/// (No `derive` here: `NitroFunction` is intentionally not `Clone/Debug/Eq`,
+/// and codegen only ever borrows these — it never clones / compares them.)
+pub enum NitroUniffiTrait {
+    /// `impl Display` → override the base virtual `std::string toString()`.
+    Display { method: NitroFunction },
+    /// `impl Debug` → `toDebugString(): string` (plain `registerHybridMethod`).
+    /// When Display is absent the JSI oracle aliases `toString`→`toDebugString`;
+    /// the emitter mirrors that.
+    Debug { method: NitroFunction },
+    /// `impl Eq` → override the base virtual
+    /// `bool equals(const std::shared_ptr<HybridObject>&)`. Only the `eq_eq`
+    /// method is rendered (uniffi also emits `ne`, but the JSI oracle drops it).
+    Eq { method: NitroFunction },
+    /// `impl Hash` → `hashCode(): bigint` (plain `registerHybridMethod`).
+    Hash { method: NitroFunction },
+    /// `impl Ord` → `compareTo(other): number` (plain `registerHybridMethod`).
+    Ord { method: NitroFunction },
 }
 
 impl NitroInterface {
@@ -1284,6 +1379,8 @@ impl NitroInterface {
             }
         }
 
+        let uniffi_traits = collect_uniffi_traits(&iface.uniffi_trait_methods);
+
         Ok(Self {
             ts_name,
             cxx_class,
@@ -1292,6 +1389,7 @@ impl NitroInterface {
             constructors,
             factories,
             methods,
+            uniffi_traits,
             docstring: iface.docstring.clone(),
         })
     }
@@ -1341,6 +1439,41 @@ impl NitroInterface {
     /// have an empty `constructors` and surface that ctor as a factory instead.
     pub fn primary_constructor(&self) -> Option<&NitroFunction> {
         self.constructors.first()
+    }
+
+    /// `true` when this interface has at least one async *method* — i.e. a
+    /// `Promise`-returning HybridObject method whose driver supports
+    /// cancellation. Gates emission of the non-spec `__uniffiBeginAbortable()` /
+    /// `__uniffiAbort()` cancel hooks on the interface HybridObject (async
+    /// constructors land in `factories` on the namespace API, so they're covered
+    /// by the namespace-API hooks, not this one).
+    pub fn has_async_methods(&self) -> bool {
+        self.methods.iter().any(|m| m.is_async)
+    }
+
+    /// `true` when this interface has a uniffi `Display` impl. When a `Debug`
+    /// impl is present WITHOUT a `Display`, the emitter aliases the base
+    /// `toString()` virtual to `toDebugString()` (mirroring the JSI oracle).
+    pub fn has_display_trait(&self) -> bool {
+        self.uniffi_traits
+            .iter()
+            .any(|t| matches!(t, NitroUniffiTrait::Display { .. }))
+    }
+
+    /// Every uniffi-trait method as a [`NitroFunction`], for the `extern "C"`
+    /// FFI-symbol declaration block (each trait method calls a distinct
+    /// `…_uniffi_trait_<name>` symbol on the handle(s)).
+    pub fn uniffi_trait_functions(&self) -> Vec<&NitroFunction> {
+        self.uniffi_traits
+            .iter()
+            .map(|t| match t {
+                NitroUniffiTrait::Display { method }
+                | NitroUniffiTrait::Debug { method }
+                | NitroUniffiTrait::Hash { method }
+                | NitroUniffiTrait::Eq { method }
+                | NitroUniffiTrait::Ord { method } => method,
+            })
+            .collect()
     }
 
     /// Record / enum headers the `.hpp` must `#include` for complete types in
@@ -1798,6 +1931,14 @@ impl NitroCallbackInterface {
 pub struct NitroArg {
     pub ts_name: String,
     pub ty: NitroType,
+    /// The UDL/proc-macro-declared default for this argument, rendered as a TS
+    /// literal, if any. Emitted as `= <dv>` ONLY in the CONSUMER `namespace.ts`
+    /// implementation arg lists (top-level fns, interface constructor, static
+    /// factories) — never in the type-only `.nitro.ts` spec interfaces or the
+    /// `as unknown as { … }` call-signature type literal (both reject `= dv`).
+    /// Mirrors gen_typescript's `build_arg` (`api_module/builders.rs`). See
+    /// parity item P3.
+    pub default_value: Option<String>,
 }
 
 impl NitroArg {
@@ -1805,6 +1946,7 @@ impl NitroArg {
         Ok(Self {
             ts_name: sanitize_ts_arg_ident(&arg.name.to_lower_camel_case()),
             ty: NitroType::from_type(&arg.ty.ty)?,
+            default_value: arg.default.as_ref().map(render_default_value),
         })
     }
 
@@ -1984,6 +2126,23 @@ pub enum NitroType {
 }
 
 impl NitroType {
+    /// The fixed number of wire bytes this type serializes to, if constant.
+    /// Returns `None` for variable-width types (string, bytes, optional,
+    /// sequence, map, record, enum, object/callback handles). Used purely for
+    /// `reserve_additional` capacity hints — never affects the bytes actually
+    /// written. Widths match the big-endian primitive encodings in
+    /// `nitro-uniffi/rust_buffer.hpp` (`bool` is wire-encoded as `i8`).
+    pub fn fixed_wire_width(&self) -> Option<usize> {
+        match self {
+            Self::U8 | Self::I8 | Self::Bool => Some(1),
+            Self::U16 | Self::I16 => Some(2),
+            Self::U32 | Self::I32 | Self::F32 => Some(4),
+            Self::U64 | Self::I64 | Self::F64 => Some(8),
+            Self::Custom { inner, .. } => inner.fixed_wire_width(),
+            _ => None,
+        }
+    }
+
     pub fn from_type(ty: &general::Type) -> Result<Self> {
         use general::Type;
         Ok(match ty {
@@ -3228,6 +3387,24 @@ pub struct NitroRecord {
 }
 
 impl NitroRecord {
+    /// Sum of the leading run of fixed-wire-width fields, in bytes. Used to
+    /// `reserve_additional` the RustBuffer once before the field walk in
+    /// `write_<Name>` instead of growing it incrementally. Capacity-only: the
+    /// wire bytes written are identical. Only the contiguous prefix of
+    /// fixed-width fields is counted (a variable-width field ends the run) so
+    /// the reservation never over-allocates relative to what those leading
+    /// fields actually write.
+    pub fn fixed_prefix_width(&self) -> usize {
+        let mut total = 0usize;
+        for field in &self.fields {
+            match field.ty.fixed_wire_width() {
+                Some(w) => total += w,
+                None => break,
+            }
+        }
+        total
+    }
+
     fn from_general(record: &general::Record) -> Result<Self> {
         let ts_name = record.name.to_upper_camel_case();
         let fields = record

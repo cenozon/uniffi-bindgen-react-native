@@ -47,6 +47,7 @@
 
 #pragma once
 
+#include <NitroModules/JSICache.hpp>
 #include <NitroModules/JSIConverter.hpp>
 
 #include <cstdint>
@@ -59,6 +60,36 @@ namespace margelo::nitro {
 using namespace facebook;
 
 namespace ubrn_detail {
+
+// The global `Map` constructor and `Array.from` don't change for a given
+// runtime, so resolve each once and keep it alive in the per-runtime
+// `JSICache` (a `BorrowingReference` into the cache's `OwningReference`)
+// instead of walking `global()` on every map crossing. Returns a reference so
+// the move-only `jsi::Function` is never copied.
+inline const jsi::Function &cachedMapCtor(jsi::Runtime &rt) {
+  static std::unordered_map<jsi::Runtime *, BorrowingReference<jsi::Function>>
+      cache;
+  auto it = cache.find(&rt);
+  if (it != cache.end() && it->second != nullptr)
+    return *it->second;
+  auto shared = JSICache::getOrCreateCache(rt).makeShared(
+      rt.global().getPropertyAsFunction(rt, "Map"));
+  auto [pos, _] = cache.insert_or_assign(&rt, std::move(shared));
+  return *pos->second;
+}
+
+inline const jsi::Function &cachedArrayFrom(jsi::Runtime &rt) {
+  static std::unordered_map<jsi::Runtime *, BorrowingReference<jsi::Function>>
+      cache;
+  auto it = cache.find(&rt);
+  if (it != cache.end() && it->second != nullptr)
+    return *it->second;
+  auto array = rt.global().getPropertyAsObject(rt, "Array");
+  auto shared = JSICache::getOrCreateCache(rt).makeShared(
+      array.getPropertyAsFunction(rt, "from"));
+  auto [pos, _] = cache.insert_or_assign(&rt, std::move(shared));
+  return *pos->second;
+}
 
 // A map key is handled here iff `K` is arithmetic and not `bool`. `bool`
 // is excluded because uniffi never produces a `bool`-keyed map and a JS
@@ -116,9 +147,7 @@ struct JSIConverter<
     jsi::Object jsMap = arg.asObject(runtime);
     // `Array.from(map)` yields an array of `[key, value]` entry pairs —
     // avoids driving the JS iterator protocol by hand.
-    jsi::Function arrayFrom = runtime.global()
-                                  .getPropertyAsObject(runtime, "Array")
-                                  .getPropertyAsFunction(runtime, "from");
+    const jsi::Function &arrayFrom = ubrn_detail::cachedArrayFrom(runtime);
     jsi::Array entries =
         arrayFrom.call(runtime, jsMap).asObject(runtime).asArray(runtime);
     size_t length = entries.size(runtime);
@@ -140,8 +169,7 @@ struct JSIConverter<
   static inline jsi::Value
   toJSI(jsi::Runtime &runtime,
         const std::unordered_map<KeyType, ValueType> &map) {
-    jsi::Function mapCtor =
-        runtime.global().getPropertyAsFunction(runtime, "Map");
+    const jsi::Function &mapCtor = ubrn_detail::cachedMapCtor(runtime);
     jsi::Object jsMap = mapCtor.callAsConstructor(runtime).asObject(runtime);
     jsi::Function set = jsMap.getPropertyAsFunction(runtime, "set");
     for (const auto &pair : map) {
@@ -159,8 +187,7 @@ struct JSIConverter<
     }
     jsi::Object object = value.getObject(runtime);
     // A JS `Map` instance — `instanceof global.Map`.
-    jsi::Object mapCtor = runtime.global().getPropertyAsObject(runtime, "Map");
-    return object.instanceOf(runtime, mapCtor.asFunction(runtime));
+    return object.instanceOf(runtime, ubrn_detail::cachedMapCtor(runtime));
   }
 };
 
@@ -199,9 +226,7 @@ struct JSIConverter<
     // `[...map]` yields an array of `[key, value]` entry pairs. Spell it
     // through the iterator-free `Array.from(map)` to avoid driving the JS
     // iterator protocol by hand.
-    jsi::Function arrayFrom = runtime.global()
-                                  .getPropertyAsObject(runtime, "Array")
-                                  .getPropertyAsFunction(runtime, "from");
+    const jsi::Function &arrayFrom = ubrn_detail::cachedArrayFrom(runtime);
     jsi::Array entries = arrayFrom.call(runtime, jsMap)
                              .asObject(runtime)
                              .asArray(runtime);
@@ -224,8 +249,7 @@ struct JSIConverter<
   static inline jsi::Value
   toJSI(jsi::Runtime &runtime,
         const std::unordered_map<KeyType, ValueType> &map) {
-    jsi::Function mapCtor =
-        runtime.global().getPropertyAsFunction(runtime, "Map");
+    const jsi::Function &mapCtor = ubrn_detail::cachedMapCtor(runtime);
     jsi::Object jsMap = mapCtor.callAsConstructor(runtime).asObject(runtime);
     jsi::Function set = jsMap.getPropertyAsFunction(runtime, "set");
     for (const auto &pair : map) {
@@ -243,8 +267,7 @@ struct JSIConverter<
     }
     jsi::Object object = value.getObject(runtime);
     // A JS `Map` instance — `instanceof global.Map`.
-    jsi::Object mapCtor = runtime.global().getPropertyAsObject(runtime, "Map");
-    return object.instanceOf(runtime, mapCtor.asFunction(runtime));
+    return object.instanceOf(runtime, ubrn_detail::cachedMapCtor(runtime));
   }
 };
 

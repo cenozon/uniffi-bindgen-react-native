@@ -32,6 +32,8 @@ uint64_t {{ method.uniffi_symbol }}(
 {%- if let Some(ad) = method.async_data %}
 void {{ ad.poll_symbol }}(uint64_t handle, void (*cb)(uint64_t, int8_t), uint64_t cb_data);
 void {{ ad.free_symbol }}(uint64_t handle);
+// uniffi async cancel — one arg (the future handle), void return, no status.
+void {{ ad.cancel_symbol }}(uint64_t handle);
 {{ method.return_kind.c_type() }} {{ ad.complete_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
 {%- endif %}
 {%- else %}
@@ -43,6 +45,18 @@ void {{ ad.free_symbol }}(uint64_t handle);
     UniffiRustCallStatus* status
 );
 {%- endif %}
+{%- endfor %}
+{%- for tf in iface.uniffi_trait_functions() %}
+// uniffi object-trait FFI symbol (`…_uniffi_trait_*`). Display/Debug return a
+// RustBuffer (UTF-8 String); Hash a u64; Eq a bool (i8); Ord an i8. Eq/Ord take
+// the cloned `other` handle as their one arg.
+{{ tf.return_kind.c_type() }} {{ tf.uniffi_symbol }}(
+    uint64_t self_handle,
+{%- for arg in tf.args -%}
+    {{ arg.ty.c_type() }} {{ arg.ts_name }}_lowered,
+{%- endfor -%}
+    UniffiRustCallStatus* status
+);
 {%- endfor %}
 }
 
@@ -79,8 +93,122 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- for method in iface.methods %}
     prototype.registerHybridMethod("{{ method.ts_name }}", &{{ iface.cxx_class }}::{{ method.cxx_name }});
 {%- endfor %}
+{%- if iface.has_async_methods() %}
+    // Non-spec async-cancellation hooks (see the `.hpp` declaration + the
+    // `.ts` wrapper's `__uniffiBeginAbortable` / `__uniffiAbort` usage).
+    prototype.registerHybridMethod("__uniffiBeginAbortable", &{{ iface.cxx_class }}::__uniffiBeginAbortable);
+    prototype.registerHybridMethod("__uniffiAbort", &{{ iface.cxx_class }}::__uniffiAbort);
+{%- endif %}
+{%- for tm in iface.uniffi_traits %}
+{%- match tm %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Display { method } %}
+    // `toString` / `equals` are base `HybridObject` virtuals, but Nitro
+    // registers each prototype's methods on the *derived* prototype only and the
+    // base's registration lands on the `HybridObject` prototype — so the derived
+    // JS object does not see `toString`/`equals` unless we register them on THIS
+    // prototype too. Registering here is safe: the duplicate-name guard is
+    // per-prototype (`Prototype::_methods`), and this prototype does not already
+    // carry `toString` (only the base does). We register the *derived override*
+    // pointer, so virtual dispatch is moot — it IS our override.
+    prototype.registerHybridMethod("toString", &{{ iface.cxx_class }}::toString);
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Debug { method } %}
+    prototype.registerHybridMethod("toDebugString", &{{ iface.cxx_class }}::toDebugString);
+{%- if !iface.has_display_trait() %}
+    // No `Display` impl — `toString` aliases Debug; register it on this
+    // prototype (same per-prototype-safe reasoning as the Display arm).
+    prototype.registerHybridMethod("toString", &{{ iface.cxx_class }}::toString);
+{%- endif %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Eq { method } %}
+    // See the `Display` arm: `equals` must be registered on this derived
+    // prototype to be visible on the JS object.
+    prototype.registerHybridMethod("equals", &{{ iface.cxx_class }}::equals);
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Hash { method } %}
+    prototype.registerHybridMethod("hashCode", &{{ iface.cxx_class }}::hashCode);
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Ord { method } %}
+    prototype.registerHybridMethod("compareTo", &{{ iface.cxx_class }}::compareTo);
+{%- endmatch %}
+{%- endfor %}
   });
 }
+
+{%- if iface.has_async_methods() %}
+double {{ iface.cxx_class }}::__uniffiBeginAbortable() {
+  return static_cast<double>(::ubrn::nitro::begin_abortable_future());
+}
+
+void {{ iface.cxx_class }}::__uniffiAbort(double token) {
+  ::ubrn::nitro::abort_rust_future(static_cast<uint64_t>(token));
+}
+{%- endif %}
+
+{%- for tm in iface.uniffi_traits %}
+{%- match tm %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Display { method } %}
+std::string {{ iface.cxx_class }}::toString() {
+  // uniffi `Display` → a String-returning trait call on the cloned receiver
+  // handle. Infallible; the Rust-owned return buffer is freed by the RAII guard.
+  auto __status = ubrn::nitro::make_status();
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
+  auto __raw = {{ method.uniffi_symbol }}(__self_guard.take(), &__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+  return ubrn::nitro::lift_string(__raw);
+}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Debug { method } %}
+std::string {{ iface.cxx_class }}::toDebugString() {
+  // uniffi `Debug` → a String-returning trait call (see `toString`).
+  auto __status = ubrn::nitro::make_status();
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
+  auto __raw = {{ method.uniffi_symbol }}(__self_guard.take(), &__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  ubrn::nitro::RustBufferGuard __raw_guard{__raw, &free_status_buffer};
+  return ubrn::nitro::lift_string(__raw);
+}
+{%- if !iface.has_display_trait() %}
+std::string {{ iface.cxx_class }}::toString() {
+  // No `Display` impl — defer to Debug (mirrors the JSI oracle).
+  return toDebugString();
+}
+{%- endif %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Eq { method } %}
+bool {{ iface.cxx_class }}::equals(const std::shared_ptr<::margelo::nitro::HybridObject>& other) {
+  // uniffi `Eq`. The base virtual's param is the BASE type; downcast to the
+  // concrete `{{ iface.cxx_class }}` (only it has `clone_handle()`), returning
+  // false on a type mismatch — a different concrete Hybrid is simply not equal.
+  auto __other = std::dynamic_pointer_cast<{{ iface.cxx_class }}>(other);
+  if (!__other) {
+    return false;
+  }
+  // Lower both handles (clone — uniffi consumes each), parked in move-only
+  // guards so a throw frees the already-cloned handle, then call eq + lift bool.
+  auto __status = ubrn::nitro::make_status();
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __other_guard{__other->clone_handle()};
+  auto __raw = {{ method.uniffi_symbol }}(__self_guard.take(), __other_guard.take(), &__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  return ubrn::nitro::lift_bool(__raw);
+}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Hash { method } %}
+{{ method.cxx_return_signature() }} {{ iface.cxx_class }}::hashCode() {
+  // uniffi `Hash` → u64 on the cloned receiver. Infallible scalar return.
+  auto __status = ubrn::nitro::make_status();
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
+  auto __raw = {{ method.uniffi_symbol }}(__self_guard.take(), &__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  return __raw;
+}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Ord { method } %}
+{{ method.cxx_return_signature() }} {{ iface.cxx_class }}::compareTo(const std::shared_ptr<{{ iface.cxx_class }}>& other) {
+  // uniffi `Ord` → i8 (-1/0/1) comparing the cloned receiver + cloned `other`.
+  auto __status = ubrn::nitro::make_status();
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __self_guard{clone_handle()};
+  ubrn::nitro::UniffiObjectHandle<&{{ iface.free_symbol }}> __other_guard{other->clone_handle()};
+  auto __raw = {{ method.uniffi_symbol }}(__self_guard.take(), __other_guard.take(), &__status);
+  ubrn::nitro::check_status(__status, free_status_buffer);
+  return __raw;
+}
+{%- endmatch %}
+{%- endfor %}
 
 {%- for method in iface.methods %}
 {{ method.cxx_return_signature() }} {{ iface.cxx_class }}::{{ method.cxx_name }}(
@@ -120,7 +248,8 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
-      });
+      },
+      &{{ ad.cancel_symbol }});
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
   return ::ubrn::nitro::drive_rust_future_async<{{ ret_ty.cxx_type() }}>(
       __handle, &{{ ad.poll_symbol }}, &{{ ad.free_symbol }},
@@ -146,7 +275,8 @@ void {{ iface.cxx_class }}::loadHybridMethods() {
 {%- else %}
         return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
-      });
+      },
+      &{{ ad.cancel_symbol }});
 {%- endmatch %}
 {%- endif %}
 {%- else %}

@@ -142,6 +142,25 @@ export interface {{ iface.ts_name }} extends HybridObject<{
 {%- endfor -%}
   ): {{ method.ts_return_signature() }}
 {%- endfor %}
+{%- for tm in iface.uniffi_traits %}
+{%- match tm %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Display { method } %}
+{#- uniffi `Display` → base `HybridObject.toString(): string`; inherited via
+    `extends HybridObject`, so it is NOT redeclared on this spec interface. -#}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Eq { method } %}
+{#- uniffi `Eq` → base `HybridObject.equals(...)`; inherited, not redeclared. -#}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Debug { method } %}
+  // uniffi `Debug` → `toDebugString()` (non-base; the C++ impl registers it on
+  // this prototype, so it MUST be declared here or the consumer type lacks it).
+  toDebugString(): {{ method.return_kind.ts_type() }}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Hash { method } %}
+  // uniffi `Hash` → `hashCode()` (non-base, registered on this prototype).
+  hashCode(): {{ method.return_kind.ts_type() }}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Ord { method } %}
+  // uniffi `Ord` → `compareTo(other)` (non-base, registered on this prototype).
+  compareTo(other: {{ iface.ts_name }}): {{ method.return_kind.ts_type() }}
+{%- endmatch %}
+{%- endfor %}
 }
 {% endfor %}
 

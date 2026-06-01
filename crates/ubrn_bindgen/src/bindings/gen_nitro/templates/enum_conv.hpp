@@ -15,30 +15,11 @@
   && !defined(UBRN_CYC_{{ module.namespace }}_{{ en.ts_name }}_CONV)
 #define UBRN_CYC_{{ module.namespace }}_{{ en.ts_name }}_CONV 1
 
-#include <NitroModules/JSICache.hpp>
+// `ubrnInternedTag` (the per-(runtime, tag) interned `jsi::String` cache) is
+// shared with the inline non-cycle converter path; both include this header.
+#include <nitro-uniffi/interned_tag.hpp>
 
 namespace margelo::nitro {
-
-// Interned tag-value cache: the variant tag string ("VariantName") is a fixed
-// ASCII literal, so its `jsi::String` can be allocated once per (runtime, tag)
-// and reused, instead of building a fresh `jsi::String` on every `toJSI` node.
-// Defined exactly once per translation unit via the include guard below; the
-// per-enum CONV guard above is unique per enum, so multiple enum converters in
-// one TU would otherwise each emit this definition.
-#ifndef UBRN_INTERNED_TAG
-#define UBRN_INTERNED_TAG 1
-inline const jsi::Value& ubrnInternedTag(jsi::Runtime& runtime, const char* tag) {
-  static std::unordered_map<jsi::Runtime*,
-      std::unordered_map<const char*, BorrowingReference<jsi::Value>>> cache;
-  auto& perRt = cache[&runtime];
-  auto it = perRt.find(tag);
-  if (it != perRt.end() && it->second != nullptr) return *it->second;
-  auto shared = JSICache::getOrCreateCache(runtime)
-                    .makeShared(jsi::Value(jsi::String::createFromAscii(runtime, tag)));
-  auto [pos, _] = perRt.insert_or_assign(tag, std::move(shared));
-  return *pos->second;
-}
-#endif
 
 inline margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}
 JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}>::fromJSI(jsi::Runtime& runtime, const jsi::Value& arg) {

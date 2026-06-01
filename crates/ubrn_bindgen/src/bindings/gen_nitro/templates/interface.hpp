@@ -101,6 +101,45 @@ public:
   );
 {%- endfor %}
 
+{%- if iface.has_async_methods() %}
+  // Non-spec async-cancellation hooks (reached from the `.ts` wrapper via an
+  // `as unknown as { ... }` cast, the same precedent as the callback
+  // `setJsImpl` hook). `__uniffiBeginAbortable()` arms the next async kick-off
+  // on this thread + returns its token; `__uniffiAbort(token)` cancels the
+  // in-flight future (a settled / unknown token is a safe no-op). Plain
+  // `double` token to match Nitro's JS `number` ABI for the `.ts` surface.
+  double __uniffiBeginAbortable();
+  void __uniffiAbort(double token);
+{%- endif %}
+
+{%- for tm in iface.uniffi_traits %}
+{%- match tm %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Display { method } %}
+  // uniffi `Display` → override the base `HybridObject::toString()` virtual
+  // (do NOT registerHybridMethod — that base name is already registered).
+  std::string toString() override;
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Debug { method } %}
+  // uniffi `Debug` → `toDebugString()` (registered, non-spec).
+  std::string toDebugString();
+{%- if !iface.has_display_trait() %}
+  // No `Display` impl — alias the base `toString()` virtual to Debug (mirrors
+  // the JSI oracle).
+  std::string toString() override;
+{%- endif %}
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Eq { method } %}
+  // uniffi `Eq` → override the base `HybridObject::equals()` virtual. The base
+  // param is the BASE type; the body downcasts to `{{ iface.cxx_class }}` and
+  // returns false on a type mismatch (the cloned handle is freed by its guard).
+  bool equals(const std::shared_ptr<::margelo::nitro::HybridObject>& other) override;
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Hash { method } %}
+  // uniffi `Hash` → `hashCode()` (registered, non-spec).
+  {{ method.cxx_return_signature() }} hashCode();
+{%- when crate::bindings::gen_nitro::model::NitroUniffiTrait::Ord { method } %}
+  // uniffi `Ord` → `compareTo(other)` (registered, non-spec).
+  {{ method.cxx_return_signature() }} compareTo(const std::shared_ptr<{{ iface.cxx_class }}>& other);
+{%- endmatch %}
+{%- endfor %}
+
 protected:
   void loadHybridMethods() override;
 

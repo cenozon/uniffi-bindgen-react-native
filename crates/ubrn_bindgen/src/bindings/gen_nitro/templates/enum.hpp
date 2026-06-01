@@ -27,6 +27,7 @@
 #include <NitroModules/PropNameIDCache.hpp>
 
 #include <NitroUniffi.hpp>
+#include <nitro-uniffi/interned_tag.hpp>
 #include <nitro-uniffi/jsi_converter_ints.hpp>
 #include <nitro-uniffi/jsi_converter_map.hpp>
 
@@ -161,7 +162,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
   toJSI(jsi::Runtime& runtime, margelo::nitro::{{ module.namespace }}::{{ en.ts_name }} arg) {
     switch (arg) {
 {%- for variant in en.variants %}
-      case margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}::{{ variant.ts_name }}: return JSIConverter<std::string>::toJSI(runtime, "{{ variant.ts_name }}");
+      case margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}::{{ variant.ts_name }}: return jsi::Value(runtime, ubrnInternedTag(runtime, "{{ variant.ts_name }}"));
 {%- endfor %}
       default: [[unlikely]]
         throw std::invalid_argument("Cannot convert {{ en.ts_name }} to JS - invalid value: " + std::to_string(static_cast<int>(arg)) + "!");
@@ -225,7 +226,7 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
     switch (arg.variant.index()) {
 {%- for variant in en.variants %}
       case {{ loop.index0 }}: {
-        obj.setProperty(runtime, PropNameIDCache::get(runtime, "tag"), JSIConverter<std::string>::toJSI(runtime, "{{ variant.ts_name }}"));
+        obj.setProperty(runtime, PropNameIDCache::get(runtime, "tag"), ubrnInternedTag(runtime, "{{ variant.ts_name }}"));
 {%- if !variant.fields.is_empty() %}
         const auto& __v = std::get<{{ loop.index0 }}>(arg.variant);
 {%- if variant.has_nameless_fields %}
@@ -255,10 +256,11 @@ struct JSIConverter<margelo::nitro::{{ module.namespace }}::{{ en.ts_name }}> fi
       return false;
     }
     jsi::Object obj = value.getObject(runtime);
-    if (!obj.hasProperty(runtime, PropNameIDCache::get(runtime, "tag"))) {
+    const auto& tag_id = PropNameIDCache::get(runtime, "tag");
+    if (!obj.hasProperty(runtime, tag_id)) {
       return false;
     }
-    jsi::Value __tagValue = obj.getProperty(runtime, PropNameIDCache::get(runtime, "tag"));
+    jsi::Value __tagValue = obj.getProperty(runtime, tag_id);
     if (!__tagValue.isString()) {
       return false;
     }

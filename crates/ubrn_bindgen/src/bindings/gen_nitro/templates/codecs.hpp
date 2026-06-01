@@ -182,6 +182,11 @@ inline std::string error_field_to_string(const {{ en.ts_name }}& value) {
 // ---- Record `{{ record.ts_name }}` ----
 template <class W>
 inline void write_{{ record.ts_name }}(W& w, const {{ record.ts_name }}& value) {
+{%- if record.fixed_prefix_width() > 0 %}
+  // Reserve the leading fixed-width fields' bytes up front (capacity only; the
+  // wire bytes written are unchanged).
+  w.reserve_additional({{ record.fixed_prefix_width() }});
+{%- endif %}
 {%- for field in record.fields %}
   {{ field.ty.stream_write_stmt("value", field.cxx_name, module.namespace) }}
 {%- endfor %}

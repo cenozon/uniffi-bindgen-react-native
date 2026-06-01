@@ -41,6 +41,8 @@ import {
   CoverallError_Tags,
   RootError_Tags,
   ComplexError_Tags,
+  NitroTraitObj,
+  nitroDefaultArgs,
 } from "@/generated/coverall";
 import { test } from "@/asserts";
 import "@/polyfills";
@@ -140,4 +142,35 @@ test("(g) thrown typed error is discriminable via <Error>_Tags", (t) => {
     (e) => ComplexError_Tags.isOsError(e),
     () => c.maybeThrowComplex(1),
   );
+});
+
+test("(h) P2: uniffi object traits route to the Rust impls", (t) => {
+  const a = new NitroTraitObj(3);
+  const a2 = new NitroTraitObj(3);
+  const b = new NitroTraitObj(7);
+
+  // Display -> toString() (base-virtual override).
+  t.assertEqual(a.toString(), "NitroTraitObj(3)");
+  // Debug -> toDebugString() (plain method).
+  t.assertEqual(a.toDebugString(), "NitroTraitObj { val: 3 }");
+
+  // Eq -> equals() (base-virtual override): value equality, not reference.
+  t.assertTrue(a.equals(a2), "equal-valued objects compare equal via Rust Eq");
+  t.assertTrue(!a.equals(b), "different-valued objects compare unequal");
+
+  // Hash -> hashCode(): equal values hash equal; different values differ.
+  t.assertEqual(a.hashCode(), a2.hashCode());
+  t.assertTrue(a.hashCode() !== b.hashCode(), "distinct values hash distinctly");
+
+  // Ord -> compareTo(): 3 < 7 so a.compareTo(b) negative, b.compareTo(a) positive.
+  t.assertTrue(a.compareTo(b) < 0, "3 compareTo 7 is negative");
+  t.assertTrue(b.compareTo(a) > 0, "7 compareTo 3 is positive");
+  t.assertEqual(a.compareTo(a2), 0);
+});
+
+test("(i) P3: default args may be omitted at the call site", (t) => {
+  // suffix defaults to "x"; omitting it must use the default.
+  t.assertEqual(nitroDefaultArgs("v"), "vx");
+  // passing it overrides the default.
+  t.assertEqual(nitroDefaultArgs("v", "Z"), "vZ");
 });

@@ -28,6 +28,8 @@ uint64_t {{ func.uniffi_symbol }}(
 {%- if let Some(ad) = func.async_data %}
 void {{ ad.poll_symbol }}(uint64_t handle, void (*cb)(uint64_t, int8_t), uint64_t cb_data);
 void {{ ad.free_symbol }}(uint64_t handle);
+// uniffi async cancel — one arg (the future handle), void return, no status.
+void {{ ad.cancel_symbol }}(uint64_t handle);
 {{ func.return_kind.c_type() }} {{ ad.complete_symbol }}(uint64_t handle, UniffiRustCallStatus* status);
 {%- endif %}
 {%- else %}
@@ -49,8 +51,24 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- for func in module.api_methods() %}
     prototype.registerHybridMethod("{{ func.ts_name }}", &{{ module.namespace_api_cxx_class() }}::{{ func.cxx_name }});
 {%- endfor %}
+{%- if module.has_async_api_methods() %}
+    // Non-spec async-cancellation hooks (see the `.hpp` declaration + the
+    // `.ts` wrapper's `__uniffiBeginAbortable` / `__uniffiAbort` usage).
+    prototype.registerHybridMethod("__uniffiBeginAbortable", &{{ module.namespace_api_cxx_class() }}::__uniffiBeginAbortable);
+    prototype.registerHybridMethod("__uniffiAbort", &{{ module.namespace_api_cxx_class() }}::__uniffiAbort);
+{%- endif %}
   });
 }
+
+{%- if module.has_async_api_methods() %}
+double {{ module.namespace_api_cxx_class() }}::__uniffiBeginAbortable() {
+  return static_cast<double>(::ubrn::nitro::begin_abortable_future());
+}
+
+void {{ module.namespace_api_cxx_class() }}::__uniffiAbort(double token) {
+  ::ubrn::nitro::abort_rust_future(static_cast<uint64_t>(token));
+}
+{%- endif %}
 
 {%- for func in module.api_methods() %}
 {{ func.cxx_return_signature() }} {{ module.namespace_api_cxx_class() }}::{{ func.cxx_name }}(
@@ -93,7 +111,8 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- else %}
         ::ubrn::nitro::check_status(__status, free_status_buffer);
 {%- endif %}
-      });
+      },
+      &{{ ad.cancel_symbol }});
 {%- when crate::bindings::gen_nitro::model::ReturnKind::Value with (ret_ty) %}
   return ::ubrn::nitro::drive_rust_future_async<{{ ret_ty.cxx_type() }}>(
       __handle, &{{ ad.poll_symbol }}, &{{ ad.free_symbol }},
@@ -119,7 +138,8 @@ void {{ module.namespace_api_cxx_class() }}::loadHybridMethods() {
 {%- else %}
         return {{ ret_ty.lift_expr("__raw", module.namespace) }};
 {%- endif %}
-      });
+      },
+      &{{ ad.cancel_symbol }});
 {%- endmatch %}
 {%- endif %}
 {%- else %}

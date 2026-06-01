@@ -175,7 +175,7 @@ export const {{ iface.ts_name }} = class {
   }
   static create(
 {%- for arg in ctor.args -%}
-    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
+    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{%- if let Some(dv) = arg.default_value %} = {{ dv }}{% endif %}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   ): {{ ctor.ts_return_signature() }} {
     return {{ module.namespace_accessor() }}().{{ ctor.ts_name }}(
@@ -190,7 +190,7 @@ export const {{ iface.ts_name }} = class {
   // and yields the HybridObject (audit bug #1).
   constructor(
 {%- for arg in ctor.args -%}
-    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
+    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{%- if let Some(dv) = arg.default_value %} = {{ dv }}{% endif %}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   ) {
     return {{ module.namespace_accessor() }}().{{ ctor.ts_name }}(
@@ -213,7 +213,7 @@ export const {{ iface.ts_name }} = class {
 {%- endmatch %}
   static {{ ctor.static_name.as_ref().unwrap() }}(
 {%- for arg in ctor.args -%}
-    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
+    {{ arg.ts_name }}: {{ arg.ty.ts_type() }}{%- if let Some(dv) = arg.default_value %} = {{ dv }}{% endif %}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
   ): {{ ctor.ts_return_signature() }} {
     return {{ module.namespace_accessor() }}().{{ ctor.ts_name }}(
@@ -386,20 +386,46 @@ export namespace {{ err.ts_name }}_Tags {
 {%- endmatch %}
 export function {{ func.ts_name }}(
 {%- for arg in func.args -%}
-{{ arg.ts_name }}: {{ arg.ty.ts_type() }}{% if !loop.last %}, {% endif %}
+{{ arg.ts_name }}: {{ arg.ty.ts_type() }}{%- if let Some(dv) = arg.default_value %} = {{ dv }}{% endif %}{% if !loop.last %}, {% endif %}
 {%- endfor -%}
 {%- if func.is_async %}{% if !func.args.is_empty() %}, {% endif %}asyncOpts_?: { signal?: AbortSignal }{% endif %}): {{ func.ts_return_signature() }} {
 {%- if func.is_async %}
-  // `asyncOpts_` is accepted for parity with the other backends' cancellation
-  // surface (audit bug #22); the underlying Nitro Promise is one-directional,
-  // so the signal is observed at the wrapper boundary only.
+  // `asyncOpts_.signal` drives real Rust-future cancellation (parity with the
+  // JSI backend). The pre-flight check is the already-aborted fast path.
   if (asyncOpts_?.signal?.aborted === true) {
     return Promise.reject(asyncOpts_.signal.reason ?? new Error('aborted'))
   }
-{%- endif %}
+  const __api = {{ module.namespace_accessor() }}()
+  const __signal = asyncOpts_?.signal
+  if (__signal !== undefined) {
+    // Arm the next async kick-off as abortable + grab its token, then register
+    // a listener that calls back into the native cancel hook on abort. The
+    // begin/typed-call pair is synchronous, so the armed token is consumed by
+    // exactly this call's future. The listener is removed on settle (mirroring
+    // the JSI backend's `removeEventListener` BEFORE free) so a post-settle
+    // abort can never reach a freed handle.
+    const __abortApi = __api as unknown as {
+      __uniffiBeginAbortable(): number
+      __uniffiAbort(token: number): void
+    }
+    const __token = __abortApi.__uniffiBeginAbortable()
+    // Custom-typed args are lowered to their inner builtin (`fromCustom`) before
+    // the call; a custom-typed return is lifted to its presented type
+    // (`intoCustom`) after. Non-custom args/returns pass straight through. #17.
+    const __promise = {{ module.free_function_call_on(func, "__api") }}
+    const __abort = () => __abortApi.__uniffiAbort(__token)
+    __signal.addEventListener('abort', __abort)
+    return __promise.finally(() => __signal.removeEventListener('abort', __abort))
+  }
+  // Custom-typed args are lowered to their inner builtin (`fromCustom`) before
+  // the call; a custom-typed return is lifted to its presented type
+  // (`intoCustom`) after. Non-custom args/returns pass straight through. #17.
+  return {{ module.free_function_call_on(func, "__api") }}
+{%- else %}
   // Custom-typed args are lowered to their inner builtin (`fromCustom`) before
   // the call; a custom-typed return is lifted to its presented type
   // (`intoCustom`) after. Non-custom args/returns pass straight through. #17.
   return {{ module.free_function_call(func) }}
+{%- endif %}
 }
 {%- endfor %}
